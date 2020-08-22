@@ -176,9 +176,7 @@ static BOOL restore_console_mode(HANDLE hin)
         close(fd);
     }
 
-    if (RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle == KERNEL32_CONSOLE_SHELL)
-        TERM_Exit();
-
+    TERM_Exit();
     return ret;
 }
 
@@ -189,18 +187,14 @@ static BOOL restore_console_mode(HANDLE hin)
  *   Success: hwnd of the console window.
  *   Failure: NULL
  */
-HWND WINAPI GetConsoleWindow(VOID)
+HWND WINAPI GetConsoleWindow(void)
 {
-    HWND hWnd = NULL;
+    struct condrv_input_info info;
+    BOOL ret;
 
-    SERVER_START_REQ(get_console_input_info)
-    {
-        req->handle = 0;
-        if (!wine_server_call_err(req)) hWnd = wine_server_ptr_handle( reply->win );
-    }
-    SERVER_END_REQ;
-
-    return hWnd;
+    ret = DeviceIoControl( RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle,
+                           IOCTL_CONDRV_GET_INPUT_INFO, NULL, 0, &info, sizeof(info), NULL, NULL );
+    return ret ? wine_server_ptr_handle(info.win) : NULL;
 }
 
 
@@ -651,63 +645,29 @@ BOOL WINAPI GetNumberOfConsoleMouseButtons(LPDWORD nrofbuttons)
 }
 
 /******************************************************************
- *		CONSOLE_HandleCtrlC
- *
- * Check whether the shall manipulate CtrlC events
- */
-LONG CALLBACK CONSOLE_HandleCtrlC( EXCEPTION_POINTERS *eptr )
-{
-    extern DWORD WINAPI CtrlRoutine( void *arg );
-    HANDLE thread;
-
-    if (eptr->ExceptionRecord->ExceptionCode != CONTROL_C_EXIT) return EXCEPTION_CONTINUE_SEARCH;
-
-    /* FIXME: better test whether a console is attached to this process ??? */
-    if (CONSOLE_GetNumHistoryEntries() == (unsigned)-1) return EXCEPTION_CONTINUE_SEARCH;
-
-    /* check if we have to ignore ctrl-C events */
-    if (!(NtCurrentTeb()->Peb->ProcessParameters->ConsoleFlags & 1))
-    {
-        /* Create a separate thread to signal all the events. 
-         * This is needed because:
-         *  - this function can be called in an Unix signal handler (hence on an
-         *    different stack than the thread that's running). This breaks the 
-         *    Win32 exception mechanisms (where the thread's stack is checked).
-         *  - since the current thread, while processing the signal, can hold the
-         *    console critical section, we need another execution environment where
-         *    we can wait on this critical section 
-         */
-        thread = CreateThread(NULL, 0, CtrlRoutine, (void*)CTRL_C_EVENT, 0, NULL);
-        if (thread) CloseHandle(thread);
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-/******************************************************************
  *		CONSOLE_WriteChars
  *
  * WriteConsoleOutput helper: hides server call semantics
  * writes a string at a given pos with standard attribute
  */
-static int CONSOLE_WriteChars(HANDLE hCon, LPCWSTR lpBuffer, int nc, COORD* pos)
+static int CONSOLE_WriteChars(HANDLE handle, const WCHAR *str, size_t length, COORD *coord)
 {
-    int written = -1;
+    struct condrv_output_params *params;
+    DWORD written = 0, size;
 
-    if (!nc) return 0;
+    if (!length) return 0;
 
-    SERVER_START_REQ( write_console_output )
-    {
-        req->handle = console_handle_unmap(hCon);
-        req->x      = pos->X;
-        req->y      = pos->Y;
-        req->mode   = CHAR_INFO_MODE_TEXTSTDATTR;
-        req->wrap   = FALSE;
-        wine_server_add_data( req, lpBuffer, nc * sizeof(WCHAR) );
-        if (!wine_server_call_err( req )) written = reply->written;
-    }
-    SERVER_END_REQ;
-
-    if (written > 0) pos->X += written;
+    size = sizeof(*params) + length * sizeof(WCHAR);
+    if (!(params = HeapAlloc( GetProcessHeap(), 0, size ))) return FALSE;
+    params->mode   = CHAR_INFO_MODE_TEXTSTDATTR;
+    params->x      = coord->X;
+    params->y      = coord->Y;
+    params->width  = 0;
+    memcpy( params + 1, str, length * sizeof(*str) );
+    if (DeviceIoControl( handle, IOCTL_CONDRV_WRITE_OUTPUT, params, size,
+                         &written, sizeof(written), NULL, NULL ))
+        coord->X += written;
+    HeapFree( GetProcessHeap(), 0, params );
     return written;
 }
 
@@ -1049,16 +1009,11 @@ BOOL	CONSOLE_AppendHistory(const WCHAR* ptr)
  *
  *
  */
-unsigned CONSOLE_GetNumHistoryEntries(void)
+unsigned CONSOLE_GetNumHistoryEntries(HANDLE console)
 {
-    unsigned ret = -1;
-    SERVER_START_REQ(get_console_input_info)
-    {
-        req->handle = 0;
-        if (!wine_server_call_err( req )) ret = reply->history_index;
-    }
-    SERVER_END_REQ;
-    return ret;
+    struct condrv_input_info info;
+    BOOL ret = DeviceIoControl( console, IOCTL_CONDRV_GET_INPUT_INFO, NULL, 0, &info, sizeof(info), NULL, NULL );
+    return ret ? info.history_index : ~0;
 }
 
 /******************************************************************
@@ -1110,7 +1065,7 @@ BOOL CONSOLE_Init(RTL_USER_PROCESS_PARAMETERS *params)
     memset(&S_termios, 0, sizeof(S_termios));
     if (params->ConsoleHandle == KERNEL32_CONSOLE_SHELL)
     {
-        HANDLE  conin;
+        HANDLE  conin, console;
 
         /* FIXME: to be done even if program is a GUI ? */
         /* This is wine specific: we have no parent (we're started from unix)
@@ -1163,6 +1118,8 @@ BOOL CONSOLE_Init(RTL_USER_PROCESS_PARAMETERS *params)
             }
             SERVER_END_REQ;
         }
+        console = CreateFileW( coninW, GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE, 0, NULL, OPEN_EXISTING, 0, 0 );
+        if (console != INVALID_HANDLE_VALUE) params->ConsoleHandle = console;
     }
 
     /* convert value from server:

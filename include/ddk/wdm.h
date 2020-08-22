@@ -464,6 +464,13 @@ typedef struct _DRIVER_OBJECT *PDRIVER_OBJECT;
 /* Irp definitions */
 typedef UCHAR KIRQL, *PKIRQL;
 typedef CCHAR KPROCESSOR_MODE;
+typedef enum _KAPC_ENVIRONMENT
+{
+    OriginalApcEnvironment,
+    AttachedApcEnvironment,
+    CurrentApcEnvironment,
+    InsertApcEnvironment
+} KAPC_ENVIRONMENT, *PKAPC_ENVIRONMENT;
 
 typedef VOID (WINAPI *PDRIVER_CANCEL)(
   IN struct _DEVICE_OBJECT  *DeviceObject,
@@ -1200,16 +1207,24 @@ typedef enum _ALTERNATIVE_ARCHITECTURE_TYPE
 
 typedef struct _XSTATE_FEATURE
 {
-  ULONG Offset;
-  ULONG Size;
+    ULONG Offset;
+    ULONG Size;
 } XSTATE_FEATURE, *PXSTATE_FEATURE;
 
 typedef struct _XSTATE_CONFIGURATION
 {
-  ULONG64 EnabledFeatures;
-  ULONG Size;
-  ULONG OptimizedSave:1;
-  XSTATE_FEATURE Features[MAXIMUM_XSTATE_FEATURES];
+    ULONG64 EnabledFeatures;
+    ULONG64 EnabledVolatileFeatures;
+    ULONG Size;
+    ULONG OptimizedSave:1;
+    ULONG CompactionEnabled:1;
+    XSTATE_FEATURE Features[MAXIMUM_XSTATE_FEATURES];
+
+    ULONG64 EnabledSupervisorFeatures;
+    ULONG64 AlignedFeatures;
+    ULONG AllFeatureSize;
+    ULONG AllFeatures[MAXIMUM_XSTATE_FEATURES];
+    ULONG64 EnabledUserVisibleSupervisorFeatures;
 } XSTATE_CONFIGURATION, *PXSTATE_CONFIGURATION;
 
 typedef struct _KUSER_SHARED_DATA {
@@ -1759,6 +1774,7 @@ KAFFINITY WINAPI KeQueryActiveProcessors(void);
 void      WINAPI KeQuerySystemTime(LARGE_INTEGER*);
 void      WINAPI KeQueryTickCount(LARGE_INTEGER*);
 ULONG     WINAPI KeQueryTimeIncrement(void);
+LONG      WINAPI KeReadStateEvent(PRKEVENT);
 void    FASTCALL KeReleaseInStackQueuedSpinLockFromDpcLevel(KLOCK_QUEUE_HANDLE*);
 LONG      WINAPI KeReleaseMutex(PRKMUTEX,BOOLEAN);
 LONG      WINAPI KeReleaseSemaphore(PRKSEMAPHORE,KPRIORITY,LONG,BOOLEAN);
@@ -1825,6 +1841,7 @@ void      WINAPI RtlCopyMemoryNonTemporal(void*,const void*,SIZE_T);
 #else
 #define RtlCopyMemoryNonTemporal RtlCopyMemory
 #endif
+ULONG64   WINAPI RtlGetEnabledExtendedFeatures(ULONG64);
 BOOLEAN   WINAPI RtlIsNtDdiVersionAvailable(ULONG);
 
 NTSTATUS  WINAPI ZwAddBootEntry(PUNICODE_STRING,PUNICODE_STRING);

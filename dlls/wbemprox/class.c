@@ -116,24 +116,29 @@ static HRESULT WINAPI enum_class_object_Next(
     struct table *table;
     static int once = 0;
     HRESULT hr;
+    ULONG i, j;
 
     TRACE("%p, %d, %u, %p, %p\n", iface, lTimeout, uCount, apObjects, puReturned);
 
-    if (!uCount) return WBEM_S_FALSE;
     if (!apObjects || !puReturned) return WBEM_E_INVALID_PARAMETER;
     if (lTimeout != WBEM_INFINITE && !once++) FIXME("timeout not supported\n");
 
     *puReturned = 0;
-    if (ec->index >= view->result_count) return WBEM_S_FALSE;
 
-    table = get_view_table( view, ec->index );
-    hr = create_class_object( table->name, iface, ec->index, NULL, apObjects );
-    if (hr != S_OK) return hr;
+    for (i = 0; i < uCount; i++)
+    {
+        if (ec->index >= view->result_count) return WBEM_S_FALSE;
+        table = get_view_table( view, ec->index );
+        hr = create_class_object( table->name, iface, ec->index, NULL, &apObjects[i] );
+        if (hr != S_OK)
+        {
+            for (j = 0; j < i; j++) IWbemClassObject_Release( apObjects[j] );
+            return hr;
+        }
+        ec->index++;
+        (*puReturned)++;
+    }
 
-    ec->index++;
-    *puReturned = 1;
-    if (ec->index == view->result_count && uCount > 1) return WBEM_S_FALSE;
-    if (uCount > 1) return WBEM_S_TIMEDOUT;
     return WBEM_S_NO_ERROR;
 }
 
@@ -455,6 +460,9 @@ static HRESULT WINAPI class_object_Put(
         if ((hr = get_column_index( co->record->table, wszName, &index )) != S_OK) return hr;
         return record_set_value( co->record, index, pVal );
     }
+
+    if (!ec) return S_OK;
+
     return put_propval( ec->query->view, co->index, wszName, pVal, Type );
 }
 
@@ -479,13 +487,21 @@ static HRESULT WINAPI class_object_GetNames(
     TRACE("%p, %s, %08x, %s, %p\n", iface, debugstr_w(wszQualifierName), lFlags,
           debugstr_variant(pQualifierVal), pNames);
 
-    if (lFlags != WBEM_FLAG_ALWAYS &&
+    if (!pNames)
+        return WBEM_E_INVALID_PARAMETER;
+
+    /* Combination used in a handful of broken apps */
+    if (lFlags == (WBEM_FLAG_ALWAYS | WBEM_MASK_CONDITION_ORIGIN))
+        lFlags = WBEM_FLAG_ALWAYS;
+
+    if (lFlags && (lFlags != WBEM_FLAG_ALWAYS &&
         lFlags != WBEM_FLAG_NONSYSTEM_ONLY &&
-        lFlags != WBEM_FLAG_SYSTEM_ONLY)
+        lFlags != WBEM_FLAG_SYSTEM_ONLY))
     {
         FIXME("flags %08x not supported\n", lFlags);
         return E_NOTIMPL;
     }
+
     if (wszQualifierName || pQualifierVal)
         FIXME("qualifier not supported\n");
 

@@ -22,6 +22,7 @@
 #define _INC_CONDRV
 
 #include "winioctl.h"
+#include "wincon.h"
 
 /* common console input and output ioctls */
 #define IOCTL_CONDRV_GET_MODE              CTL_CODE(FILE_DEVICE_CONSOLE,  0, METHOD_BUFFERED, FILE_READ_PROPERTIES)
@@ -32,13 +33,18 @@
 #define IOCTL_CONDRV_WRITE_INPUT           CTL_CODE(FILE_DEVICE_CONSOLE, 11, METHOD_BUFFERED, FILE_WRITE_PROPERTIES)
 #define IOCTL_CONDRV_PEEK                  CTL_CODE(FILE_DEVICE_CONSOLE, 12, METHOD_BUFFERED, FILE_READ_ACCESS)
 #define IOCTL_CONDRV_GET_INPUT_INFO        CTL_CODE(FILE_DEVICE_CONSOLE, 13, METHOD_BUFFERED, FILE_READ_PROPERTIES)
+#define IOCTL_CONDRV_SET_INPUT_INFO        CTL_CODE(FILE_DEVICE_CONSOLE, 14, METHOD_BUFFERED, FILE_WRITE_PROPERTIES)
 #define IOCTL_CONDRV_GET_TITLE             CTL_CODE(FILE_DEVICE_CONSOLE, 15, METHOD_BUFFERED, FILE_READ_PROPERTIES)
+#define IOCTL_CONDRV_SET_TITLE             CTL_CODE(FILE_DEVICE_CONSOLE, 16, METHOD_BUFFERED, FILE_WRITE_PROPERTIES)
 
 /* console output ioctls */
+#define IOCTL_CONDRV_READ_OUTPUT           CTL_CODE(FILE_DEVICE_CONSOLE, 30, METHOD_BUFFERED, FILE_READ_DATA)
+#define IOCTL_CONDRV_WRITE_OUTPUT          CTL_CODE(FILE_DEVICE_CONSOLE, 31, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_CONDRV_GET_OUTPUT_INFO       CTL_CODE(FILE_DEVICE_CONSOLE, 32, METHOD_BUFFERED, FILE_READ_PROPERTIES)
 #define IOCTL_CONDRV_SET_OUTPUT_INFO       CTL_CODE(FILE_DEVICE_CONSOLE, 33, METHOD_BUFFERED, FILE_WRITE_PROPERTIES)
 #define IOCTL_CONDRV_ACTIVATE              CTL_CODE(FILE_DEVICE_CONSOLE, 34, METHOD_BUFFERED, FILE_WRITE_DATA)
 #define IOCTL_CONDRV_FILL_OUTPUT           CTL_CODE(FILE_DEVICE_CONSOLE, 35, METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_CONDRV_SCROLL                CTL_CODE(FILE_DEVICE_CONSOLE, 36, METHOD_BUFFERED, FILE_WRITE_DATA)
 
 /* console renderer ioctls */
 #define IOCTL_CONDRV_GET_RENDERER_EVENTS   CTL_CODE(FILE_DEVICE_CONSOLE, 70, METHOD_BUFFERED, FILE_READ_PROPERTIES)
@@ -64,10 +70,46 @@ typedef struct
 /* IOCTL_CONDRV_GET_INPUT_INFO result */
 struct condrv_input_info
 {
+    unsigned int  input_cp;       /* console input codepage */
+    unsigned int  output_cp;      /* console output codepage */
     unsigned int  history_mode;   /* whether we duplicate lines in history */
     unsigned int  history_size;   /* number of lines in history */
+    unsigned int  history_index;  /* number of used lines in history */
     unsigned int  edition_mode;   /* index to the edition mode flavors */
     unsigned int  input_count;    /* number of available input records */
+    condrv_handle_t win;          /* renderer window handle */
+};
+
+/* IOCTL_CONDRV_SET_INPUT_INFO params */
+struct condrv_input_info_params
+{
+    unsigned int  mask;               /* setting mask */
+    struct condrv_input_info info;    /* input_info */
+};
+
+#define SET_CONSOLE_INPUT_INFO_EDITION_MODE     0x01
+#define SET_CONSOLE_INPUT_INFO_INPUT_CODEPAGE   0x02
+#define SET_CONSOLE_INPUT_INFO_OUTPUT_CODEPAGE  0x04
+#define SET_CONSOLE_INPUT_INFO_WIN              0x08
+#define SET_CONSOLE_INPUT_INFO_HISTORY_MODE     0x10
+#define SET_CONSOLE_INPUT_INFO_HISTORY_SIZE     0x20
+
+/* IOCTL_CONDRV_WRITE_OUTPUT and IOCTL_CONDRV_READ_OUTPUT params */
+struct condrv_output_params
+{
+    unsigned int  x;                  /* destination position */
+    unsigned int  y;
+    unsigned int  mode;               /* char info mode */
+    unsigned int  width;              /* width of output rectangle, 0 for wrapped mode */
+    /* followed by an array of data with type depending on mode */
+};
+
+enum char_info_mode
+{
+    CHAR_INFO_MODE_TEXT,              /* characters only */
+    CHAR_INFO_MODE_ATTR,              /* attributes only */
+    CHAR_INFO_MODE_TEXTATTR,          /* both characters and attributes */
+    CHAR_INFO_MODE_TEXTSTDATTR,       /* characters but use standard attributes */
 };
 
 /* IOCTL_CONDRV_GET_OUTPUT_INFO result */
@@ -101,6 +143,16 @@ struct condrv_output_info_params
     struct condrv_output_info info;   /* output info */
 };
 
+#define SET_CONSOLE_OUTPUT_INFO_CURSOR_GEOM     0x0001
+#define SET_CONSOLE_OUTPUT_INFO_CURSOR_POS      0x0002
+#define SET_CONSOLE_OUTPUT_INFO_SIZE            0x0004
+#define SET_CONSOLE_OUTPUT_INFO_ATTR            0x0008
+#define SET_CONSOLE_OUTPUT_INFO_DISPLAY_WINDOW  0x0010
+#define SET_CONSOLE_OUTPUT_INFO_MAX_SIZE        0x0020
+#define SET_CONSOLE_OUTPUT_INFO_FONT            0x0040
+#define SET_CONSOLE_OUTPUT_INFO_COLORTABLE      0x0080
+#define SET_CONSOLE_OUTPUT_INFO_POPUP_ATTR      0x0100
+
 /* IOCTL_CONDRV_FILL_OUTPUT params */
 struct condrv_fill_output_params
 {
@@ -113,15 +165,14 @@ struct condrv_fill_output_params
     unsigned short attr;              /* attribute to write */
 };
 
-#define SET_CONSOLE_OUTPUT_INFO_CURSOR_GEOM     0x0001
-#define SET_CONSOLE_OUTPUT_INFO_CURSOR_POS      0x0002
-#define SET_CONSOLE_OUTPUT_INFO_SIZE            0x0004
-#define SET_CONSOLE_OUTPUT_INFO_ATTR            0x0008
-#define SET_CONSOLE_OUTPUT_INFO_DISPLAY_WINDOW  0x0010
-#define SET_CONSOLE_OUTPUT_INFO_MAX_SIZE        0x0020
-#define SET_CONSOLE_OUTPUT_INFO_FONT            0x0040
-#define SET_CONSOLE_OUTPUT_INFO_COLORTABLE      0x0080
-#define SET_CONSOLE_OUTPUT_INFO_POPUP_ATTR      0x0100
+/* IOCTL_CONDRV_SCROLL params */
+struct condrv_scroll_params
+{
+    SMALL_RECT   scroll;              /* source rectangle */
+    COORD        origin;              /* destination coordinates */
+    SMALL_RECT   clip;                /* clipping rectangle */
+    char_info_t  fill;                /* empty character info */
+};
 
 /* IOCTL_CONDRV_GET_RENDERER_EVENTS result */
 struct condrv_renderer_event
@@ -163,7 +214,6 @@ enum condrv_renderer_event_type
 {
     CONSOLE_RENDERER_NONE_EVENT,
     CONSOLE_RENDERER_TITLE_EVENT,
-    CONSOLE_RENDERER_ACTIVE_SB_EVENT,
     CONSOLE_RENDERER_SB_RESIZE_EVENT,
     CONSOLE_RENDERER_UPDATE_EVENT,
     CONSOLE_RENDERER_CURSOR_POS_EVENT,

@@ -8693,7 +8693,7 @@ msgstr ""
 msgid "&Test Connection"
 msgstr "重置的連線"
 
-#: version.rc:92 winemine.rc:65
+#: version.rc:92
 msgid "Advanced"
 msgstr "進階"
 
@@ -13063,6 +13063,24 @@ msgstr "啟動"
 msgid "&Run..."
 msgstr "執行(&R)..."
 
+#: fsutil.mc:28
+msgid ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+msgstr ""
+
+#: fsutil.mc:35
+msgid ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+msgstr ""
+
+#: fsutil.mc:40
+msgid "Syntax: fsutil hardlink create <new> <existing>\n"
+msgstr ""
+
 #: hostname.rc:30
 msgid "Usage: hostname\n"
 msgstr "用法：主機名稱\n"
@@ -17109,8 +17127,10 @@ msgid "&Beginner"
 msgstr "初學者(&B)"
 
 #: winemine.rc:45
-msgid "&Advanced"
-msgstr "進階(&A)"
+#, fuzzy
+#| msgid "Interface"
+msgid "&Intermediate"
+msgstr "介面"
 
 #: winemine.rc:46
 msgid "&Expert"
@@ -17139,6 +17159,12 @@ msgstr "最快時間"
 #: winemine.rc:64
 msgid "Beginner"
 msgstr "初學者"
+
+#: winemine.rc:65
+#, fuzzy
+#| msgid "Interface"
+msgid "Intermediate"
+msgstr "介面"
 
 #: winemine.rc:66
 msgid "Expert"

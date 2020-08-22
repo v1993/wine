@@ -66,19 +66,12 @@ static void WINECON_Usage(void)
  */
 static void WINECON_FetchCells(struct inner_data* data, int upd_tp, int upd_bm)
 {
-    SERVER_START_REQ( read_console_output )
-    {
-        req->handle = wine_server_obj_handle( data->hConOut );
-        req->x      = 0;
-        req->y      = upd_tp;
-        req->mode   = CHAR_INFO_MODE_TEXTATTR;
-        req->wrap   = TRUE;
-        wine_server_set_reply( req, &data->cells[upd_tp * data->curcfg.sb_width],
-                               (upd_bm-upd_tp+1) * data->curcfg.sb_width * sizeof(CHAR_INFO) );
-        wine_server_call( req );
-    }
-    SERVER_END_REQ;
-    data->fnRefresh(data, upd_tp, upd_bm);
+    SMALL_RECT region = { 0, upd_tp, data->curcfg.sb_width - 1, upd_bm };
+    COORD size = { data->curcfg.sb_width, data->curcfg.sb_height };
+    COORD coord = { 0, upd_tp };
+
+    if (ReadConsoleOutputW(data->console, data->cells, size, coord, &region))
+        data->fnRefresh(data, upd_tp, upd_bm);
 }
 
 /******************************************************************
@@ -116,17 +109,9 @@ void WINECON_ResizeWithContainer(struct inner_data* data, int width, int height)
  */
 static BOOL WINECON_SetHistorySize(HANDLE hConIn, int size)
 {
-    BOOL	ret;
-
-    SERVER_START_REQ(set_console_input_info)
-    {
-	req->handle = wine_server_obj_handle( hConIn );
-	req->mask = SET_CONSOLE_INPUT_INFO_HISTORY_SIZE;
-	req->history_size = size;
-	ret = !wine_server_call_err( req );
-    }
-    SERVER_END_REQ;
-    return ret;
+    struct condrv_input_info_params params = { SET_CONSOLE_INPUT_INFO_HISTORY_SIZE };
+    params.info.history_size = size;
+    return DeviceIoControl(hConIn, IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL, NULL);
 }
 
 /******************************************************************
@@ -136,17 +121,9 @@ static BOOL WINECON_SetHistorySize(HANDLE hConIn, int size)
  */
 static BOOL WINECON_SetHistoryMode(HANDLE hConIn, int mode)
 {
-    BOOL	ret;
-
-    SERVER_START_REQ(set_console_input_info)
-    {
-	req->handle = wine_server_obj_handle( hConIn );
-	req->mask = SET_CONSOLE_INPUT_INFO_HISTORY_MODE;
-	req->history_mode = mode;
-	ret = !wine_server_call_err( req );
-    }
-    SERVER_END_REQ;
-    return ret;
+    struct condrv_input_info_params params = { SET_CONSOLE_INPUT_INFO_HISTORY_MODE };
+    params.info.history_mode = mode;
+    return DeviceIoControl(hConIn, IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL, NULL);
 }
 
 /******************************************************************
@@ -189,17 +166,9 @@ BOOL WINECON_GetConsoleTitle(HANDLE hConIn, WCHAR* buffer, size_t len)
  */
 static BOOL WINECON_SetEditionMode(HANDLE hConIn, int edition_mode)
 {
-    BOOL ret;
-
-    SERVER_START_REQ( set_console_input_info )
-    {
-        req->handle = wine_server_obj_handle( hConIn );
-        req->mask = SET_CONSOLE_INPUT_INFO_EDITION_MODE;
-        req->edition_mode = edition_mode;
-        ret = !wine_server_call_err( req );
-    }
-    SERVER_END_REQ;
-    return ret;
+    struct condrv_input_info_params params = { SET_CONSOLE_INPUT_INFO_EDITION_MODE };
+    params.info.edition_mode = edition_mode;
+    return DeviceIoControl(hConIn, IOCTL_CONDRV_SET_INPUT_INFO, &params, sizeof(params), NULL, 0, NULL, NULL);
 }
 
 /******************************************************************
@@ -217,7 +186,7 @@ static void WINECON_SetColors(struct inner_data *data, const struct config_data*
 
     params.info.popup_attr = cfg->popup_attr;
     memcpy(params.info.color_map, cfg->color_map, sizeof(cfg->color_map));
-    DeviceIoControl(data->hConOut, IOCTL_CONDRV_SET_OUTPUT_INFO, &params, sizeof(params), NULL, 0, NULL, NULL);
+    DeviceIoControl(data->console, IOCTL_CONDRV_SET_OUTPUT_INFO, &params, sizeof(params), NULL, 0, NULL, NULL);
 }
 
 /******************************************************************
@@ -230,12 +199,12 @@ void	WINECON_GrabChanges(struct inner_data* data)
     struct condrv_renderer_event *evts = data->events;
     int i, ev_found;
     DWORD num;
-    HANDLE h;
 
     if (data->in_grab_changes) return;
 
-    if (!GetOverlappedResult(data->hSynchro, &data->overlapped, &num, FALSE))
+    if (!GetOverlappedResult(data->console, &data->overlapped, &num, FALSE))
     {
+        if (GetLastError() == ERROR_IO_INCOMPLETE) return;
         ERR( "failed to get renderer events: %u\n", GetLastError() );
         data->dying = TRUE;
         return;
@@ -296,23 +265,6 @@ void	WINECON_GrabChanges(struct inner_data* data)
 	case CONSOLE_RENDERER_TITLE_EVENT:
 	    WINE_TRACE("%u/%u: title()\n", i+1, num);
 	    data->fnSetTitle(data);
-	    break;
-	case CONSOLE_RENDERER_ACTIVE_SB_EVENT:
-	    SERVER_START_REQ( open_console )
-	    {
-                req->from       = wine_server_obj_handle( data->hConIn );
-                req->access     = GENERIC_READ | GENERIC_WRITE;
-                req->attributes = 0;
-                req->share      = FILE_SHARE_READ | FILE_SHARE_WRITE;
-                h = wine_server_call_err( req ) ? 0 : wine_server_ptr_handle(reply->handle);
-	    }
-	    SERVER_END_REQ;
-	    WINE_TRACE("%u/%u: active(%p)\n", i+1, num, h);
-	    if (h)
-	    {
-		CloseHandle(data->hConOut);
-		data->hConOut = h;
-	    }
 	    break;
 	case CONSOLE_RENDERER_SB_RESIZE_EVENT:
 	    if (data->curcfg.sb_width != evts[i].u.resize.width ||
@@ -385,7 +337,7 @@ void	WINECON_GrabChanges(struct inner_data* data)
     }
     data->in_grab_changes = FALSE;
 
-    if (!DeviceIoControl(data->hSynchro, IOCTL_CONDRV_GET_RENDERER_EVENTS, NULL, 0, data->events,
+    if (!DeviceIoControl(data->console, IOCTL_CONDRV_GET_RENDERER_EVENTS, NULL, 0, data->events,
                          sizeof(data->events), NULL, &data->overlapped) && GetLastError() != ERROR_IO_PENDING)
     {
         ERR("failed to get renderer events: %u\n", GetLastError());
@@ -413,26 +365,26 @@ void     WINECON_SetConfig(struct inner_data* data, const struct config_data* cf
          * (no notification is sent when invariant operation is requested)
          */
         cinfo.bVisible = !cfg->cursor_visible;
-        SetConsoleCursorInfo(data->hConOut, &cinfo);
+        SetConsoleCursorInfo(data->console, &cinfo);
         /* </FIXME> */
         cinfo.bVisible = cfg->cursor_visible;
         /* this shall update (through notif) curcfg */
-        SetConsoleCursorInfo(data->hConOut, &cinfo);
+        SetConsoleCursorInfo(data->console, &cinfo);
     }
     if (data->curcfg.history_size != cfg->history_size)
     {
         data->curcfg.history_size = cfg->history_size;
-        WINECON_SetHistorySize(data->hConIn, cfg->history_size);
+        WINECON_SetHistorySize(data->console, cfg->history_size);
     }
     if (data->curcfg.history_nodup != cfg->history_nodup)
     {
         data->curcfg.history_nodup = cfg->history_nodup;
-        WINECON_SetHistoryMode(data->hConIn, cfg->history_nodup);
+        WINECON_SetHistoryMode(data->console, cfg->history_nodup);
     }
     if (data->curcfg.insert_mode != cfg->insert_mode)
     {
         data->curcfg.insert_mode = cfg->insert_mode;
-        WINECON_SetInsertMode(data->hConIn, cfg->insert_mode);
+        WINECON_SetInsertMode(data->console, cfg->insert_mode);
     }
     data->curcfg.menu_mask = cfg->menu_mask;
     data->curcfg.quick_edit = cfg->quick_edit;
@@ -455,7 +407,7 @@ void     WINECON_SetConfig(struct inner_data* data, const struct config_data* cf
             params->info.font_weight = cfg->font_weight;
             params->info.font_pitch_family = cfg->font_pitch_family;
             memcpy(params + 1, cfg->face_name, len * sizeof(WCHAR));
-            DeviceIoControl(data->hConOut, IOCTL_CONDRV_SET_OUTPUT_INFO, params, sizeof(*params) + len * sizeof(WCHAR),
+            DeviceIoControl(data->console, IOCTL_CONDRV_SET_OUTPUT_INFO, params, sizeof(*params) + len * sizeof(WCHAR),
                             NULL, 0, NULL, NULL);
         }
     }
@@ -466,8 +418,8 @@ void     WINECON_SetConfig(struct inner_data* data, const struct config_data* cf
 
         data->curcfg.def_attr = cfg->def_attr;
         screen_size = cfg->win_width * (cfg->win_height + 1);
-        FillConsoleOutputAttribute(data->hConOut, cfg->def_attr, screen_size, top_left, &written);
-        SetConsoleTextAttribute(data->hConOut, cfg->def_attr);
+        FillConsoleOutputAttribute(data->console, cfg->def_attr, screen_size, top_left, &written);
+        SetConsoleTextAttribute(data->console, cfg->def_attr);
     }
     WINECON_SetColors(data, cfg);
     /* now let's look at the window / sb size changes...
@@ -484,13 +436,13 @@ void     WINECON_SetConfig(struct inner_data* data, const struct config_data* cf
 
 #define ChgSBfWidth()   do {c.X = cfg->sb_width; \
                             c.Y = data->curcfg.sb_height;\
-                            SetConsoleScreenBufferSize(data->hConOut, c);\
+                            SetConsoleScreenBufferSize(data->console, c);\
                         } while (0)
 #define ChgWinHPos()    do {pos.Left = cfg->win_pos.X - data->curcfg.win_pos.X; \
                             pos.Top = 0; \
                             pos.Right = pos.Left + cfg->win_width - data->curcfg.win_width; \
                             pos.Bottom = 0; \
-                            SetConsoleWindowInfo(data->hConOut, FALSE, &pos);\
+                            SetConsoleWindowInfo(data->console, FALSE, &pos);\
                         } while (0)
 #define TstSBfHeight()  (data->curcfg.sb_height != cfg->sb_height)
 #define TstWinVPos()    (data->curcfg.win_height != cfg->win_height || data->curcfg.win_pos.Y != cfg->win_pos.Y)
@@ -498,13 +450,13 @@ void     WINECON_SetConfig(struct inner_data* data, const struct config_data* cf
 /* since we're going to apply height after width is done, we use width as defined 
  * in cfg, and not in data->curcfg because if won't be updated yet */
 #define ChgSBfHeight()  do {c.X = cfg->sb_width; c.Y = cfg->sb_height; \
-                            SetConsoleScreenBufferSize(data->hConOut, c); \
+                            SetConsoleScreenBufferSize(data->console, c); \
                         } while (0)
 #define ChgWinVPos()    do {pos.Left = 0; \
                             pos.Top = cfg->win_pos.Y - data->curcfg.win_pos.Y; \
                             pos.Right = 0; \
                             pos.Bottom = pos.Top + cfg->win_height - data->curcfg.win_height; \
-                            SetConsoleWindowInfo(data->hConOut, FALSE, &pos);\
+                            SetConsoleWindowInfo(data->console, FALSE, &pos);\
                         } while (0)
 
     do
@@ -559,7 +511,7 @@ void     WINECON_SetConfig(struct inner_data* data, const struct config_data* cf
     if (data->curcfg.edition_mode != cfg->edition_mode)
     {
         data->curcfg.edition_mode = cfg->edition_mode;
-        WINECON_SetEditionMode(data->hConIn, cfg->edition_mode);
+        WINECON_SetEditionMode(data->console, cfg->edition_mode);
     }
     /* we now need to gather all events we got from the operations above,
      * in order to get data correctly updated
@@ -578,9 +530,7 @@ static void WINECON_Delete(struct inner_data* data)
     if (!data) return;
 
     if (data->fnDeleteBackend)  data->fnDeleteBackend(data);
-    if (data->hConIn)		CloseHandle(data->hConIn);
-    if (data->hConOut)		CloseHandle(data->hConOut);
-    if (data->hSynchro)		CloseHandle(data->hSynchro);
+    if (data->console)		CloseHandle(data->console);
     if (data->hProcess)         CloseHandle(data->hProcess);
     if (data->overlapped.hEvent) CloseHandle(data->overlapped.hEvent);
     HeapFree(GetProcessHeap(), 0, data->curcfg.registry);
@@ -601,18 +551,18 @@ static BOOL WINECON_GetServerConfig(struct inner_data* data)
     struct condrv_output_info output_info;
     DWORD mode;
 
-    if (!DeviceIoControl(data->hConIn, IOCTL_CONDRV_GET_INPUT_INFO, NULL, 0,
+    if (!DeviceIoControl(data->console, IOCTL_CONDRV_GET_INPUT_INFO, NULL, 0,
                          &input_info, sizeof(input_info), NULL, NULL))
         return FALSE;
     data->curcfg.history_size  = input_info.history_size;
     data->curcfg.history_nodup = input_info.history_mode;
     data->curcfg.edition_mode  = input_info.edition_mode;
 
-    GetConsoleMode(data->hConIn, &mode);
+    GetConsoleMode(data->console, &mode);
     data->curcfg.insert_mode = (mode & (ENABLE_INSERT_MODE|ENABLE_EXTENDED_FLAGS)) ==
                                        (ENABLE_INSERT_MODE|ENABLE_EXTENDED_FLAGS);
 
-    if (!DeviceIoControl(data->hConOut, IOCTL_CONDRV_GET_OUTPUT_INFO, NULL, 0,
+    if (!DeviceIoControl(data->console, IOCTL_CONDRV_GET_OUTPUT_INFO, NULL, 0,
                          &output_info, sizeof(output_info), NULL, NULL))
         return FALSE;
     data->curcfg.cursor_size = output_info.cursor_size;
@@ -628,6 +578,53 @@ static BOOL WINECON_GetServerConfig(struct inner_data* data)
 }
 
 /******************************************************************
+ *		WINECON_Spawn
+ *
+ * Spawn the child process when invoked with wineconsole foo bar
+ */
+static BOOL WINECON_Spawn(struct inner_data* data, LPWSTR cmdLine, HANDLE con_in, HANDLE con_out)
+{
+    PROCESS_INFORMATION info;
+    STARTUPINFOW        startup;
+    BOOL                done;
+
+    /* we're in the case wineconsole <exe> <options>... spawn the new process */
+    memset(&startup, 0, sizeof(startup));
+    startup.cb          = sizeof(startup);
+    startup.dwFlags     = STARTF_USESTDHANDLES;
+
+    /* the attributes of wineconsole's handles are not adequate for inheritance, so
+     * get them with the correct attributes before process creation
+     */
+    if (!DuplicateHandle(GetCurrentProcess(), con_in,  GetCurrentProcess(),
+			 &startup.hStdInput, GENERIC_READ|GENERIC_WRITE|SYNCHRONIZE, TRUE, 0) ||
+	!DuplicateHandle(GetCurrentProcess(), con_out, GetCurrentProcess(),
+			 &startup.hStdOutput, GENERIC_READ|GENERIC_WRITE, TRUE, 0) ||
+	!DuplicateHandle(GetCurrentProcess(), con_out, GetCurrentProcess(),
+                         &startup.hStdError, GENERIC_READ|GENERIC_WRITE, TRUE, 0))
+    {
+	WINE_ERR("Can't dup handles\n");
+	/* no need to delete handles, we're exiting the program anyway */
+	return FALSE;
+    }
+
+    done = CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, 0L, NULL, NULL, &startup, &info);
+    if (done)
+    {
+        data->hProcess = info.hProcess;
+        CloseHandle(info.hThread);
+    }
+    else printf_res(IDS_CMD_LAUNCH_FAILED, wine_dbgstr_w(cmdLine));
+
+    /* we no longer need the handles passed to the child for the console */
+    CloseHandle(startup.hStdInput);
+    CloseHandle(startup.hStdOutput);
+    CloseHandle(startup.hStdError);
+
+    return done;
+}
+
+/******************************************************************
  *		WINECON_Init
  *
  * Initialisation part I. Creation of server object (console input and
@@ -635,8 +632,9 @@ static BOOL WINECON_GetServerConfig(struct inner_data* data)
  */
 static struct inner_data* WINECON_Init(HINSTANCE hInst, DWORD pid, LPCWSTR appname,
                                        enum init_return (*backend)(struct inner_data*),
-                                       INT nCmdShow)
+                                       INT nCmdShow, WCHAR *cmdline)
 {
+    struct condrv_input_info_params input_params;
     OBJECT_ATTRIBUTES attr = {sizeof(attr)};
     struct inner_data*	data = NULL;
     DWORD		ret;
@@ -645,6 +643,8 @@ static struct inner_data* WINECON_Init(HINSTANCE hInst, DWORD pid, LPCWSTR appna
     UNICODE_STRING string;
     IO_STATUS_BLOCK io;
     condrv_handle_t h;
+    HANDLE con_in;
+    HANDLE con_out;
     NTSTATUS status;
 
     static const WCHAR renderer_pathW[] = {'\\','D','e','v','i','c','e','\\','C','o','n','D','r','v',
@@ -689,36 +689,36 @@ static struct inner_data* WINECON_Init(HINSTANCE hInst, DWORD pid, LPCWSTR appna
         req->input_fd   = -1;
 
         ret = !wine_server_call_err( req );
-        data->hConIn = wine_server_ptr_handle( reply->handle_in );
+        con_in = wine_server_ptr_handle( reply->handle_in );
     }
     SERVER_END_REQ;
     if (!ret) goto error;
-    WINE_TRACE("using hConIn %p, hSynchro event %p\n", data->hConIn, data->hSynchro);
+    WINE_TRACE("using con_in %p, renderer %p\n", con_in, data->console);
 
     RtlInitUnicodeString(&string, renderer_pathW);
     attr.ObjectName = &string;
-    status = NtCreateFile(&data->hSynchro, FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_PROPERTIES
+    status = NtCreateFile(&data->console, FILE_READ_DATA | FILE_WRITE_DATA | FILE_WRITE_PROPERTIES
                           | FILE_READ_PROPERTIES | SYNCHRONIZE, &attr, &io, NULL, FILE_ATTRIBUTE_NORMAL,
                           0, FILE_OPEN, FILE_NON_DIRECTORY_FILE,  NULL, 0);
     if (status) goto error;
 
-    h = condrv_handle(data->hConIn);
-    if (!DeviceIoControl(data->hSynchro, IOCTL_CONDRV_ATTACH_RENDERER, &h, sizeof(h), NULL, 0, NULL, NULL))
+    h = condrv_handle(con_in);
+    if (!DeviceIoControl(data->console, IOCTL_CONDRV_ATTACH_RENDERER, &h, sizeof(h), NULL, 0, NULL, NULL))
         goto error;
 
     SERVER_START_REQ(create_console_output)
     {
-        req->handle_in  = wine_server_obj_handle( data->hConIn );
+        req->handle_in  = wine_server_obj_handle( con_in );
         req->access     = GENERIC_WRITE|GENERIC_READ;
         req->attributes = 0;
         req->share      = FILE_SHARE_READ|FILE_SHARE_WRITE;
         req->fd         = -1;
         ret = !wine_server_call_err( req );
-        data->hConOut   = wine_server_ptr_handle( reply->handle_out );
+        con_out         = wine_server_ptr_handle( reply->handle_out );
     }
     SERVER_END_REQ;
     if (!ret) goto error;
-    WINE_TRACE("using hConOut %p\n", data->hConOut);
+    WINE_TRACE("using con_out %p\n", con_out);
 
     /* filling data->curcfg from cfg */
     switch ((*backend)(data))
@@ -743,19 +743,24 @@ static struct inner_data* WINECON_Init(HINSTANCE hInst, DWORD pid, LPCWSTR appna
         WINECON_SetConfig(data, &cfg);
         data->curcfg.registry = cfg.registry;
         WINECON_DumpConfig("fint", &data->curcfg);
-        SERVER_START_REQ( set_console_input_info )
-        {
-            req->handle = wine_server_obj_handle( data->hConIn );
-            req->win = wine_server_user_handle( data->hWnd );
-            req->mask = SET_CONSOLE_INPUT_INFO_TITLE |
-                        SET_CONSOLE_INPUT_INFO_WIN;
-            wine_server_add_data( req, appname, lstrlenW(appname) * sizeof(WCHAR) );
-            ret = !wine_server_call_err( req );
-        }
-        SERVER_END_REQ;
+
+        memset(&input_params, 0, sizeof(input_params));
+        input_params.mask = SET_CONSOLE_INPUT_INFO_WIN;
+        input_params.info.win = condrv_handle(data->hWnd);
+        ret = DeviceIoControl(data->console, IOCTL_CONDRV_SET_INPUT_INFO, &input_params, sizeof(input_params),
+                              NULL, 0, NULL, NULL);
         if (!ret) goto error;
 
+        ret = DeviceIoControl(data->console, IOCTL_CONDRV_SET_TITLE, (void *)appname,
+                              lstrlenW(appname) * sizeof(WCHAR), NULL, 0, NULL, NULL);
+        if (!ret) goto error;
+
+        if (cmdline && !WINECON_Spawn(data, cmdline, con_in, con_out)) goto error;
+
+        CloseHandle(con_in);
+        CloseHandle(con_out);
         return data;
+
     case init_failed:
         break;
     }
@@ -765,52 +770,6 @@ static struct inner_data* WINECON_Init(HINSTANCE hInst, DWORD pid, LPCWSTR appna
 
     WINECON_Delete(data);
     return NULL;
-}
-
-/******************************************************************
- *		WINECON_Spawn
- *
- * Spawn the child process when invoked with wineconsole foo bar
- */
-static int WINECON_Spawn(struct inner_data* data, LPWSTR cmdLine)
-{
-    PROCESS_INFORMATION info;
-    STARTUPINFOW        startup;
-    BOOL                done;
-
-    /* we're in the case wineconsole <exe> <options>... spawn the new process */
-    memset(&startup, 0, sizeof(startup));
-    startup.cb          = sizeof(startup);
-    startup.dwFlags     = STARTF_USESTDHANDLES;
-
-    /* the attributes of wineconsole's handles are not adequate for inheritance, so
-     * get them with the correct attributes before process creation
-     */
-    if (!DuplicateHandle(GetCurrentProcess(), data->hConIn,  GetCurrentProcess(),
-			 &startup.hStdInput, GENERIC_READ|GENERIC_WRITE|SYNCHRONIZE, TRUE, 0) ||
-	!DuplicateHandle(GetCurrentProcess(), data->hConOut, GetCurrentProcess(),
-			 &startup.hStdOutput, GENERIC_READ|GENERIC_WRITE, TRUE, 0) ||
-	!DuplicateHandle(GetCurrentProcess(), data->hConOut, GetCurrentProcess(),
-                         &startup.hStdError, GENERIC_READ|GENERIC_WRITE, TRUE, 0))
-    {
-	WINE_ERR("Can't dup handles\n");
-	/* no need to delete handles, we're exiting the program anyway */
-	return 1;
-    }
-
-    done = CreateProcessW(NULL, cmdLine, NULL, NULL, TRUE, 0L, NULL, NULL, &startup, &info);
-    if (done)
-    {
-        data->hProcess = info.hProcess;
-        CloseHandle(info.hThread);
-    }
-
-    /* we no longer need the handles passed to the child for the console */
-    CloseHandle(startup.hStdInput);
-    CloseHandle(startup.hStdOutput);
-    CloseHandle(startup.hStdError);
-
-    return !done;
 }
 
 struct wc_init {
@@ -894,6 +853,9 @@ int PASCAL WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, INT nCmdSh
     int			ret = 1;
     struct wc_init      wci;
 
+    /* make sure we're not connected to inherited console */
+    FreeConsole();
+
     if ((ret = WINECON_ParseOptions(lpCmdLine, &wci)) != 0)
     {
         printf_res(ret & 0xffff);
@@ -906,7 +868,7 @@ int PASCAL WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, INT nCmdSh
     {
     case from_event:
         /* case of wineconsole <evt>, signal process that created us that we're up and running */
-        if (!(data = WINECON_Init(hInst, 0, NULL, wci.backend, nCmdShow))) return 1;
+        if (!(data = WINECON_Init(hInst, 0, NULL, wci.backend, nCmdShow, NULL))) return 1;
         ret = !SetEvent(wci.event);
         if (ret != 0) WINE_ERR("SetEvent failed.\n");
         break;
@@ -923,19 +885,9 @@ int PASCAL WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR lpCmdLine, INT nCmdSh
 
             MultiByteToWideChar(CP_ACP, 0, wci.ptr, -1, buffer, len);
 
-            if (!(data = WINECON_Init(hInst, GetCurrentProcessId(), buffer, wci.backend, nCmdShow)))
-            {
-                HeapFree(GetProcessHeap(), 0, buffer);
-                return 1;
-            }
-            ret = WINECON_Spawn(data, buffer);
+            data = WINECON_Init(hInst, GetCurrentProcessId(), buffer, wci.backend, nCmdShow, buffer);
             HeapFree(GetProcessHeap(), 0, buffer);
-            if (ret != 0)
-            {
-                WINECON_Delete(data);
-                printf_res(IDS_CMD_LAUNCH_FAILED, wine_dbgstr_a(wci.ptr));
-                return ret;
-            }
+            if (!data) return 1;
         }
         break;
     default:

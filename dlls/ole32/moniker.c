@@ -41,14 +41,8 @@
 #include "compobj_private.h"
 #include "moniker.h"
 #include "irot.h"
-#include "irpcss.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(ole);
-
-/* see MSDN docs for IROTData::GetComparisonData, which states what this
- * constant is
- */
-#define MAX_COMPARISON_DATA 2048
 
 static LONG WINAPI rpc_filter(EXCEPTION_POINTERS *eptr)
 {
@@ -78,7 +72,6 @@ typedef struct RunningObjectTableImpl
 
 static RunningObjectTableImpl* runningObjectTableInstance = NULL;
 static IrotHandle irot_handle;
-static RPC_BINDING_HANDLE irpcss_handle;
 
 /* define the EnumMonikerImpl structure */
 typedef struct EnumMonikerImpl
@@ -135,21 +128,6 @@ static IrotHandle get_irot_handle(void)
     return irot_handle;
 }
 
-static RPC_BINDING_HANDLE get_irpcss_handle(void)
-{
-    if (!irpcss_handle)
-    {
-        unsigned short protseq[] = IROT_PROTSEQ;
-        unsigned short endpoint[] = IROT_ENDPOINT;
-
-        RPC_BINDING_HANDLE new_handle = get_rpc_handle(protseq, endpoint);
-        if (InterlockedCompareExchangePointer(&irpcss_handle, new_handle, NULL))
-            /* another thread beat us to it */
-            RpcBindingFree(&new_handle);
-    }
-    return irpcss_handle;
-}
-
 static BOOL start_rpcss(void)
 {
     static const WCHAR rpcssW[] = {'R','p','c','S','s',0};
@@ -198,33 +176,6 @@ static BOOL start_rpcss(void)
     CloseServiceHandle( service );
     CloseServiceHandle( scm );
     return ret;
-}
-
-DWORD rpcss_get_next_seqid(void)
-{
-    DWORD id = 0;
-    HRESULT hr;
-
-    for (;;)
-    {
-        __TRY
-        {
-            hr = irpcss_get_thread_seq_id(get_irpcss_handle(), &id);
-        }
-        __EXCEPT(rpc_filter)
-        {
-            hr = HRESULT_FROM_WIN32(GetExceptionCode());
-        }
-        __ENDTRY
-        if (hr == HRESULT_FROM_WIN32(RPC_S_SERVER_UNAVAILABLE))
-        {
-            if (start_rpcss())
-                continue;
-        }
-        break;
-    }
-
-    return id;
 }
 
 static HRESULT create_stream_on_mip_ro(const InterfaceData *mip, IStream **stream)
@@ -289,7 +240,7 @@ static HRESULT get_moniker_comparison_data(IMoniker *pMoniker, MonikerComparison
     hr = IMoniker_QueryInterface(pMoniker, &IID_IROTData, (void *)&pROTData);
     if (SUCCEEDED(hr))
     {
-        ULONG size = MAX_COMPARISON_DATA;
+        ULONG size = ROT_COMPARE_MAX;
         *moniker_data = HeapAlloc(GetProcessHeap(), 0, FIELD_OFFSET(MonikerComparisonData, abData[size]));
         if (!*moniker_data)
         {

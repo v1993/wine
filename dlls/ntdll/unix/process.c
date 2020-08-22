@@ -277,7 +277,9 @@ static BOOL is_builtin_path( UNICODE_STRING *path, BOOL *is_64bit )
     *is_64bit = is_win64;
     if (path->Length > sizeof(systemW) && !wcsnicmp( path->Buffer, systemW, ARRAY_SIZE(systemW) ))
     {
-        if (is_wow64 && !ntdll_get_thread_data()->wow64_redir) *is_64bit = TRUE;
+#ifndef _WIN64
+        if (NtCurrentTeb64() && NtCurrentTeb64()->TlsSlots[WOW64_TLS_FILESYSREDIR]) *is_64bit = TRUE;
+#endif
         return TRUE;
     }
     if ((is_win64 || is_wow64) && path->Length > sizeof(wow64W) &&
@@ -1002,6 +1004,7 @@ done:
  */
 NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
 {
+    static BOOL clean_exit;
     NTSTATUS ret;
     BOOL self;
 
@@ -1013,7 +1016,12 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
         self = reply->self;
     }
     SERVER_END_REQ;
-    if (self && handle) abort_process( exit_code );
+    if (self)
+    {
+        if (!handle) clean_exit = TRUE;
+        else if (clean_exit) exit_process( exit_code );
+        else abort_process( exit_code );
+    }
     return ret;
 }
 
@@ -1573,6 +1581,28 @@ NTSTATUS WINAPI NtSetInformationProcess( HANDLE handle, PROCESSINFOCLASS class, 
             virtual_set_force_exec( enable );
         }
         break;
+
+    case ProcessThreadStackAllocation:
+    {
+        void *addr = NULL;
+        SIZE_T reserve;
+        PROCESS_STACK_ALLOCATION_INFORMATION *stack = info;
+        if (size == sizeof(PROCESS_STACK_ALLOCATION_INFORMATION_EX))
+            stack = &((PROCESS_STACK_ALLOCATION_INFORMATION_EX *)info)->AllocInfo;
+        else if (size != sizeof(*stack)) return STATUS_INFO_LENGTH_MISMATCH;
+
+        reserve = stack->ReserveSize;
+        ret = NtAllocateVirtualMemory( GetCurrentProcess(), &addr, stack->ZeroBits, &reserve,
+                                       MEM_RESERVE, PAGE_READWRITE );
+        if (!ret)
+        {
+#ifdef VALGRIND_STACK_REGISTER
+            VALGRIND_STACK_REGISTER( addr, (char *)addr + reserve );
+#endif
+            stack->StackBase = addr;
+        }
+        break;
+    }
 
     default:
         FIXME( "(%p,0x%08x,%p,0x%08x) stub\n", handle, class, info, size );

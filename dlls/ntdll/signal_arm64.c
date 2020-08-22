@@ -78,6 +78,7 @@ static inline BOOL is_valid_frame( ULONG_PTR frame )
  *		RtlCaptureContext (NTDLL.@)
  */
 __ASM_STDCALL_FUNC( RtlCaptureContext, 8,
+                    "str x0, [x0, #0x8]\n\t"         /* context->X0 */
                     "stp x1, x2, [x0, #0x10]\n\t"    /* context->X1,X2 */
                     "stp x3, x4, [x0, #0x20]\n\t"    /* context->X3,X4 */
                     "stp x5, x6, [x0, #0x30]\n\t"    /* context->X5,X6 */
@@ -96,7 +97,7 @@ __ASM_STDCALL_FUNC( RtlCaptureContext, 8,
                     "mov x1, sp\n\t"
                     "stp x1, x30, [x0, #0x100]\n\t"  /* context->Sp,Pc */
                     "mov w1, #0x400000\n\t"          /* CONTEXT_ARM64 */
-                    "add w1, w1, #0x3\n\t"           /* CONTEXT_FULL */
+                    "movk w1, #0x7\n\t"              /* CONTEXT_FULL */
                     "str w1, [x0]\n\t"               /* context->ContextFlags */
                     "mrs x1, NZCV\n\t"
                     "str w1, [x0, #0x4]\n\t"         /* context->Cpsr */
@@ -1173,7 +1174,6 @@ __ASM_STDCALL_FUNC( RtlRaiseException, 4,
                    "ldp x4, x5, [sp]\n\t"        /* frame pointer, return address */
                    "stp x4, x5, [x1, #0xf0]\n\t" /* context->Fp, Lr */
                    "str  x5, [x1, #0x108]\n\t"   /* context->Pc */
-                   "str  x5, [x1, #0x108]\n\t"   /* context->Pc */
                    "str  x5, [x0, #0x10]\n\t"    /* rec->ExceptionAddress */
                    "mov  x2, #1\n\t"
                    "bl " __ASM_NAME("NtRaiseException") "\n\t"
@@ -1187,6 +1187,17 @@ USHORT WINAPI RtlCaptureStackBackTrace( ULONG skip, ULONG count, PVOID *buffer, 
     FIXME( "(%d, %d, %p, %p) stub!\n", skip, count, buffer, hash );
     return 0;
 }
+
+/***********************************************************************
+ *           signal_start_thread
+ */
+__ASM_GLOBAL_FUNC( signal_start_thread,
+                   "mov sp, x0\n\t"  /* context */
+                   "and x0, x0, #~0xfff\n\t"  /* round down to page size */
+                   "bl " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
+                   "mov x0, sp\n\t"
+                   "mov x1, #1\n\t"
+                   "b " __ASM_NAME("NtContinue") )
 
 /**********************************************************************
  *              DbgBreakPoint   (NTDLL.@)

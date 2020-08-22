@@ -1594,6 +1594,9 @@ static void gstdemux_sink_disconnect(struct strmbase_sink *iface)
     mark_wine_thread();
 
     GST_RemoveOutputPins(filter);
+
+    IAsyncReader_Release(filter->reader);
+    filter->reader = NULL;
 }
 
 static const struct strmbase_sink_ops sink_ops =
@@ -1714,13 +1717,18 @@ static HRESULT gstdecoder_source_get_media_type(struct gstdemux_source *pin,
 
     if (!strcmp(type, "video/x-raw") && index < ARRAY_SIZE(video_formats))
     {
-        gint width, height;
+        gint width, height, fps_n, fps_d;
         GstVideoInfo info;
 
         gst_caps_unref(caps);
         gst_structure_get_int(structure, "width", &width);
         gst_structure_get_int(structure, "height", &height);
         gst_video_info_set_format(&info, video_formats[index], width, height);
+        if (gst_structure_get_fraction(structure, "framerate", &fps_n, &fps_d) && fps_n)
+        {
+            info.fps_n = fps_n;
+            info.fps_d = fps_d;
+        }
         if (!amt_from_gst_video_info(&info, mt))
             return E_OUTOFMEMORY;
         return S_OK;

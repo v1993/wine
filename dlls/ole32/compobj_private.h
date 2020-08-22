@@ -187,7 +187,6 @@ struct oletls
 
 
 /* Global Interface Table Functions */
-extern IGlobalInterfaceTable *get_std_git(void) DECLSPEC_HIDDEN;
 extern void release_std_git(void) DECLSPEC_HIDDEN;
 extern HRESULT StdGlobalInterfaceTable_GetFactory(LPVOID *ppv) DECLSPEC_HIDDEN;
 
@@ -270,16 +269,15 @@ APARTMENT *apartment_get_current_or_mta(void) DECLSPEC_HIDDEN;
  * Per-thread values are stored in the TEB on offset 0xF80
  */
 
+extern HRESULT WINAPI InternalTlsAllocData(struct oletls **tlsdata);
+
 /* will create if necessary */
 static inline struct oletls *COM_CurrentInfo(void)
 {
+    struct oletls *oletls;
+
     if (!NtCurrentTeb()->ReservedForOle)
-    {
-        struct oletls *oletls = heap_alloc_zero(sizeof(*oletls));
-        if (oletls)
-            list_init(&oletls->spies);
-        NtCurrentTeb()->ReservedForOle = oletls;
-    }
+        InternalTlsAllocData(&oletls);
 
     return NtCurrentTeb()->ReservedForOle;
 }
@@ -287,16 +285,6 @@ static inline struct oletls *COM_CurrentInfo(void)
 static inline APARTMENT* COM_CurrentApt(void)
 {  
     return COM_CurrentInfo()->apt;
-}
-
-static inline GUID COM_CurrentCausalityId(void)
-{
-    struct oletls *info = COM_CurrentInfo();
-    if (!info)
-        return GUID_NULL;
-    if (IsEqualGUID(&info->causality_id, &GUID_NULL))
-        CoCreateGuid(&info->causality_id);
-    return info->causality_id;
 }
 
 /* helpers for debugging */
@@ -319,6 +307,13 @@ extern HRESULT HandlerCF_Create(REFCLSID rclsid, REFIID riid, LPVOID *ppv) DECLS
 extern HRESULT WINAPI GlobalOptions_CreateInstance(IClassFactory *iface, IUnknown *pUnk,
                                                    REFIID riid, void **ppv) DECLSPEC_HIDDEN;
 extern IClassFactory GlobalOptionsCF DECLSPEC_HIDDEN;
+extern HRESULT WINAPI GlobalInterfaceTable_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID riid,
+        void **obj) DECLSPEC_HIDDEN;
+extern IClassFactory GlobalInterfaceTableCF DECLSPEC_HIDDEN;
+extern HRESULT WINAPI ManualResetEvent_CreateInstance(IClassFactory *iface, IUnknown *outer, REFIID riid,
+        void **obj) DECLSPEC_HIDDEN;
+extern IClassFactory ManualResetEventCF DECLSPEC_HIDDEN;
+extern HRESULT WINAPI Ole32DllGetClassObject(REFCLSID clsid, REFIID riid, void **obj) DECLSPEC_HIDDEN;
 
 /* Exported non-interface Data Advise Holder functions */
 HRESULT DataAdviseHolder_OnConnect(IDataAdviseHolder *iface, IDataObject *pDelegate) DECLSPEC_HIDDEN;
@@ -357,7 +352,5 @@ static inline HRESULT copy_formatetc(FORMATETC *dst, const FORMATETC *src)
 
 extern HRESULT EnumSTATDATA_Construct(IUnknown *holder, ULONG index, DWORD array_len, STATDATA *data,
                                       BOOL copy, IEnumSTATDATA **ppenum) DECLSPEC_HIDDEN;
-
-extern DWORD rpcss_get_next_seqid(void) DECLSPEC_HIDDEN;
 
 #endif /* __WINE_OLE_COMPOBJ_H */

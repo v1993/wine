@@ -8423,7 +8423,7 @@ msgstr ""
 msgid "&Test Connection"
 msgstr "اطلاعات"
 
-#: version.rc:92 winemine.rc:65
+#: version.rc:92
 msgid "Advanced"
 msgstr ""
 
@@ -12197,6 +12197,24 @@ msgstr ""
 
 #: explorer.rc:34 winefile.rc:36
 msgid "&Run..."
+msgstr ""
+
+#: fsutil.mc:28
+msgid ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+msgstr ""
+
+#: fsutil.mc:35
+msgid ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+msgstr ""
+
+#: fsutil.mc:40
+msgid "Syntax: fsutil hardlink create <new> <existing>\n"
 msgstr ""
 
 #: hostname.rc:30
@@ -16118,7 +16136,7 @@ msgid "&Beginner"
 msgstr ""
 
 #: winemine.rc:45
-msgid "&Advanced"
+msgid "&Intermediate"
 msgstr ""
 
 #: winemine.rc:46
@@ -16149,6 +16167,10 @@ msgstr "&حذف\tDel"
 
 #: winemine.rc:64
 msgid "Beginner"
+msgstr ""
+
+#: winemine.rc:65
+msgid "Intermediate"
 msgstr ""
 
 #: winemine.rc:66

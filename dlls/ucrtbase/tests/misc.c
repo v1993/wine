@@ -557,17 +557,15 @@ static void test_isblank(void)
     for(c = 0; c <= 0xffff; c++) {
         if(c == '\t' || c == ' ' || c == 0x3000 || c == 0xfeff) {
             if(c == '\t')
-                todo_wine ok(!_iswctype_l(c, _BLANK, NULL), "tab shouldn't be blank\n");
+                ok(!_iswctype_l(c, _BLANK, NULL), "tab shouldn't be blank\n");
             else
                 ok(_iswctype_l(c, _BLANK, NULL), "%d should be blank\n", c);
             ok(iswblank(c), "%d should be blank\n", c);
             ok(_iswblank_l(c, NULL), "%d should be blank\n", c);
         } else {
-            todo_wine_if(c == 0xa0) {
-                ok(!_iswctype_l(c, _BLANK, NULL), "%d shouldn't be blank\n", c);
-                ok(!iswblank(c), "%d shouldn't be blank\n", c);
-                ok(!_iswblank_l(c, NULL), "%d shouldn't be blank\n", c);
-            }
+            ok(!_iswctype_l(c, _BLANK, NULL), "%d shouldn't be blank\n", c);
+            ok(!iswblank(c), "%d shouldn't be blank\n", c);
+            ok(!_iswblank_l(c, NULL), "%d shouldn't be blank\n", c);
         }
     }
 }
@@ -577,6 +575,9 @@ static struct _exception exception;
 static int CDECL matherr_callback(struct _exception *e)
 {
     exception = *e;
+
+    if (!strcmp(e->name, "acos") && e->arg1 == 2)
+        e->retval = -1;
     return 0;
 }
 
@@ -750,6 +751,7 @@ static void test_math_errors(void)
     double (CDECL *p_func3d)(double, double, double);
     double (CDECL *p_funcdl)(double, long);
     HMODULE module;
+    double d;
     int i;
 
     __setusermatherr(matherr_callback);
@@ -819,6 +821,9 @@ static void test_math_errors(void)
         ok(exception.arg2 == testsdl[i].b,
            "%s(%f, %ld) got exception arg2 %f\n", testsdl[i].func, testsdl[i].a, testsdl[i].b, exception.arg2);
     }
+
+    d = acos(2.0);
+    ok(d == -1.0, "failed to change log10 return value: %e\n", d);
 }
 
 static void test_asctime(void)

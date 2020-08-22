@@ -79,6 +79,7 @@ AC_ARG_WITH(png,       AS_HELP_STRING([--without-png],[do not use PNG]))
 AC_ARG_WITH(pthread,   AS_HELP_STRING([--without-pthread],[do not use the pthread library]),
             [if test "x$withval" = "xno"; then ac_cv_header_pthread_h=no; fi])
 AC_ARG_WITH(pulse,     AS_HELP_STRING([--without-pulse],[do not use PulseAudio sound support]))
+AC_ARG_WITH(quicktime, AS_HELP_STRING([--without-quicktime],[do not use QuickTime support]))
 AC_ARG_WITH(sane,      AS_HELP_STRING([--without-sane],[do not use SANE (scanner support)]))
 AC_ARG_WITH(sdl,       AS_HELP_STRING([--without-sdl],[do not use SDL]))
 AC_ARG_WITH(tiff,      AS_HELP_STRING([--without-tiff],[do not use TIFF]))
@@ -830,24 +831,28 @@ case $host_os in
         AC_CHECK_FUNCS(IOHIDManagerCreate)
         LIBS="$ac_save_LIBS"
     fi
-    if test "$ac_cv_header_QuickTime_ImageCompression_h" = "yes"
+
+    dnl *** Check for QuickTime ***
+    if test "x$with_quicktime" != "xno"
     then
-        dnl Make sure we can actually use the QuickTime framework
-        ac_save_LIBS="$LIBS"
-        LIBS="-framework QuickTime -framework ApplicationServices -framework CoreVideo $LIBS"
-        AC_MSG_CHECKING([for the QuickTime framework])
-        AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <QuickTime/ImageCompression.h>]],[[CodecManagerVersion(NULL);]])],
-                       [AC_MSG_RESULT([yes])
-                        AC_SUBST(QUICKTIME_LIBS,"-framework QuickTime -framework ApplicationServices -framework CoreVideo")
-                        enable_wineqtdecoder=${enable_wineqtdecoder:-yes}],
-                       [AC_MSG_RESULT([no])
-                        ac_cv_header_QuickTime_ImageCompression_h=no])
-        LIBS="$ac_save_LIBS"
+        if test "$ac_cv_header_QuickTime_ImageCompression_h" = "yes"
+        then
+            dnl Make sure we can actually use the QuickTime framework
+            ac_save_LIBS="$LIBS"
+            LIBS="-framework QuickTime -framework ApplicationServices -framework CoreVideo $LIBS"
+            AC_MSG_CHECKING([for the QuickTime framework])
+            AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <QuickTime/ImageCompression.h>]],[[CodecManagerVersion(NULL);]])],
+                           [AC_MSG_RESULT([yes])
+                            AC_SUBST(QUICKTIME_LIBS,"-framework QuickTime -framework ApplicationServices -framework CoreVideo")
+                            enable_wineqtdecoder=${enable_wineqtdecoder:-yes}],
+                           [AC_MSG_RESULT([no])
+                            ac_cv_header_QuickTime_ImageCompression_h=no])
+            LIBS="$ac_save_LIBS"
+        fi
     fi
-    if test "$ac_cv_header_QuickTime_ImageCompression_h" != "yes"
-    then
-        WINE_NOTICE([QuickTime ${notice_platform}development files not found, video decoding won't be supported.])
-    fi
+    WINE_NOTICE_WITH(quicktime,[test "$ac_cv_header_QuickTime_ImageCompression_h" != "yes"],
+                     [QuickTime ${notice_platform}development files not found, video decoding won't be supported.])
+
     if test "$ac_cv_header_Carbon_Carbon_h" = "yes"
     then
         AC_SUBST(CARBON_LIBS,"-framework Carbon")
@@ -1060,8 +1065,8 @@ then
             if test -z "$llvm_target"
             then
                 case $host_cpu in
-                *i[[3456789]]86*) llvm_target=i686-windows-gnu ;;
-                *) llvm_target=$host_cpu-windows-gnu ;;
+                *i[[3456789]]86*) llvm_target=i686-windows ;;
+                *) llvm_target=$host_cpu-windows ;;
                 esac
             fi
             case $llvm_target in
@@ -1096,7 +1101,8 @@ then
           *i[[3456789]]86*) WINE_TRY_CROSSCFLAGS([-fno-omit-frame-pointer]) ;;
           x86_64) WINE_TRY_CROSSCFLAGS([-Wno-format])
                   WINE_TRY_CROSSCFLAGS([-Wformat-overflow])
-                  WINE_TRY_CROSSCFLAGS([-Wnonnull]) ;;
+                  WINE_TRY_CROSSCFLAGS([-Wnonnull])
+                  WINE_TRY_CROSSCFLAGS([-mcx16]) ;;
         esac
 
         dnl Determine debug info format
@@ -1255,10 +1261,6 @@ then
 #include <X11/extensions/Xrandr.h>]], [[static typeof(XRRSetScreenConfigAndRate) * func; if (func) return 0;]])],
                   [WINE_CHECK_SONAME(Xrandr,XRRQueryExtension,
                     [AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <X11/Xlib.h>
-#include <X11/extensions/Xrandr.h>]], [[static typeof(XRRGetScreenResources) *f; if (f) return 0;]])],
-                      [AC_DEFINE(HAVE_XRRGETSCREENRESOURCES, 1,
-                        [Define if Xrandr has the XRRGetScreenResources function])])
-                     AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <X11/Xlib.h>
 #include <X11/extensions/Xrandr.h>]], [[static typeof(XRRGetProviderResources) *f; if (f) return 0;]])],
                       [AC_DEFINE(HAVE_XRRGETPROVIDERRESOURCES, 1,
                         [Define if Xrandr has the XRRGetProviderResources function])],
@@ -1782,7 +1784,8 @@ then
             [WINE_CHECK_SONAME(FAudio,FAudioCreate,,,[$FAUDIO_LIBS],[[libFAudio*]])])
              WINE_CHECK_LIB_FUNCS([FAudio_CommitOperationSet \
                                    F3DAudioInitialize8 \
-                                   FAudioLinkedVersion], [$FAUDIO_LIBS])
+                                   FAudioLinkedVersion \
+                                   FAudioCreateReverb9WithCustomAllocatorEXT], [$FAUDIO_LIBS])
             ])
 fi
 WINE_NOTICE_WITH(faudio,[test "x$ac_cv_lib_soname_FAudio" = "x"],
@@ -1961,6 +1964,14 @@ then
     enable_x3daudio1_5=${enable_x3daudio1_5:-no}
     enable_x3daudio1_6=${enable_x3daudio1_6:-no}
     enable_x3daudio1_7=${enable_x3daudio1_7:-no}
+    enable_xactengine3_0=${enable_xactengine3_0:-no}
+    enable_xactengine3_1=${enable_xactengine3_1:-no}
+    enable_xactengine3_2=${enable_xactengine3_2:-no}
+    enable_xactengine3_3=${enable_xactengine3_3:-no}
+    enable_xactengine3_4=${enable_xactengine3_4:-no}
+    enable_xactengine3_5=${enable_xactengine3_5:-no}
+    enable_xactengine3_6=${enable_xactengine3_6:-no}
+    enable_xactengine3_7=${enable_xactengine3_7:-no}
     enable_xapofx1_1=${enable_xapofx1_1:-no}
     enable_xapofx1_2=${enable_xapofx1_2:-no}
     enable_xapofx1_3=${enable_xapofx1_3:-no}
@@ -2178,6 +2189,7 @@ AC_CHECK_FUNCS(\
 	_spawnvp \
 	epoll_create \
 	ffs \
+	finite \
 	finitef \
 	fnmatch \
 	fork \
@@ -2660,6 +2672,12 @@ AC_CHECK_MEMBERS([struct ifreq.ifr_hwaddr],,,
 # include <net/if.h>
 #endif])
 
+dnl Check for struct sysinfo members totalram and mem_unit
+AC_CHECK_MEMBERS([struct sysinfo.totalram, struct sysinfo.mem_unit],,,
+[#ifdef HAVE_SYS_SYSINFO_H
+# include <sys/sysinfo.h>
+#endif])
+
 dnl Check for isfinite
 ac_save_LIBS="$LIBS"
 LIBS="$LIBS -lm"
@@ -2858,6 +2876,8 @@ WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-errorhandling-l1-1-2)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-errorhandling-l1-1-3)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-fibers-l1-1-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-fibers-l1-1-1)
+WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-file-ansi-l2-1-0)
+WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-file-fromapp-l1-1-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-file-l1-1-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-file-l1-2-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-file-l1-2-1)
@@ -2899,6 +2919,7 @@ WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-localregistry-l1-1-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-memory-l1-1-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-memory-l1-1-1)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-memory-l1-1-2)
+WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-memory-l1-1-3)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-memory-l1-1-4)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-misc-l1-1-0)
 WINE_CONFIG_MAKEFILE(dlls/api-ms-win-core-namedpipe-ansi-l1-1-0)
@@ -3249,6 +3270,7 @@ WINE_CONFIG_MAKEFILE(dlls/dpvoice/tests)
 WINE_CONFIG_MAKEFILE(dlls/dpwsockx)
 WINE_CONFIG_MAKEFILE(dlls/drmclien)
 WINE_CONFIG_MAKEFILE(dlls/dsdmo)
+WINE_CONFIG_MAKEFILE(dlls/dsdmo/tests)
 WINE_CONFIG_MAKEFILE(dlls/dsound)
 WINE_CONFIG_MAKEFILE(dlls/dsound/tests)
 WINE_CONFIG_MAKEFILE(dlls/dsquery)
@@ -3258,6 +3280,7 @@ WINE_CONFIG_MAKEFILE(dlls/dsuiext)
 WINE_CONFIG_MAKEFILE(dlls/dswave)
 WINE_CONFIG_MAKEFILE(dlls/dswave/tests)
 WINE_CONFIG_MAKEFILE(dlls/dwmapi)
+WINE_CONFIG_MAKEFILE(dlls/dwmapi/tests)
 WINE_CONFIG_MAKEFILE(dlls/dwrite)
 WINE_CONFIG_MAKEFILE(dlls/dwrite/tests)
 WINE_CONFIG_MAKEFILE(dlls/dx8vb)
@@ -3515,6 +3538,7 @@ WINE_CONFIG_MAKEFILE(dlls/msvcp120/tests)
 WINE_CONFIG_MAKEFILE(dlls/msvcp120_app)
 WINE_CONFIG_MAKEFILE(dlls/msvcp140)
 WINE_CONFIG_MAKEFILE(dlls/msvcp140/tests)
+WINE_CONFIG_MAKEFILE(dlls/msvcp140_1)
 WINE_CONFIG_MAKEFILE(dlls/msvcp60)
 WINE_CONFIG_MAKEFILE(dlls/msvcp60/tests)
 WINE_CONFIG_MAKEFILE(dlls/msvcp70)
@@ -3896,6 +3920,14 @@ WINE_CONFIG_MAKEFILE(dlls/x3daudio1_4)
 WINE_CONFIG_MAKEFILE(dlls/x3daudio1_5)
 WINE_CONFIG_MAKEFILE(dlls/x3daudio1_6)
 WINE_CONFIG_MAKEFILE(dlls/x3daudio1_7)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_0)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_1)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_2)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_3)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_4)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_5)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_6)
+WINE_CONFIG_MAKEFILE(dlls/xactengine3_7)
 WINE_CONFIG_MAKEFILE(dlls/xapofx1_1)
 WINE_CONFIG_MAKEFILE(dlls/xapofx1_2)
 WINE_CONFIG_MAKEFILE(dlls/xapofx1_3)
@@ -3955,6 +3987,7 @@ WINE_CONFIG_MAKEFILE(programs/find)
 WINE_CONFIG_MAKEFILE(programs/find/tests)
 WINE_CONFIG_MAKEFILE(programs/findstr)
 WINE_CONFIG_MAKEFILE(programs/fsutil)
+WINE_CONFIG_MAKEFILE(programs/fsutil/tests)
 WINE_CONFIG_MAKEFILE(programs/hh)
 WINE_CONFIG_MAKEFILE(programs/hostname)
 WINE_CONFIG_MAKEFILE(programs/icacls)

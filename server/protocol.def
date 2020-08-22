@@ -1472,24 +1472,9 @@ enum server_fd_type
 @END
 
 
-/* Open a handle to the process console */
-@REQ(open_console)
-    obj_handle_t from;          /* console_in handle to get active screen buffer */
-    unsigned int access;        /* wanted access rights */
-    unsigned int attributes;    /* object attributes */
-    int          share;         /* share mask (only for output handles) */
-@REPLY
-    obj_handle_t handle;        /* handle to the console */
-@END
-
-
 /* Attach to a other process's console */
 @REQ(attach_console)
     process_id_t pid;           /* pid of attached console process */
-@REPLY
-    obj_handle_t std_in;        /* attached stdin */
-    obj_handle_t std_out;       /* attached stdout */
-    obj_handle_t std_err;       /* attached stderr */
 @END
 
 
@@ -1498,43 +1483,6 @@ enum server_fd_type
     obj_handle_t handle;        /* handle to the console */
 @REPLY
     obj_handle_t event;
-@END
-
-
-/* Set info about a console (input only) */
-@REQ(set_console_input_info)
-    obj_handle_t  handle;        /* handle to console input, or 0 for process' console */
-    int           mask;          /* setting mask (see below) */
-    obj_handle_t  active_sb;     /* active screen buffer */
-    int           history_mode;  /* whether we duplicate lines in history */
-    int           history_size;  /* number of lines in history */
-    int           edition_mode;  /* index to the edition mode flavors */
-    int           input_cp;      /* console input codepage */
-    int           output_cp;     /* console output codepage */
-    user_handle_t win;           /* console window if backend supports it */
-    VARARG(title,unicode_str);   /* console title */
-@END
-#define SET_CONSOLE_INPUT_INFO_TITLE            0x02
-#define SET_CONSOLE_INPUT_INFO_HISTORY_MODE     0x04
-#define SET_CONSOLE_INPUT_INFO_HISTORY_SIZE     0x08
-#define SET_CONSOLE_INPUT_INFO_EDITION_MODE     0x10
-#define SET_CONSOLE_INPUT_INFO_INPUT_CODEPAGE   0x20
-#define SET_CONSOLE_INPUT_INFO_OUTPUT_CODEPAGE  0x40
-#define SET_CONSOLE_INPUT_INFO_WIN              0x80
-
-
-/* Get info about a console (input only) */
-@REQ(get_console_input_info)
-    obj_handle_t  handle;         /* handle to console input, or 0 for process' console */
-@REPLY
-    int           history_mode;   /* whether we duplicate lines in history */
-    int           history_size;   /* number of lines in history */
-    int           history_index;  /* number of used lines in history */
-    int           edition_mode;   /* index to the edition mode flavors */
-    int           input_cp;       /* console input codepage */
-    int           output_cp;      /* console output codepage */
-    user_handle_t win;            /* console window if backend supports it */
-    VARARG(title,unicode_str);    /* console title */
 @END
 
 
@@ -1567,58 +1515,23 @@ enum server_fd_type
 @END
 
 
-/* write data (chars and/or attributes) in a screen buffer */
-@REQ(write_console_output)
-    obj_handle_t handle;        /* handle to the console output */
-    int          x;             /* position where to start writing */
-    int          y;
-    int          mode;          /* char info (see below) */
-    int          wrap;          /* wrap around at end of line? */
-    VARARG(data,bytes);         /* info to write */
-@REPLY
-    int          written;       /* number of char infos actually written */
-    int          width;         /* width of screen buffer */
-    int          height;        /* height of screen buffer */
-@END
-enum char_info_mode
-{
-    CHAR_INFO_MODE_TEXT,        /* characters only */
-    CHAR_INFO_MODE_ATTR,        /* attributes only */
-    CHAR_INFO_MODE_TEXTATTR,    /* both characters and attributes */
-    CHAR_INFO_MODE_TEXTSTDATTR  /* characters but use standard attributes */
-};
-
-
-/* read data (chars and/or attributes) from a screen buffer */
-@REQ(read_console_output)
-    obj_handle_t handle;        /* handle to the console output */
-    int          x;             /* position (x,y) where to start reading */
-    int          y;
-    int          mode;          /* char info mode */
-    int          wrap;          /* wrap around at end of line? */
-@REPLY
-    int          width;         /* width of screen buffer */
-    int          height;        /* height of screen buffer */
-    VARARG(data,bytes);
-@END
-
-
-/* move a rect (of data) in screen buffer content */
-@REQ(move_console_output)
-    obj_handle_t handle;        /* handle to the console output */
-    short int    x_src;         /* position (x, y) of rect to start moving from */
-    short int    y_src;
-    short int    x_dst;         /* position (x, y) of rect to move to */
-    short int    y_dst;
-    short int    w;             /* size of the rect (width, height) to move */
-    short int    h;
-@END
-
-
 /* Sends a signal to a process group */
 @REQ(send_console_signal)
     int          signal;        /* the signal to send */
     process_id_t group_id;      /* the group to send the signal to */
+@END
+
+
+/* Retrieve the next pending console ioctl request */
+@REQ(get_next_console_request)
+    obj_handle_t handle;        /* console server handle */
+    int          signal;        /* server signal state */
+    unsigned int status;        /* status of previous ioctl */
+    VARARG(out_data,bytes);     /* out_data of previous ioctl */
+@REPLY
+    unsigned int code;          /* ioctl code */
+    data_size_t  out_size;      /* ioctl output size */
+    VARARG(in_data,bytes);      /* ioctl in_data */
 @END
 
 
@@ -3721,6 +3634,12 @@ struct handle_info
     VARARG(devices,rawinput_devices);
 @END
 
+/* Retrieve the list of registered rawinput devices */
+@REQ(get_rawinput_devices)
+@REPLY
+    unsigned int device_count;
+    VARARG(devices,rawinput_devices);
+@END
 
 /* Create a new job object */
 @REQ(create_job)

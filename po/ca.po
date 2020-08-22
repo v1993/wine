@@ -8448,7 +8448,7 @@ msgstr ""
 msgid "&Test Connection"
 msgstr "Connexions restablertes"
 
-#: version.rc:92 winemine.rc:65
+#: version.rc:92
 msgid "Advanced"
 msgstr "Avançat"
 
@@ -12664,6 +12664,24 @@ msgstr "Inici"
 msgid "&Run..."
 msgstr "&Executa..."
 
+#: fsutil.mc:28
+msgid ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+msgstr ""
+
+#: fsutil.mc:35
+msgid ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+msgstr ""
+
+#: fsutil.mc:40
+msgid "Syntax: fsutil hardlink create <new> <existing>\n"
+msgstr ""
+
 #: hostname.rc:30
 msgid "Usage: hostname\n"
 msgstr "Ús: hostname\n"
@@ -16702,8 +16720,10 @@ msgid "&Beginner"
 msgstr "&Principiant"
 
 #: winemine.rc:45
-msgid "&Advanced"
-msgstr "&Avançat"
+#, fuzzy
+#| msgid "Interface"
+msgid "&Intermediate"
+msgstr "Interfície"
 
 #: winemine.rc:46
 msgid "&Expert"
@@ -16732,6 +16752,12 @@ msgstr "Millors temps"
 #: winemine.rc:64
 msgid "Beginner"
 msgstr "Principiant"
+
+#: winemine.rc:65
+#, fuzzy
+#| msgid "Interface"
+msgid "Intermediate"
+msgstr "Interfície"
 
 #: winemine.rc:66
 msgid "Expert"

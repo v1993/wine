@@ -153,7 +153,11 @@ static HRESULT WINAPI multimedia_stream_SetState(IAMMultiMediaStream *iface, STR
     TRACE("(%p/%p)->(%u)\n", This, iface, new_state);
 
     if (new_state == STREAMSTATE_RUN)
+    {
         hr = IMediaControl_Run(This->media_control);
+        if (SUCCEEDED(hr))
+            hr = S_OK;
+    }
     else if (new_state == STREAMSTATE_STOP)
         hr = IMediaControl_Stop(This->media_control);
 
@@ -169,13 +173,19 @@ static HRESULT WINAPI multimedia_stream_GetTime(IAMMultiMediaStream *iface, STRE
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI multimedia_stream_GetDuration(IAMMultiMediaStream *iface, STREAM_TIME *pDuration)
+static HRESULT WINAPI multimedia_stream_GetDuration(IAMMultiMediaStream *iface, STREAM_TIME *duration)
 {
-    struct multimedia_stream *This = impl_from_IAMMultiMediaStream(iface);
+    struct multimedia_stream *mmstream = impl_from_IAMMultiMediaStream(iface);
 
-    FIXME("(%p/%p)->(%p) stub!\n", This, iface, pDuration);
+    TRACE("mmstream %p, duration %p.\n", mmstream, duration);
 
-    return E_NOTIMPL;
+    if (!mmstream->media_seeking)
+        return E_NOINTERFACE;
+
+    if (IMediaSeeking_GetDuration(mmstream->media_seeking, duration) != S_OK)
+        return S_FALSE;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI multimedia_stream_Seek(IAMMultiMediaStream *iface, STREAM_TIME seek_time)
@@ -441,9 +451,27 @@ static HRESULT WINAPI multimedia_stream_OpenFile(IAMMultiMediaStream *iface,
     }
 
     if (SUCCEEDED(ret) && !(flags & AMMSF_NORENDER))
-        ret = IGraphBuilder_Render(This->graph, This->ipin);
+    {
+        IFilterGraph2 *graph;
+
+        if (SUCCEEDED(ret = IGraphBuilder_QueryInterface(This->graph, &IID_IFilterGraph2, (void **)&graph)))
+        {
+            ret = IFilterGraph2_RenderEx(graph, This->ipin, AM_RENDEREX_RENDERTOEXISTINGRENDERERS, NULL);
+            if (ret == VFW_E_CANNOT_RENDER) ret = VFW_E_CANNOT_CONNECT;
+            else if (ret == VFW_S_PARTIAL_RENDER) ret = S_OK;
+            IFilterGraph2_Release(graph);
+        }
+        else
+        {
+            FIXME("Failed to get IFilterGraph2 interface, hr %#x.\n", ret);
+            ret = IGraphBuilder_Render(This->graph, This->ipin);
+        }
+    }
 
     IMediaStreamFilter_SupportSeeking(This->filter, This->type == STREAMTYPE_READ);
+
+    if (SUCCEEDED(ret) && (flags & AMMSF_RUN))
+        ret = IAMMultiMediaStream_SetState(iface, STREAMSTATE_RUN);
 
     if (EnumPins)
         IEnumPins_Release(EnumPins);

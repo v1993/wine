@@ -1624,10 +1624,10 @@ static HRESULT Global_InStr(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
 {
     VARIANT *startv, *str1v, *str2v;
     BSTR str1, str2;
-    int start, ret;
+    int ret = -1, start = 0, mode = 0;
     HRESULT hres;
 
-    TRACE("\n");
+    TRACE("args_cnt=%u\n", args_cnt);
 
     assert(2 <= args_cnt && args_cnt <= 4);
 
@@ -1643,48 +1643,67 @@ static HRESULT Global_InStr(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
         str2v = args+2;
         break;
     case 4:
-        FIXME("unsupported compare argument %s\n", debugstr_variant(args));
-        return E_NOTIMPL;
+        startv = args;
+        str1v = args+1;
+        str2v = args+2;
+
+        if(V_VT(args+3) == VT_NULL)
+            return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
+
+        hres = to_int(args+3, &mode);
+        if(FAILED(hres))
+            return hres;
+
+        if (mode != 0 && mode != 1)
+            return MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
+
+        break;
     DEFAULT_UNREACHABLE;
     }
 
     if(startv) {
+       if(V_VT(startv) == VT_NULL)
+            return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
+
         hres = to_int(startv, &start);
         if(FAILED(hres))
             return hres;
-        if(--start < 0) {
-            FIXME("start %d\n", start);
-            return E_FAIL;
-        }
-    }else {
-        start = 0;
+        if(--start < 0)
+            return MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
     }
 
     if(V_VT(str1v) == VT_NULL || V_VT(str2v) == VT_NULL)
         return return_null(res);
 
     if(V_VT(str1v) != VT_BSTR) {
-        FIXME("Unsupported str1 type %s\n", debugstr_variant(str1v));
-        return E_NOTIMPL;
+        hres = to_string(str1v, &str1);
+        if(FAILED(hres))
+            return hres;
     }
-    str1 = V_BSTR(str1v);
+    else
+        str1 = V_BSTR(str1v);
 
     if(V_VT(str2v) != VT_BSTR) {
-        FIXME("Unsupported str2 type %s\n", debugstr_variant(str2v));
-        return E_NOTIMPL;
+        hres = to_string(str2v, &str2);
+        if(FAILED(hres)){
+            if(V_VT(str1v) != VT_BSTR)
+                SysFreeString(str1);
+            return hres;
+        }
     }
-    str2 = V_BSTR(str2v);
+    else
+        str2 = V_BSTR(str2v);
 
     if(start < SysStringLen(str1)) {
-        WCHAR *ptr;
-
-        ptr = wcsstr(str1+start, str2);
-        ret = ptr ? ptr-str1+1 : 0;
-    }else {
-        ret = 0;
+        ret = FindStringOrdinal(FIND_FROMSTART, str1 + start, SysStringLen(str1)-start,
+                                str2, SysStringLen(str2), mode);
     }
 
-    return return_int(res, ret);
+    if(V_VT(str1v) != VT_BSTR)
+        SysFreeString(str1);
+    if(V_VT(str2v) != VT_BSTR)
+        SysFreeString(str2);
+    return return_int(res, ++ret ? ret+start : 0);
 }
 
 static HRESULT Global_InStrB(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
@@ -2379,61 +2398,80 @@ static HRESULT Global_StrReverse(BuiltinDisp *This, VARIANT *arg, unsigned args_
 
 static HRESULT Global_InStrRev(BuiltinDisp *This, VARIANT *args, unsigned args_cnt, VARIANT *res)
 {
-    int start, ret = 0;
+    int start = -1, ret = -1, mode = 0;
     BSTR str1, str2;
+    size_t len1, len2;
     HRESULT hres;
 
     TRACE("%s %s arg_cnt=%u\n", debugstr_variant(args), debugstr_variant(args+1), args_cnt);
 
-    if(args_cnt > 3) {
-        FIXME("Unsupported args\n");
-        return E_NOTIMPL;
-    }
-
     assert(2 <= args_cnt && args_cnt <= 4);
 
-    if(V_VT(args) == VT_NULL || V_VT(args+1) == VT_NULL || (args_cnt > 2 && V_VT(args+2) == VT_NULL))
+    if(V_VT(args) == VT_NULL || V_VT(args+1) == VT_NULL || (args_cnt > 2 && V_VT(args+2) == VT_NULL)
+       || (args_cnt == 4 && V_VT(args+3) == VT_NULL))
         return MAKE_VBSERROR(VBSE_ILLEGAL_NULL_USE);
 
-    hres = to_string(args, &str1);
-    if(FAILED(hres))
-        return hres;
-
-    hres = to_string(args+1, &str2);
-    if(SUCCEEDED(hres)) {
-        if(args_cnt > 2) {
-            hres = to_int(args+2, &start);
-            if(SUCCEEDED(hres) && start <= 0) {
-                FIXME("Unsupported start %d\n", start);
-                hres = E_NOTIMPL;
-            }
-        }else {
-            start = SysStringLen(str1);
-        }
-    } else {
-        str2 = NULL;
+    if(args_cnt == 4) {
+        hres = to_int(args+3, &mode);
+        if(FAILED(hres))
+            return hres;
+        if (mode != 0 && mode != 1)
+            return MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
     }
 
-    if(SUCCEEDED(hres)) {
-        const WCHAR *ptr;
-        size_t len;
-
-        len = SysStringLen(str2);
-        if(start >= len && start <= SysStringLen(str1)) {
-            for(ptr = str1+start-SysStringLen(str2); ptr >= str1; ptr--) {
-                if(!memcmp(ptr, str2, len*sizeof(WCHAR))) {
-                    ret = ptr-str1+1;
-                    break;
-                }
-            }
-        }
+    if(args_cnt >= 3) {
+        hres = to_int(args+2, &start);
+        if(FAILED(hres))
+            return hres;
+        if(!start || start < -1)
+            return MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
     }
 
-    SysFreeString(str1);
-    SysFreeString(str2);
-    if(FAILED(hres))
-        return hres;
+    if(V_VT(args) != VT_BSTR) {
+        hres = to_string(args, &str1);
+        if(FAILED(hres))
+            return hres;
+    }
+    else
+        str1 = V_BSTR(args);
 
+    if(V_VT(args+1) != VT_BSTR) {
+        hres = to_string(args+1, &str2);
+        if(FAILED(hres)) {
+            if(V_VT(args) != VT_BSTR)
+                SysFreeString(str1);
+            return hres;
+        }
+    }
+    else
+        str2 = V_BSTR(args+1);
+
+    len1 = SysStringLen(str1);
+    if(!len1) {
+        ret = 0;
+        goto end;
+    }
+
+    if(start == -1)
+        start = len1;
+
+    len2 = SysStringLen(str2);
+    if(!len2) {
+        ret = start;
+        goto end;
+    }
+
+    if(start >= len2 && start <= len1) {
+        ret = FindStringOrdinal(FIND_FROMEND, str1, start,
+                                str2, len2, mode);
+    }
+    ret++;
+
+end:
+    if(V_VT(args) != VT_BSTR)
+        SysFreeString(str1);
+    if(V_VT(args+1) != VT_BSTR)
+        SysFreeString(str2);
     return return_int(res, ret);
 }
 

@@ -311,7 +311,7 @@ __ASM_GLOBAL_FUNC( __chkstk, "ret" );
 __ASM_GLOBAL_FUNC( RtlCaptureContext,
                    "pushfq\n\t"
                    __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
-                   "movl $0x001000f,0x30(%rcx)\n\t" /* context->ContextFlags */
+                   "movl $0x10000f,0x30(%rcx)\n\t"  /* context->ContextFlags */
                    "stmxcsr 0x34(%rcx)\n\t"         /* context->MxCsr */
                    "movw %cs,0x38(%rcx)\n\t"        /* context->SegCs */
                    "movw %ds,0x3a(%rcx)\n\t"        /* context->SegDs */
@@ -340,23 +340,7 @@ __ASM_GLOBAL_FUNC( RtlCaptureContext,
                    "movq %r15,0xf0(%rcx)\n\t"       /* context->R15 */
                    "movq (%rsp),%rax\n\t"
                    "movq %rax,0xf8(%rcx)\n\t"       /* context->Rip */
-                   "fxsave 0x100(%rcx)\n\t"         /* context->FtlSave */
-                   "movdqa %xmm0,0x1a0(%rcx)\n\t"   /* context->Xmm0 */
-                   "movdqa %xmm1,0x1b0(%rcx)\n\t"   /* context->Xmm1 */
-                   "movdqa %xmm2,0x1c0(%rcx)\n\t"   /* context->Xmm2 */
-                   "movdqa %xmm3,0x1d0(%rcx)\n\t"   /* context->Xmm3 */
-                   "movdqa %xmm4,0x1e0(%rcx)\n\t"   /* context->Xmm4 */
-                   "movdqa %xmm5,0x1f0(%rcx)\n\t"   /* context->Xmm5 */
-                   "movdqa %xmm6,0x200(%rcx)\n\t"   /* context->Xmm6 */
-                   "movdqa %xmm7,0x210(%rcx)\n\t"   /* context->Xmm7 */
-                   "movdqa %xmm8,0x220(%rcx)\n\t"   /* context->Xmm8 */
-                   "movdqa %xmm9,0x230(%rcx)\n\t"   /* context->Xmm9 */
-                   "movdqa %xmm10,0x240(%rcx)\n\t"  /* context->Xmm10 */
-                   "movdqa %xmm11,0x250(%rcx)\n\t"  /* context->Xmm11 */
-                   "movdqa %xmm12,0x260(%rcx)\n\t"  /* context->Xmm12 */
-                   "movdqa %xmm13,0x270(%rcx)\n\t"  /* context->Xmm13 */
-                   "movdqa %xmm14,0x280(%rcx)\n\t"  /* context->Xmm14 */
-                   "movdqa %xmm15,0x290(%rcx)\n\t"  /* context->Xmm15 */
+                   "fxsave 0x100(%rcx)\n\t"         /* context->FltSave */
                    "ret" );
 
 /******************************************************************************
@@ -380,10 +364,10 @@ NTSTATUS WINAPI RtlWow64SetThreadContext( HANDLE handle, const WOW64_CONTEXT *co
 static DWORD __cdecl nested_exception_handler( EXCEPTION_RECORD *rec, EXCEPTION_REGISTRATION_RECORD *frame,
                                                CONTEXT *context, EXCEPTION_REGISTRATION_RECORD **dispatcher )
 {
-    if (rec->ExceptionFlags & (EH_UNWINDING | EH_EXIT_UNWIND)) return ExceptionContinueSearch;
+    if (!(rec->ExceptionFlags & (EH_UNWINDING | EH_EXIT_UNWIND)))
+        rec->ExceptionFlags |= EH_NESTED_CALL;
 
-    /* FIXME */
-    return ExceptionNestedException;
+    return ExceptionContinueSearch;
 }
 
 /**********************************************************************
@@ -444,6 +428,8 @@ static NTSTATUS call_stack_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_contex
     NTSTATUS status;
 
     context = *orig_context;
+    context.ContextFlags &= ~0x40; /* Clear xstate flag. */
+
     dispatch.TargetIp      = 0;
     dispatch.ContextRecord = &context;
     dispatch.HistoryTable  = &table;
@@ -792,6 +778,7 @@ PVOID WINAPI RtlVirtualUnwind( ULONG type, ULONG64 base, ULONG64 pc,
     ULONG64 frame, off;
     struct UNWIND_INFO *info;
     unsigned int i, prolog_offset;
+    BOOL mach_frame = FALSE;
 
     TRACE( "type %x rip %lx rsp %lx\n", type, pc, context->Rsp );
     if (TRACE_ON(seh)) dump_unwind_info( base, function );
@@ -814,13 +801,16 @@ PVOID WINAPI RtlVirtualUnwind( ULONG type, ULONG64 base, ULONG64 pc,
         /* check if in prolog */
         if (pc >= base + function->BeginAddress && pc < base + function->BeginAddress + info->prolog)
         {
+            TRACE("inside prolog.\n");
             prolog_offset = pc - base - function->BeginAddress;
         }
         else
         {
             prolog_offset = ~0;
-            if (is_inside_epilog( (BYTE *)pc, base, function ))
+            /* Since Win10 1809 epilogue does not have a special treatment in case of zero opcode count. */
+            if (info->count && is_inside_epilog( (BYTE *)pc, base, function ))
             {
+                TRACE("inside epilog.\n");
                 interpret_epilog( (BYTE *)pc, context, ctx_ptr );
                 *frame_ret = frame;
                 return NULL;
@@ -864,7 +854,23 @@ PVOID WINAPI RtlVirtualUnwind( ULONG type, ULONG64 base, ULONG64 pc,
                 set_float_reg( context, ctx_ptr, info->opcodes[i].info, (M128A *)off );
                 break;
             case UWOP_PUSH_MACHFRAME:
-                FIXME( "PUSH_MACHFRAME %u\n", info->opcodes[i].info );
+                if (info->flags & UNW_FLAG_CHAININFO)
+                {
+                    FIXME("PUSH_MACHFRAME with chained unwind info.\n");
+                    break;
+                }
+                if (i + get_opcode_size(info->opcodes[i]) < info->count )
+                {
+                    FIXME("PUSH_MACHFRAME is not the last opcode.\n");
+                    break;
+                }
+
+                if (info->opcodes[i].info)
+                    context->Rsp += 0x8;
+
+                context->Rip = *(ULONG64 *)context->Rsp;
+                context->Rsp = *(ULONG64 *)(context->Rsp + 24);
+                mach_frame = TRUE;
                 break;
             case UWOP_EPILOG:
                 if (info->version == 2)
@@ -879,9 +885,12 @@ PVOID WINAPI RtlVirtualUnwind( ULONG type, ULONG64 base, ULONG64 pc,
         function = &handler_data->chain;  /* restart with the chained info */
     }
 
-    /* now pop return address */
-    context->Rip = *(ULONG64 *)context->Rsp;
-    context->Rsp += sizeof(ULONG64);
+    if (!mach_frame)
+    {
+        /* now pop return address */
+        context->Rip = *(ULONG64 *)context->Rsp;
+        context->Rsp += sizeof(ULONG64);
+    }
 
     if (!(info->flags & type)) return NULL;  /* no matching handler */
     if (prolog_offset != ~0) return NULL;  /* inside prolog */
@@ -991,8 +1000,8 @@ static DWORD call_teb_unwind_handler( EXCEPTION_RECORD *rec, DISPATCHER_CONTEXT 
  * Wrapper function to call a consolidate callback from a fake frame.
  * If the callback executes RtlUnwindEx (like for example done in C++ handlers),
  * we have to skip all frames which were already processed. To do that we
- * trick the unwinding functions into thinking the call came from somewhere
- * else. All CFI instructions are either DW_CFA_def_cfa_expression or
+ * trick the unwinding functions into thinking the call came from the specified
+ * context. All CFI instructions are either DW_CFA_def_cfa_expression or
  * DW_CFA_expression, and the expressions have the following format:
  *
  * DW_OP_breg6; sleb128 0x10            | Load %rbp + 0x10
@@ -1005,15 +1014,26 @@ extern void * WINAPI call_consolidate_callback( CONTEXT *context,
                                                 EXCEPTION_RECORD *rec );
 __ASM_GLOBAL_FUNC( call_consolidate_callback,
                    "pushq %rbp\n\t"
-                   __ASM_SEH(".seh_pushreg %rbp\n\t")
                    __ASM_CFI(".cfi_adjust_cfa_offset 8\n\t")
                    __ASM_CFI(".cfi_rel_offset %rbp,0\n\t")
                    "movq %rsp,%rbp\n\t"
-                   __ASM_SEH(".seh_setframe %rbp,0\n\t")
                    __ASM_CFI(".cfi_def_cfa_register %rbp\n\t")
-                   "subq $0x20,%rsp\n\t"
-                   __ASM_SEH(".seh_stackalloc 0x20\n\t")
+
+                   /* Setup SEH machine frame. */
+                   "subq $0x28,%rsp\n\t"
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0x28\n\t")
+                   "movq 0xf8(%rcx),%rax\n\t" /* Context->Rip */
+                   "movq %rax,(%rsp)\n\t"
+                   "movq 0x98(%rcx),%rax\n\t" /* context->Rsp */
+                   "movq %rax,0x18(%rsp)\n\t"
+                   __ASM_SEH(".seh_pushframe\n\t")
                    __ASM_SEH(".seh_endprologue\n\t")
+
+                   "subq $0xf8,%rsp\n\t" /* 10*16 (float regs) + 7*8 (int regs) + 32 (shadow store). */
+                   __ASM_SEH(".seh_stackalloc 0xf8\n\t")
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0xf8\n\t")
+
+                   /* Setup CFI unwind to context. */
                    "movq %rcx,0x10(%rbp)\n\t"
                    __ASM_CFI(".cfi_remember_state\n\t")
                    __ASM_CFI(".cfi_escape 0x0f,0x07,0x76,0x10,0x06,0x23,0x98,0x01,0x06\n\t") /* CFA    */
@@ -1036,9 +1056,57 @@ __ASM_GLOBAL_FUNC( call_consolidate_callback,
                    __ASM_CFI(".cfi_escape 0x10,0x1e,0x06,0x76,0x10,0x06,0x23,0xf0,0x04\n\t") /* %xmm13 */
                    __ASM_CFI(".cfi_escape 0x10,0x1f,0x06,0x76,0x10,0x06,0x23,0x80,0x05\n\t") /* %xmm14 */
                    __ASM_CFI(".cfi_escape 0x10,0x20,0x06,0x76,0x10,0x06,0x23,0x90,0x05\n\t") /* %xmm15 */
+
+                   /* Setup SEH unwind registers restore. */
+                   "movq 0x90(%rcx),%rax\n\t" /* context->Rbx */
+                   "movq %rax,0x20(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %rbx, 0x20\n\t")
+                   "movq 0xa8(%rcx),%rax\n\t" /* context->Rsi */
+                   "movq %rax,0x28(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %rsi, 0x28\n\t")
+                   "movq 0xb0(%rcx),%rax\n\t" /* context->Rdi */
+                   "movq %rax,0x30(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %rdi, 0x30\n\t")
+
+                   "movq 0xd8(%rcx),%rax\n\t" /* context->R12 */
+                   "movq %rax,0x38(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %r12, 0x38\n\t")
+                   "movq 0xe0(%rcx),%rax\n\t" /* context->R13 */
+                   "movq %rax,0x40(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %r13, 0x40\n\t")
+                   "movq 0xe8(%rcx),%rax\n\t" /* context->R14 */
+                   "movq %rax,0x48(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %r14, 0x48\n\t")
+                   "movq 0xf0(%rcx),%rax\n\t" /* context->R15 */
+                   "movq %rax,0x50(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %r15, 0x50\n\t")
+                   "pushq %rsi\n\t"
+                   "pushq %rdi\n\t"
+                   "leaq 0x200(%rcx),%rsi\n\t"
+                   "leaq 0x60(%rsp),%rdi\n\t"
+                   "movq $0x14,%rcx\n\t"
+                   "cld\n\t"
+                   "rep; movsq\n\t"
+                   "popq %rdi\n\t"
+                   "popq %rsi\n\t"
+                   __ASM_SEH(".seh_savexmm %xmm6, 0x60\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm7, 0x70\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm8, 0x80\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm9, 0x90\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm10, 0xa0\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm11, 0xb0\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm12, 0xc0\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm13, 0xd0\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm14, 0xe0\n\t")
+                   __ASM_SEH(".seh_savexmm %xmm15, 0xf0\n\t")
+
+                   /* call the callback. */
                    "movq %r8,%rcx\n\t"
                    "callq *%rdx\n\t"
                    __ASM_CFI(".cfi_restore_state\n\t")
+                   "nop\n\t" /* Otherwise RtlVirtualUnwind() will think we are inside epilogue and
+                              * interpret / execute the rest of opcodes here instead of unwind through
+                              * machine frame. */
                    "leaq 0(%rbp),%rsp\n\t"
                    __ASM_CFI(".cfi_def_cfa_register %rsp\n\t")
                    "popq %rbp\n\t"
@@ -1409,6 +1477,20 @@ USHORT WINAPI RtlCaptureStackBackTrace( ULONG skip, ULONG count, PVOID *buffer, 
     TRACE( "captured %hu frames\n", num_entries );
     return num_entries;
 }
+
+
+/***********************************************************************
+ *           signal_start_thread
+ */
+__ASM_GLOBAL_FUNC( signal_start_thread,
+                   "movq %rcx,%rbx\n\t"     /* context */
+                   "leaq -32(%rcx),%rcx\n\t"
+                   "movq %rcx,%rsp\n\t"
+                   "andq $~0xfff,%rcx\n\t"  /* round down to page size */
+                   "call " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
+                   "movl $1,%edx\n\t"
+                   "movq %rbx,%rcx\n\t"
+                   "call " __ASM_NAME("NtContinue") )
 
 
 /**********************************************************************

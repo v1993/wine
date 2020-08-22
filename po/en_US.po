@@ -8393,7 +8393,7 @@ msgstr "3. Enter the &initial catalog to use:"
 msgid "&Test Connection"
 msgstr "&Test Connection"
 
-#: version.rc:92 winemine.rc:65
+#: version.rc:92
 msgid "Advanced"
 msgstr "Advanced"
 
@@ -12501,6 +12501,30 @@ msgstr "Start"
 msgid "&Run..."
 msgstr "&Run..."
 
+#: fsutil.mc:28
+msgid ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+msgstr ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+
+#: fsutil.mc:35
+msgid ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+msgstr ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+
+#: fsutil.mc:40
+msgid "Syntax: fsutil hardlink create <new> <existing>\n"
+msgstr "Syntax: fsutil hardlink create <new> <existing>\n"
+
 #: hostname.rc:30
 msgid "Usage: hostname\n"
 msgstr "Usage: hostname\n"
@@ -16505,8 +16529,8 @@ msgid "&Beginner"
 msgstr "&Beginner"
 
 #: winemine.rc:45
-msgid "&Advanced"
-msgstr "&Advanced"
+msgid "&Intermediate"
+msgstr "&Intermediate"
 
 #: winemine.rc:46
 msgid "&Expert"
@@ -16535,6 +16559,10 @@ msgstr "Fastest times"
 #: winemine.rc:64
 msgid "Beginner"
 msgstr "Beginner"
+
+#: winemine.rc:65
+msgid "Intermediate"
+msgstr "Intermediate"
 
 #: winemine.rc:66
 msgid "Expert"

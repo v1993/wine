@@ -324,7 +324,7 @@ static void	WCCURSES_ComputePositions(struct inner_data* data)
                   data->curcfg.win_width, data->curcfg.win_height, x, y);
         pos.Left = pos.Top = 0;
         pos.Right = x - 1; pos.Bottom = y - 1;
-        SetConsoleWindowInfo(data->hConOut, FALSE, &pos);
+        SetConsoleWindowInfo(data->console, FALSE, &pos);
         return; /* we'll get called again upon event for new window size */
     }
     if (PRIVATE(data)->pad) WCCURSES_PosCursor(data);
@@ -339,7 +339,7 @@ static void	WCCURSES_SetTitle(const struct inner_data* data)
 {
     WCHAR   wbuf[256];
 
-    if (WINECON_GetConsoleTitle(data->hConIn, wbuf, ARRAY_SIZE(wbuf)))
+    if (WINECON_GetConsoleTitle(data->console, wbuf, ARRAY_SIZE(wbuf)))
     {
         char        buffer[256];
 
@@ -965,7 +965,7 @@ static DWORD CALLBACK input_thread( void *arg )
             else
                 numEvent = WCCURSES_FillSimpleChar(ir, inchar);
 
-            if (numEvent) WriteConsoleInputW(data->hConIn, ir, numEvent, &n);
+            if (numEvent) WriteConsoleInputW(data->console, ir, numEvent, &n);
         }
         LeaveCriticalSection(&PRIVATE(data)->lock);
     }

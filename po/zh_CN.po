@@ -8339,7 +8339,7 @@ msgstr "3. 输入要使用的初始目录："
 msgid "&Test Connection"
 msgstr "测试连接(&T)"
 
-#: version.rc:92 winemine.rc:65
+#: version.rc:92
 msgid "Advanced"
 msgstr "高级"
 
@@ -12296,6 +12296,24 @@ msgstr "起点"
 msgid "&Run..."
 msgstr "运行(&R)..."
 
+#: fsutil.mc:28
+msgid ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+msgstr ""
+
+#: fsutil.mc:35
+msgid ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+msgstr ""
+
+#: fsutil.mc:40
+msgid "Syntax: fsutil hardlink create <new> <existing>\n"
+msgstr ""
+
 #: hostname.rc:30
 msgid "Usage: hostname\n"
 msgstr "用法：hostname\n"
@@ -16249,8 +16267,10 @@ msgid "&Beginner"
 msgstr "初学者(&B)"
 
 #: winemine.rc:45
-msgid "&Advanced"
-msgstr "高级(&A)"
+#, fuzzy
+#| msgid "Interface"
+msgid "&Intermediate"
+msgstr "接口"
 
 #: winemine.rc:46
 msgid "&Expert"
@@ -16279,6 +16299,12 @@ msgstr "最快时间"
 #: winemine.rc:64
 msgid "Beginner"
 msgstr "初学者"
+
+#: winemine.rc:65
+#, fuzzy
+#| msgid "Interface"
+msgid "Intermediate"
+msgstr "接口"
 
 #: winemine.rc:66
 msgid "Expert"

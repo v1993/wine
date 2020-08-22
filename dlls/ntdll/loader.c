@@ -3416,7 +3416,7 @@ void WINAPI LdrInitializeThunk( CONTEXT *context, void **entry, ULONG_PTR unknow
     WINE_MODREF *wm;
     LPCWSTR load_path = NtCurrentTeb()->Peb->ProcessParameters->DllPath.Buffer;
 
-    if (process_detaching) return;
+    if (process_detaching) NtTerminateThread( GetCurrentThread(), 0 );
 
     RtlEnterCriticalSection( &loader_section );
 
@@ -3486,6 +3486,7 @@ void WINAPI LdrInitializeThunk( CONTEXT *context, void **entry, ULONG_PTR unknow
     }
 
     RtlLeaveCriticalSection( &loader_section );
+    signal_start_thread( context );
 }
 
 
@@ -3877,28 +3878,6 @@ void WINAPI RtlReleasePath( PWSTR path )
 }
 
 
-/***********************************************************************
- *           NtLoadDriver   (NTDLL.@)
- *           ZwLoadDriver   (NTDLL.@)
- */
-NTSTATUS WINAPI NtLoadDriver( const UNICODE_STRING *DriverServiceName )
-{
-    FIXME("(%p), stub!\n",DriverServiceName);
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-
-/***********************************************************************
- *           NtUnloadDriver   (NTDLL.@)
- *           ZwUnloadDriver   (NTDLL.@)
- */
-NTSTATUS WINAPI NtUnloadDriver( const UNICODE_STRING *DriverServiceName )
-{
-    FIXME("(%p), stub!\n",DriverServiceName);
-    return STATUS_NOT_IMPLEMENTED;
-}
-
-
 /******************************************************************
  *		DllMain   (NTDLL.@)
  */
@@ -3928,7 +3907,6 @@ void __wine_process_init(void)
     UNICODE_STRING nt_name;
     MEMORY_BASIC_INFORMATION meminfo;
     INITIAL_TEB stack;
-    ULONG_PTR val;
     TEB *teb = NtCurrentTeb();
     PEB *peb = teb->Peb;
 
@@ -3957,8 +3935,9 @@ void __wine_process_init(void)
     InitializeListHead( &ldr.InMemoryOrderModuleList );
     InitializeListHead( &ldr.InInitializationOrderModuleList );
 
-    NtQueryInformationProcess( GetCurrentProcess(), ProcessWow64Information, &val, sizeof(val), NULL );
-    is_wow64 = !!val;
+#ifndef _WIN64
+    is_wow64 = !!NtCurrentTeb64();
+#endif
 
     init_unix_codepage();
     init_directories();
@@ -4030,7 +4009,18 @@ void __wine_process_init(void)
         NtTerminateProcess( GetCurrentProcess(), status );
     }
 
-    unix_funcs->virtual_set_large_address_space();
+#ifndef _WIN64
+    if (NtCurrentTeb64())
+    {
+        PEB64 *peb64 = UlongToPtr( NtCurrentTeb64()->Peb );
+        peb64->ImageBaseAddress = PtrToUlong( peb->ImageBaseAddress );
+        peb64->OSMajorVersion   = peb->OSMajorVersion;
+        peb64->OSMinorVersion   = peb->OSMinorVersion;
+        peb64->OSBuildNumber    = peb->OSBuildNumber;
+        peb64->OSPlatformId     = peb->OSPlatformId;
+        peb64->SessionId        = peb->SessionId;
+    }
+#endif
 
     /* the main exe needs to be the first in the load order list */
     RemoveEntryList( &wm->ldr.InLoadOrderLinks );
@@ -4038,7 +4028,7 @@ void __wine_process_init(void)
     RemoveEntryList( &wm->ldr.InMemoryOrderLinks );
     InsertHeadList( &peb->LdrData->InMemoryOrderModuleList, &wm->ldr.InMemoryOrderLinks );
 
-    unix_funcs->virtual_alloc_thread_stack( &stack, 0, 0, NULL );
+    RtlCreateUserStack( 0, 0, 0, 0x10000, 0x10000, &stack );
     teb->Tib.StackBase = stack.StackBase;
     teb->Tib.StackLimit = stack.StackLimit;
     teb->DeallocationStack = stack.DeallocationStack;

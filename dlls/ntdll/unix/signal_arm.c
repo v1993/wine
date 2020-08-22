@@ -172,6 +172,37 @@ enum arm_trap_code
     TRAP_ARM_ALIGNFLT   = 17,  /* Alignment check exception */
 };
 
+struct syscall_frame
+{
+    struct syscall_frame *prev_frame;
+    DWORD                 cpsr;
+    DWORD                 r5;
+    DWORD                 r6;
+    DWORD                 r7;
+    DWORD                 r8;
+    DWORD                 r9;
+    DWORD                 r10;
+    DWORD                 r11;
+    DWORD                 thunk_addr;
+    DWORD                 r4;
+    DWORD                 ret_addr;
+};
+
+struct arm_thread_data
+{
+    void                 *exit_frame;    /* 1d4 exit frame pointer */
+    struct syscall_frame *syscall_frame; /* 1d8 frame pointer on syscall entry */
+};
+
+C_ASSERT( sizeof(struct arm_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct arm_thread_data, exit_frame ) == 0x1d4 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct arm_thread_data, syscall_frame ) == 0x1d8 );
+
+static inline struct arm_thread_data *arm_thread_data(void)
+{
+    return (struct arm_thread_data *)ntdll_get_thread_data()->cpu_data;
+}
+
 
 /***********************************************************************
  *           unwind_builtin_dll
@@ -309,45 +340,6 @@ static unsigned int get_server_context_flags( DWORD flags )
 
 
 /***********************************************************************
- *           copy_context
- *
- * Copy a register context according to the flags.
- */
-static void copy_context( CONTEXT *to, const CONTEXT *from, DWORD flags )
-{
-    flags &= ~CONTEXT_ARM;  /* get rid of CPU id */
-    if (flags & CONTEXT_CONTROL)
-    {
-        to->Sp      = from->Sp;
-        to->Lr      = from->Lr;
-        to->Pc      = from->Pc;
-        to->Cpsr    = from->Cpsr;
-    }
-    if (flags & CONTEXT_INTEGER)
-    {
-        to->R0  = from->R0;
-        to->R1  = from->R1;
-        to->R2  = from->R2;
-        to->R3  = from->R3;
-        to->R4  = from->R4;
-        to->R5  = from->R5;
-        to->R6  = from->R6;
-        to->R7  = from->R7;
-        to->R8  = from->R8;
-        to->R9  = from->R9;
-        to->R10 = from->R10;
-        to->R11 = from->R11;
-        to->R12 = from->R12;
-    }
-    if (flags & CONTEXT_FLOATING_POINT)
-    {
-        to->Fpscr = from->Fpscr;
-        memcpy( to->u.D, from->u.D, sizeof(to->u.D) );
-    }
-}
-
-
-/***********************************************************************
  *           context_to_server
  *
  * Convert a register context to the server format.
@@ -469,7 +461,12 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 
     context_to_server( &server_context, context );
     ret = set_thread_context( handle, &server_context, &self );
-    if (self && ret == STATUS_SUCCESS) set_cpu_context( context );
+    if (self && ret == STATUS_SUCCESS)
+    {
+        struct syscall_frame *frame = arm_thread_data()->syscall_frame;
+        arm_thread_data()->syscall_frame = frame->prev_frame;
+        set_cpu_context( context );
+    }
     return ret;
 }
 
@@ -481,7 +478,8 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
     NTSTATUS ret;
-    DWORD needed_flags = context->ContextFlags;
+    struct syscall_frame *frame = arm_thread_data()->syscall_frame;
+    DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM;
     BOOL self = (handle == GetCurrentThread());
 
     if (!self)
@@ -494,12 +492,34 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         needed_flags &= ~context->ContextFlags;
     }
 
-    if (self && needed_flags)
+    if (self)
     {
-        CONTEXT ctx;
-        RtlCaptureContext( &ctx );
-        copy_context( context, &ctx, ctx.ContextFlags & needed_flags );
-        context->ContextFlags |= ctx.ContextFlags & needed_flags;
+        if (needed_flags & CONTEXT_INTEGER)
+        {
+            context->R0  = 0;
+            context->R1  = 0;
+            context->R2  = 0;
+            context->R3  = 0;
+            context->R4  = frame->r4;
+            context->R5  = frame->r5;
+            context->R6  = frame->r6;
+            context->R7  = frame->r7;
+            context->R8  = frame->r8;
+            context->R9  = frame->r9;
+            context->R10 = frame->r10;
+            context->R11 = frame->r11;
+            context->R12 = 0;
+            context->ContextFlags |= CONTEXT_INTEGER;
+        }
+        if (needed_flags & CONTEXT_CONTROL)
+        {
+            context->Sp   = (DWORD)&frame->r4;
+            context->Lr   = frame->thunk_addr;
+            context->Pc   = frame->thunk_addr;
+            context->Cpsr = frame->cpsr;
+            context->ContextFlags |= CONTEXT_CONTROL;
+        }
+        if (needed_flags & CONTEXT_FLOATING_POINT) FIXME( "floating point not implemented\n" );
     }
     return STATUS_SUCCESS;
 }
@@ -509,7 +529,8 @@ extern void raise_func_trampoline_thumb( EXCEPTION_RECORD *rec, CONTEXT *context
 __ASM_GLOBAL_FUNC( raise_func_trampoline_thumb,
                    ".thumb\n\t"
                    "bx r2\n\t"
-                   "bkpt")
+                   "bkpt\n\t"
+                   ".arm")
 
 extern void raise_func_trampoline_arm( EXCEPTION_RECORD *rec, CONTEXT *context, void *func );
 __ASM_GLOBAL_FUNC( raise_func_trampoline_arm,
@@ -536,6 +557,7 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
 
     rec->ExceptionAddress = (void *)PC_sig(sigcontext);
     save_context( &context, sigcontext );
+    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context.Pc += 4;
 
     status = send_debug_event( rec, &context, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -559,11 +581,79 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
     REGn_sig(2, sigcontext) = (DWORD)pKiUserExceptionDispatcher;
 }
 
-void WINAPI call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context,
-                                            NTSTATUS (WINAPI *dispatcher)(EXCEPTION_RECORD*,CONTEXT*) )
-{
-    dispatcher( rec, context );
-}
+
+/***********************************************************************
+ *           call_user_apc_dispatcher
+ */
+__ASM_GLOBAL_FUNC( call_user_apc_dispatcher,
+                   "mov r4, r0\n\t"           /* context_ptr */
+                   "mov r5, r1\n\t"           /* ctx */
+                   "mov r6, r2\n\t"           /* arg1 */
+                   "mov r7, r3\n\t"           /* arg2 */
+                   "ldr r8, [sp]\n\t"         /* func */
+                   "ldr r9, [sp, #4]\n\t"     /* dispatcher */
+                   "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
+                   "add r10, r0, #0x1d8\n\t"  /* arm_thread_data()->syscall_frame */
+                   "ldr r12, [r10]\n\t"
+                   "movs r0, r4\n\t"
+                   "beq 1f\n\t"
+                   "ldr r0, [r0, #0x38]\n\t"  /* context_ptr->Sp */
+                   "sub r0, r0, #0x1c8\n\t"   /* sizeof(CONTEXT) + offsetof(frame,r4) */
+                   "ldr r12, [r12]\n\t"       /* frame->prev_frame */
+                   "str r12, [r10]\n\t"
+                   "mov sp, r0\n\t"
+                   "b 2f\n"
+                   "1:\tsub r11, r12, #0x1a0\n\t"
+                   "cmp r11, sp\n\t"
+                   "movlo sp, r11\n\t"
+                   "mov r0, #3\n\t"
+                   "movt r0, #32\n\t"
+                   "str r0, [r11]\n\t"         /* context.ContextFlags = CONTEXT_FULL */
+                   "mov r1, r11\n\t"
+                   "mov r0, #~1\n\t"
+                   "bl " __ASM_NAME("NtGetContextThread") "\n\t"
+                   "mov r0, #0xc0\n\t"
+                   "str r0, [r11, #4]\n\t"    /* context.R0 = STATUS_USER_APC */
+                   "mov r0, r11\n\t"
+                   "ldr r12, [r12]\n\t"       /* frame->prev_frame */
+                   "str r12, [r10]\n"
+                   "2:\tmov r1, r5\n\t"       /* ctx */
+                   "mov r2, r6\n\t"           /* arg1 */
+                   "mov r3, r7\n\t"           /* arg2 */
+                   "push {r8, r9}\n\t"        /* func */
+                   "ldr lr, [r0, #0x3c]\n\t"  /* context.Lr */
+                   "bx r9" )
+
+
+/***********************************************************************
+ *           call_raise_user_exception_dispatcher
+ */
+__ASM_GLOBAL_FUNC( call_raise_user_exception_dispatcher,
+                   "mov r2, r0\n\t"  /* dispatcher */
+                   "b " __ASM_NAME("call_user_exception_dispatcher") )
+
+
+/***********************************************************************
+ *           call_user_exception_dispatcher
+ */
+__ASM_GLOBAL_FUNC( call_user_exception_dispatcher,
+                   "mov r4, r0\n\t"
+                   "mov r5, r1\n\t"
+                   "mov r6, r2\n\t"
+                   "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
+                   "add r7, r0, #0x1d8\n\t"  /* arm_thread_data()->syscall_frame */
+                   "mov r0, r4\n\t"
+                   "mov r1, r5\n\t"
+                   "mov r2, r6\n\t"
+                   "ldr r3, [r7]\n\t"
+                   "ldr r4, [r3]\n\t"        /* frame->prev_frame */
+                   "str r4, [r7]\n\t"
+                   "add r3, r3, #8\n\t"
+                   "ldm r3, {r5-r11}\n\t"
+                   "ldr r4, [r3, #32]\n\t"
+                   "ldr lr, [r3, #36]\n\t"
+                   "add sp, r3, #40\n\t"
+                   "bx r2" )
 
 
 /**********************************************************************
@@ -624,6 +714,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     case TRAP_BRKPT:
     default:
         rec.ExceptionCode = EXCEPTION_BREAKPOINT;
+        rec.NumberParameters = 1;
         break;
     }
     setup_exception( sigcontext, &rec );
@@ -844,10 +935,10 @@ static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry,
 
 
 /***********************************************************************
- *           attach_thread
+ *           get_initial_context
  */
-PCONTEXT DECLSPEC_HIDDEN attach_thread( LPTHREAD_START_ROUTINE entry, void *arg,
-                                        BOOL suspend, void *relay )
+PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void *arg,
+                                              BOOL suspend, void *relay )
 {
     CONTEXT *ctx;
 
@@ -867,7 +958,6 @@ PCONTEXT DECLSPEC_HIDDEN attach_thread( LPTHREAD_START_ROUTINE entry, void *arg,
     }
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
     ctx->ContextFlags = CONTEXT_FULL;
-    pLdrInitializeThunk( ctx, (void **)&ctx->R0, 0, 0 );
     return ctx;
 }
 
@@ -878,28 +968,24 @@ PCONTEXT DECLSPEC_HIDDEN attach_thread( LPTHREAD_START_ROUTINE entry, void *arg,
 __ASM_GLOBAL_FUNC( signal_start_thread,
                    ".arm\n\t"
                    "push {r4-r12,lr}\n\t"
+                   "ldr r5, [sp, #40]\n\t"    /* thunk */
                    /* store exit frame */
-                   "ldr r4, [sp, #40]\n\t"    /* teb */
-                   "str sp, [r4, #0x1d4]\n\t" /* teb->SystemReserved2 */
+                   "ldr r4, [sp, #44]\n\t"    /* teb */
+                   "str sp, [r4, #0x1d4]\n\t" /* teb->GdiTebBatch */
                    /* switch to thread stack */
                    "ldr r4, [r4, #4]\n\t"     /* teb->Tib.StackBase */
                    "sub sp, r4, #0x1000\n\t"
                    /* attach dlls */
-                   "bl " __ASM_NAME("attach_thread") "\n\t"
-                   "mov sp, r0\n\t"
-                   /* clear the stack */
-                   "and r0, #~0xff0\n\t"  /* round down to page size */
-                   "bl " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
-                   /* switch to the initial context */
-                   "mov r1, #1\n\t"
-                   "mov r0, sp\n\t"
-                   "b " __ASM_NAME("NtContinue") )
+                   "bl " __ASM_NAME("get_initial_context") "\n\t"
+                   "add r1, r0, #4\n\t"       /* &context->R0 */
+                   "mov lr, #0\n\t"
+                   "bx r5" )
 
 
 extern void DECLSPEC_NORETURN call_thread_exit_func( int status, void (*func)(int), TEB *teb );
 __ASM_GLOBAL_FUNC( call_thread_exit_func,
                    ".arm\n\t"
-                   "ldr r3, [r2, #0x1d4]\n\t"  /* teb->SystemReserved2 */
+                   "ldr r3, [r2, #0x1d4]\n\t"  /* teb->GdiTebBatch */
                    "mov ip, #0\n\t"
                    "str ip, [r2, #0x1d4]\n\t"
                    "cmp r3, ip\n\t"

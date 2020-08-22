@@ -60,7 +60,6 @@ __ASM_GLOBAL_FUNC( __chkstk, "lsl r4, r4, #2\n\t"
 /***********************************************************************
  *		RtlCaptureContext (NTDLL.@)
  */
-/* FIXME: Use the Stack instead of the actual register values */
 __ASM_STDCALL_FUNC( RtlCaptureContext, 4,
                     ".arm\n\t"
                     "stmib r0, {r0-r12}\n\t"   /* context->R0..R12 */
@@ -69,7 +68,7 @@ __ASM_STDCALL_FUNC( RtlCaptureContext, 4,
                     "str r1, [r0]\n\t"         /* context->ContextFlags */
                     "str SP, [r0, #0x38]\n\t"  /* context->Sp */
                     "str LR, [r0, #0x3c]\n\t"  /* context->Lr */
-                    "str PC, [r0, #0x40]\n\t"  /* context->Pc */
+                    "str LR, [r0, #0x40]\n\t"  /* context->Pc */
                     "mrs r1, CPSR\n\t"
                     "str r1, [r0, #0x44]\n\t"  /* context->Cpsr */
                     "bx lr"
@@ -239,14 +238,21 @@ void WINAPI RtlUnwind( void *endframe, void *target_ip, EXCEPTION_RECORD *rec, v
 /***********************************************************************
  *		RtlRaiseException (NTDLL.@)
  */
-void WINAPI RtlRaiseException( EXCEPTION_RECORD *rec )
-{
-    CONTEXT context;
-
-    RtlCaptureContext( &context );
-    rec->ExceptionAddress = (LPVOID)context.Pc;
-    RtlRaiseStatus( NtRaiseException( rec, &context, TRUE ));
-}
+__ASM_STDCALL_FUNC( RtlRaiseException, 4,
+                    "push {r0, lr}\n\t"
+                    "sub sp, sp, #0x1a0\n\t"  /* sizeof(CONTEXT) */
+                    "mov r0, sp\n\t"  /* context */
+                    "bl " __ASM_NAME("RtlCaptureContext") "\n\t"
+                    "ldr r0, [sp, #0x1a0]\n\t" /* rec */
+                    "ldr r1, [sp, #0x1a4]\n\t"
+                    "str r1, [sp, #0x40]\n\t"  /* context->Pc */
+                    "str r1, [r0, #12]\n\t"    /* rec->ExceptionAddress */
+                    "add r1, sp, #0x1a8\n\t"
+                    "str r1, [sp, #0x38]\n\t"  /* context->Sp */
+                    "mov r1, sp\n\t"
+                    "mov r2, #1\n\t"
+                    "bl " __ASM_NAME("NtRaiseException") "\n\t"
+                    "bl " __ASM_NAME("RtlRaiseStatus") )
 
 /*************************************************************************
  *             RtlCaptureStackBackTrace (NTDLL.@)
@@ -256,6 +262,17 @@ USHORT WINAPI RtlCaptureStackBackTrace( ULONG skip, ULONG count, PVOID *buffer, 
     FIXME( "(%d, %d, %p, %p) stub!\n", skip, count, buffer, hash );
     return 0;
 }
+
+/***********************************************************************
+ *           signal_start_thread
+ */
+__ASM_GLOBAL_FUNC( signal_start_thread,
+                   "mov sp, r0\n\t"  /* context */
+                   "and r0, #~0xff0\n\t"  /* round down to page size */
+                   "bl " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
+                   "mov r1, #1\n\t"
+                   "mov r0, sp\n\t"
+                   "b " __ASM_NAME("NtContinue") )
 
 /**********************************************************************
  *              DbgBreakPoint   (NTDLL.@)

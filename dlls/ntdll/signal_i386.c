@@ -36,34 +36,6 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
-/* not defined for x86, so copy the x86_64 definition */
-typedef struct DECLSPEC_ALIGN(16) _M128A
-{
-    ULONGLONG Low;
-    LONGLONG High;
-} M128A;
-
-typedef struct
-{
-    WORD ControlWord;
-    WORD StatusWord;
-    BYTE TagWord;
-    BYTE Reserved1;
-    WORD ErrorOpcode;
-    DWORD ErrorOffset;
-    WORD ErrorSelector;
-    WORD Reserved2;
-    DWORD DataOffset;
-    WORD DataSelector;
-    WORD Reserved3;
-    DWORD MxCsr;
-    DWORD MxCsr_Mask;
-    M128A FloatRegisters[8];
-    M128A XmmRegisters[16];
-    BYTE Reserved4[96];
-} XMM_SAVE_AREA32;
-
-
 struct x86_thread_data
 {
     DWORD              fs;            /* 1d4 TEB selector */
@@ -75,15 +47,15 @@ struct x86_thread_data
     DWORD              dr6;           /* 1ec */
     DWORD              dr7;           /* 1f0 */
     void              *exit_frame;    /* 1f4 exit frame pointer */
-    /* the ntdll_thread_data structure follows here */
 };
 
-C_ASSERT( offsetof( TEB, SystemReserved2 ) + offsetof( struct x86_thread_data, gs ) == 0x1d8 );
-C_ASSERT( offsetof( TEB, SystemReserved2 ) + offsetof( struct x86_thread_data, exit_frame ) == 0x1f4 );
+C_ASSERT( sizeof(struct x86_thread_data) <= 16 * sizeof(void *) );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct x86_thread_data, gs ) == 0x1d8 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct x86_thread_data, exit_frame ) == 0x1f4 );
 
 static inline struct x86_thread_data *x86_thread_data(void)
 {
-    return (struct x86_thread_data *)NtCurrentTeb()->SystemReserved2;
+    return (struct x86_thread_data *)&NtCurrentTeb()->GdiTebBatch;
 }
 
 struct ldt_copy *__wine_ldt_copy = NULL;
@@ -287,8 +259,8 @@ static inline void save_fpux( CONTEXT *context )
 {
 #ifdef __GNUC__
     /* we have to enforce alignment by hand */
-    char buffer[sizeof(XMM_SAVE_AREA32) + 16];
-    XMM_SAVE_AREA32 *state = (XMM_SAVE_AREA32 *)(((ULONG_PTR)buffer + 15) & ~15);
+    char buffer[sizeof(XSAVE_FORMAT) + 16];
+    XSAVE_FORMAT *state = (XSAVE_FORMAT *)(((ULONG_PTR)buffer + 15) & ~15);
 
     context->ContextFlags |= CONTEXT_EXTENDED_REGISTERS;
     __asm__ __volatile__( "fxsave %0" : "=m" (*state) );
@@ -329,55 +301,6 @@ __ASM_STDCALL_FUNC( RtlCaptureContext, 4,
                     "popl 0xb0(%eax)\n\t"      /* context->Eax */
                     __ASM_CFI(".cfi_adjust_cfa_offset -4\n\t")
                     "ret $4" )
-
-
-/***********************************************************************
- *              NtGetContextThread  (NTDLL.@)
- *              ZwGetContextThread  (NTDLL.@)
- *
- * Note: we use a small assembly wrapper to save the necessary registers
- *       in case we are fetching the context of the current thread.
- */
-NTSTATUS CDECL DECLSPEC_HIDDEN __regs_NtGetContextThread( DWORD edi, DWORD esi, DWORD ebx, DWORD eflags,
-                                                          DWORD ebp, DWORD retaddr, HANDLE handle,
-                                                          CONTEXT *context )
-{
-    DWORD needed_flags = context->ContextFlags & ~CONTEXT_i386;
-
-    /* preset the registers that we got from the asm wrapper */
-    if (needed_flags & CONTEXT_INTEGER)
-    {
-        context->Ebx = ebx;
-        context->Esi = esi;
-        context->Edi = edi;
-    }
-    if (needed_flags & CONTEXT_CONTROL)
-    {
-        context->Ebp    = ebp;
-        context->Esp    = (DWORD)&retaddr;
-        context->Eip    = (DWORD)NtGetContextThread + 12;
-        context->EFlags = eflags;
-    }
-    return unix_funcs->NtGetContextThread( handle, context );
-}
-__ASM_STDCALL_FUNC( NtGetContextThread, 8,
-                    "pushl %ebp\n\t"
-                    __ASM_CFI(".cfi_adjust_cfa_offset 4\n\t")
-                    __ASM_CFI(".cfi_rel_offset %ebp,0\n\t")
-                    "movl %esp,%ebp\n\t"
-                    __ASM_CFI(".cfi_def_cfa_register %ebp\n\t")
-                    "pushfl\n\t"
-                    "pushl %ebx\n\t"
-                    __ASM_CFI(".cfi_rel_offset %ebx,-8\n\t")
-                    "pushl %esi\n\t"
-                    __ASM_CFI(".cfi_rel_offset %esi,-12\n\t")
-                    "pushl %edi\n\t"
-                    __ASM_CFI(".cfi_rel_offset %edi,-16\n\t")
-                    "call " __ASM_NAME("__regs_NtGetContextThread") "\n\t"
-                    "leave\n\t"
-                    __ASM_CFI(".cfi_def_cfa %esp,4\n\t")
-                    __ASM_CFI(".cfi_same_value %ebp\n\t")
-                    "ret $8" )
 
 
 /*******************************************************************
@@ -546,6 +469,22 @@ USHORT WINAPI RtlCaptureStackBackTrace( ULONG skip, ULONG count, PVOID *buffer, 
     return i;
 }
 
+
+/***********************************************************************
+ *           signal_start_thread
+ */
+__ASM_GLOBAL_FUNC( signal_start_thread,
+                   "movl 4(%esp),%esi\n\t"   /* context */
+                   "leal -12(%esi),%eax\n\t"
+                   "movl %eax,%esp\n\t"
+                   /* clear the stack */
+                   "andl $~0xfff,%eax\n\t"  /* round down to page size */
+                   "movl %eax,(%esp)\n\t"
+                   "call " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
+                   /* switch to the initial context */
+                   "movl $1,4(%esp)\n\t"
+                   "movl %esi,(%esp)\n\t"
+                   "call " __ASM_STDCALL("NtContinue", 8) )
 
 /**********************************************************************
  *		DbgBreakPoint   (NTDLL.@)

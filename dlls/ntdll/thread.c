@@ -74,6 +74,17 @@ int __cdecl __wine_dbg_output( const char *str )
 }
 
 
+/*******************************************************************
+ *		KiUserApcDispatcher (NTDLL.@)
+ */
+void WINAPI KiUserApcDispatcher( CONTEXT *context, ULONG_PTR ctx, ULONG_PTR arg1, ULONG_PTR arg2,
+                                 PNTAPCFUNC func )
+{
+    func( ctx, arg1, arg2 );
+    NtContinue( context, TRUE );
+}
+
+
 /***********************************************************************
  *           RtlExitUserThread  (NTDLL.@)
  */
@@ -81,26 +92,11 @@ void WINAPI RtlExitUserThread( ULONG status )
 {
     ULONG last;
 
-    if (status)  /* send the exit code to the server (0 is already the default) */
-    {
-        SERVER_START_REQ( terminate_thread )
-        {
-            req->handle    = wine_server_obj_handle( GetCurrentThread() );
-            req->exit_code = status;
-            wine_server_call( req );
-        }
-        SERVER_END_REQ;
-    }
-
     NtQueryInformationThread( GetCurrentThread(), ThreadAmILastThread, &last, sizeof(last), NULL );
-    if (last)
-    {
-        LdrShutdownProcess();
-        unix_funcs->exit_process( status );
-    }
+    if (last) RtlExitUserProcess( status );
     LdrShutdownThread();
     RtlFreeThreadActivationContextStack();
-    for (;;) unix_funcs->exit_thread( status );
+    for (;;) NtTerminateThread( GetCurrentThread(), status );
 }
 
 
@@ -255,15 +251,3 @@ TEB_ACTIVE_FRAME * WINAPI RtlGetFrame(void)
 {
     return NtCurrentTeb()->ActiveFrame;
 }
-
-
-/***********************************************************************
- *              NtGetContextThread  (NTDLL.@)
- *              ZwGetContextThread  (NTDLL.@)
- */
-#ifndef __i386__
-NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
-{
-    return unix_funcs->NtGetContextThread( handle, context );
-}
-#endif

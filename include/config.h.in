@@ -152,6 +152,10 @@
 /* Define to 1 if you have the `fallocate' function. */
 #undef HAVE_FALLOCATE
 
+/* Define to 1 if you have the `FAudioCreateReverb9WithCustomAllocatorEXT'
+   function. */
+#undef HAVE_FAUDIOCREATEREVERB9WITHCUSTOMALLOCATOREXT
+
 /* Define to 1 if you have the `FAudioLinkedVersion' function. */
 #undef HAVE_FAUDIOLINKEDVERSION
 
@@ -163,6 +167,9 @@
 
 /* Define to 1 if you have the `ffs' function. */
 #undef HAVE_FFS
+
+/* Define to 1 if you have the `finite' function. */
+#undef HAVE_FINITE
 
 /* Define to 1 if you have the `finitef' function. */
 #undef HAVE_FINITEF
@@ -950,6 +957,12 @@
 /* Define to 1 if `__st_birthtime' is a member of `struct stat'. */
 #undef HAVE_STRUCT_STAT___ST_BIRTHTIME
 
+/* Define to 1 if `mem_unit' is a member of `struct sysinfo'. */
+#undef HAVE_STRUCT_SYSINFO_MEM_UNIT
+
+/* Define to 1 if `totalram' is a member of `struct sysinfo'. */
+#undef HAVE_STRUCT_SYSINFO_TOTALRAM
+
 /* Define to 1 if `tcps_connattempt' is a member of `struct tcpstat'. */
 #undef HAVE_STRUCT_TCPSTAT_TCPS_CONNATTEMPT
 
@@ -1254,9 +1267,6 @@
 
 /* Define if Xrandr has the XRRGetProviderResources function */
 #undef HAVE_XRRGETPROVIDERRESOURCES
-
-/* Define if Xrandr has the XRRGetScreenResources function */
-#undef HAVE_XRRGETSCREENRESOURCES
 
 /* Define to 1 if you have the `y0' function. */
 #undef HAVE_Y0

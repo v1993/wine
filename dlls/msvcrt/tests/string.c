@@ -115,6 +115,8 @@ static int (__cdecl *p__memicmp)(const char*, const char*, size_t);
 static int (__cdecl *p__memicmp_l)(const char*, const char*, size_t, _locale_t);
 static size_t (__cdecl *p___strncnt)(const char*, size_t);
 
+int CDECL __STRINGTOLD(_LDOUBLE*, char**, const char*, int);
+
 #define SETNOFAIL(x,y) x = (void*)GetProcAddress(hMsvcrt,y)
 #define SET(x,y) SETNOFAIL(x,y); ok(x != NULL, "Export '%s' not found\n", y)
 
@@ -1981,7 +1983,8 @@ static void test__strtod(void)
         ok(d == tests[i].ret, "%d) d = %.16e\n", i, d);
         ok(end == tests[i].str + tests[i].len, "%d) len = %d\n",
                 i, (int)(end - tests[i].str));
-        ok(errno == tests[i].err, "%d) errno = %d\n", i, errno);
+        ok(errno == tests[i].err || (!tests[i].err && errno == 0xdeadbeef) /* <= 2003 */,
+                "%d) errno = %d\n", i, errno);
     }
 
     if (!p__strtod_l)
@@ -2103,6 +2106,11 @@ static void test_mbstowcs(void)
     ret = mbstowcs(wOut, mEmpty, 6);
     ok(ret == 0, "mbstowcs did not return 0, got %d\n", (int)ret);
     ok(!memcmp(wOut, wEmpty, sizeof(wEmpty)), "wOut = %s\n", wine_dbgstr_w(wOut));
+
+    errno = 0xdeadbeef;
+    ret = mbstowcs(wOut, mHiragana+1, 5);
+    ok(ret == -1, "mbstowcs did not return -1\n");
+    ok(errno == EILSEQ, "errno = %d\n", errno);
 
     ret = wcstombs(mOut, wHiragana, 6);
     ok(ret == 4, "wcstombs did not return 4\n");
@@ -4230,6 +4238,148 @@ static void test_wcscmp(void)
     ok(!r, "wcscmp returned %d\n", r);
 }
 
+static const char* debugstr_ldouble(_LDOUBLE *v)
+{
+    static char buf[2 * ARRAY_SIZE(v->ld) + 1];
+    int i;
+
+    for(i=0; i<ARRAY_SIZE(v->ld); i++)
+    {
+        buf[2*i] = v->ld[i] / 16 + '0';
+        if(buf[2*i] > '9') buf[2*i] -= 10 + '0' - 'a';
+        buf[2*i+1] = v->ld[i] % 16 + '0';
+        if(buf[2*i+1] > '9') buf[2*i+1] -= 10 + '0' - 'a';
+    }
+    buf[2 * ARRAY_SIZE(v->ld)] = 0;
+    return buf;
+}
+
+static void test___STRINGTOLD(void)
+{
+    static const struct {
+        const char *str;
+        int endptr;
+        int r;
+        _LDOUBLE v;
+        BOOL todo;
+    } tests[] = {
+        { "0", 1 },
+        { "nan", 0, 4 },
+        { "inf", 0, 4 },
+        { "-0.0", 4, 0, {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80 }} },
+        { "1e0", 3, 0, {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0x3f }} },
+        { "1.7976931348623158e+308", 23, 0, {{ 0xaf, 0xfb, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x43 }} },
+        { "1.7976931348623159e+308", 23, 0, {{ 0xb1, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xfe, 0x43 }} },
+        { "3.65e-4951", 10, 0, {{ 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }} },
+        { "1.82e-4951", 10, 0, {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }}, TRUE },
+        { "1e-99999", 8, 1, {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }} },
+        { "1.18e+4932", 10, 0, {{ 0x25, 0x75, 0x06, 0x68, 0x8a, 0xf1, 0xe7, 0xfd, 0xfe, 0x7f }} },
+        { "1.19e+4932", 10, 2, {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0x7f }} },
+        { "1e+99999", 8, 2, {{ 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80, 0xff, 0x7f }} },
+    };
+
+    char *endptr;
+    _LDOUBLE v;
+    int i, r;
+
+    for(i=0; i<ARRAY_SIZE(tests); i++)
+    {
+        errno = 0xdeadbeef;
+        r = __STRINGTOLD(&v, &endptr, tests[i].str, 0);
+        todo_wine_if(tests[i].todo)
+            ok(r == tests[i].r, "%d) r = %d\n", i, r);
+        ok(endptr == tests[i].str + tests[i].endptr, "%d) endptr = %p, expected %p\n",
+                i, endptr, tests[i].str+tests[i].endptr);
+        ok(!memcmp(&v, &tests[i].v, sizeof(v)), "%d) v = %s\n", i, debugstr_ldouble(&v));
+        ok(errno == 0xdeadbeef, "%d) errno = %x\n", i, errno);
+    }
+}
+
+static void test_SpecialCasing(void)
+{
+    int i;
+    wint_t ret, exp;
+    _locale_t locale;
+    struct test {
+        const char *lang;
+        wint_t ch;
+        wint_t exp;
+    };
+
+    struct test ucases[] = {
+        {"English", 'I', 'i'},  /* LATIN CAPITAL LETTER I */
+        {"English", 0x0130},    /* LATIN CAPITAL LETTER I WITH DOT ABOVE */
+
+        {"Turkish", 'I', 'i'},  /* LATIN CAPITAL LETTER I */
+        {"Turkish", 0x0130},    /* LATIN CAPITAL LETTER I WITH DOT ABOVE */
+    };
+    struct test lcases[] = {
+        {"English", 'i', 'I'},  /* LATIN SMALL LETTER I */
+        {"English", 0x0131},    /* LATIN SMALL LETTER DOTLESS I */
+
+        {"Turkish", 'i', 'I'},  /* LATIN SMALL LETTER I */
+        {"Turkish", 0x0131},    /* LATIN SMALL LETTER DOTLESS I */
+    };
+
+    for (i = 0; i < ARRAY_SIZE(ucases); i++) {
+        if (!setlocale(LC_ALL, ucases[i].lang)) {
+            win_skip("skipping special case tests for %s\n", ucases[i].lang);
+            continue;
+        }
+
+        ret = p_towlower(ucases[i].ch);
+        exp = ucases[i].exp ? ucases[i].exp : ucases[i].ch;
+        ok(ret == exp, "expected lowercase %x, got %x for locale %s\n", exp, ret, ucases[i].lang);
+    }
+
+    for (i = 0; i < ARRAY_SIZE(lcases); i++) {
+        if (!setlocale(LC_ALL, lcases[i].lang)) {
+            win_skip("skipping special case tests for %s\n", lcases[i].lang);
+            continue;
+        }
+
+        ret = p_towupper(lcases[i].ch);
+        exp = lcases[i].exp ? lcases[i].exp : lcases[i].ch;
+        ok(ret == exp, "expected uppercase %x, got %x for locale %s\n", exp, ret, lcases[i].lang);
+    }
+
+    setlocale(LC_ALL, "C");
+
+    if (!p__towlower_l || !p__towupper_l || !p__create_locale)
+    {
+        win_skip("_towlower_l/_towupper_l/_create_locale not available\n");
+        return;
+    }
+
+    /* test _towlower_l creating locale */
+    for (i = 0; i < ARRAY_SIZE(ucases); i++) {
+        if (!(locale = p__create_locale(LC_ALL, ucases[i].lang))) {
+            win_skip("locale %s not available.  skipping\n", ucases[i].lang);
+            continue;
+        }
+
+        ret = p__towlower_l(ucases[i].ch, locale);
+        exp = ucases[i].exp ? ucases[i].exp : ucases[i].ch;
+        ok(ret == exp, "expected lowercase %x, got %x for locale %s\n", exp, ret, ucases[i].lang);
+
+        p__free_locale(locale);
+    }
+
+    /* test _towupper_l creating locale */
+    for (i = 0; i < ARRAY_SIZE(lcases); i++) {
+        if (!(locale = p__create_locale(LC_ALL, lcases[i].lang))) {
+            win_skip("locale %s not available.  skipping\n", lcases[i].lang);
+            continue;
+        }
+
+        ret = p__towupper_l(lcases[i].ch, locale);
+        exp = lcases[i].exp ? lcases[i].exp : lcases[i].ch;
+        ok(ret == exp, "expected uppercase %x, got %x for locale %s\n", exp, ret, lcases[i].lang);
+
+        p__free_locale(locale);
+    }
+}
+
 START_TEST(string)
 {
     char mem[100];
@@ -4380,4 +4530,6 @@ START_TEST(string)
     test_strstr();
     test_iswdigit();
     test_wcscmp();
+    test___STRINGTOLD();
+    test_SpecialCasing();
 }

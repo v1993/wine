@@ -69,9 +69,7 @@
 #include "unix_private.h"
 #include "wine/debug.h"
 
-#ifdef HAVE_LIBUNWIND
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
-#endif
 
 /***********************************************************************
  * signal context platform-specific definitions
@@ -112,22 +110,53 @@ static DWORD64 get_fault_esr( ucontext_t *sigcontext )
     return 0;
 }
 
+#elif defined(__APPLE__)
+
+/* All Registers access - only for local access */
+# define REG_sig(reg_name, context) ((context)->uc_mcontext->__ss.__ ## reg_name)
+# define REGn_sig(reg_num, context) ((context)->uc_mcontext->__ss.__x[reg_num])
+
+/* Special Registers access  */
+# define SP_sig(context)            REG_sig(sp, context)    /* Stack pointer */
+# define PC_sig(context)            REG_sig(pc, context)    /* Program counter */
+# define PSTATE_sig(context)        REG_sig(cpsr, context)  /* Current State Register */
+# define FP_sig(context)            REG_sig(fp, context)    /* Frame pointer */
+# define LR_sig(context)            REG_sig(lr, context)    /* Link Register */
+
+static DWORD64 get_fault_esr( ucontext_t *sigcontext )
+{
+    return sigcontext->uc_mcontext->__es.__esr;
+}
+
 #endif /* linux */
 
 static pthread_key_t teb_key;
 
-struct arm64_thread_data
+struct syscall_frame
 {
-    void     *exit_frame;    /* exit frame pointer */
-    CONTEXT  *context;       /* context to set with SIGUSR2 */
+    ULONG64 x29;
+    ULONG64 thunk_addr;
+    ULONG64 x0, x1, x2, x3, x4, x5, x6, x7, x8;
+    struct syscall_frame *prev_frame;
+    ULONG64 x19, x20, x21, x22, x23, x24, x25, x26, x27, x28;
+    ULONG64 thunk_x29;
+    ULONG64 ret_addr;
 };
 
-C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((TEB *)0)->SystemReserved2) );
-C_ASSERT( offsetof( TEB, SystemReserved2 ) + offsetof( struct arm64_thread_data, exit_frame ) == 0x300 );
+struct arm64_thread_data
+{
+    void                 *exit_frame;    /* 02f0 exit frame pointer */
+    struct syscall_frame *syscall_frame; /* 02f8 frame pointer on syscall entry */
+    CONTEXT              *context;       /* 0300 context to set with SIGUSR2 */
+};
+
+C_ASSERT( sizeof(struct arm64_thread_data) <= sizeof(((struct ntdll_thread_data *)0)->cpu_data) );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct arm64_thread_data, exit_frame ) == 0x2f0 );
+C_ASSERT( offsetof( TEB, GdiTebBatch ) + offsetof( struct arm64_thread_data, syscall_frame ) == 0x2f8 );
 
 static inline struct arm64_thread_data *arm64_thread_data(void)
 {
-    return (struct arm64_thread_data *)NtCurrentTeb()->SystemReserved2;
+    return (struct arm64_thread_data *)ntdll_get_thread_data()->cpu_data;
 }
 
 
@@ -145,11 +174,27 @@ NTSTATUS CDECL unwind_builtin_dll( ULONG type, DISPATCHER_CONTEXT *dispatch, CON
     unw_proc_info_t info;
     int rc;
 
+#ifdef __APPLE__
+    rc = unw_getcontext( &unw_context );
+    if (rc == UNW_ESUCCESS)
+        rc = unw_init_local( &cursor, &unw_context );
+    if (rc == UNW_ESUCCESS)
+    {
+        int i;
+        for (i = 0; i <= 28; i++)
+            unw_set_reg( &cursor, UNW_ARM64_X0 + i, context->u.X[i] );
+        unw_set_reg( &cursor, UNW_ARM64_FP, context->u.s.Fp );
+        unw_set_reg( &cursor, UNW_ARM64_LR, context->u.s.Lr );
+        unw_set_reg( &cursor, UNW_ARM64_SP, context->Sp );
+        unw_set_reg( &cursor, UNW_REG_IP,   context->Pc );
+    }
+#else
     memcpy( unw_context.uc_mcontext.regs, context->u.X, sizeof(context->u.X) );
     unw_context.uc_mcontext.sp = context->Sp;
     unw_context.uc_mcontext.pc = context->Pc;
 
     rc = unw_init_local( &cursor, &unw_context );
+#endif
     if (rc != UNW_ESUCCESS)
     {
         WARN( "setup failed: %d\n", rc );
@@ -187,6 +232,16 @@ NTSTATUS CDECL unwind_builtin_dll( ULONG type, DISPATCHER_CONTEXT *dispatch, CON
     dispatch->LanguageHandler  = (void *)info.handler;
     dispatch->HandlerData      = (void *)info.lsda;
     dispatch->EstablisherFrame = context->Sp;
+#ifdef __APPLE__
+    {
+        int i;
+        for (i = 0; i <= 28; i++)
+            unw_get_reg( &cursor, UNW_ARM64_X0 + i, (unw_word_t *)&context->u.X[i] );
+    }
+    unw_get_reg( &cursor, UNW_ARM64_FP,    (unw_word_t *)&context->u.s.Fp );
+    unw_get_reg( &cursor, UNW_ARM64_X30,   (unw_word_t *)&context->u.s.Lr );
+    unw_get_reg( &cursor, UNW_ARM64_SP,    (unw_word_t *)&context->Sp );
+#else
     unw_get_reg( &cursor, UNW_AARCH64_X0,  (unw_word_t *)&context->u.s.X0 );
     unw_get_reg( &cursor, UNW_AARCH64_X1,  (unw_word_t *)&context->u.s.X1 );
     unw_get_reg( &cursor, UNW_AARCH64_X2,  (unw_word_t *)&context->u.s.X2 );
@@ -219,7 +274,8 @@ NTSTATUS CDECL unwind_builtin_dll( ULONG type, DISPATCHER_CONTEXT *dispatch, CON
     unw_get_reg( &cursor, UNW_AARCH64_X29, (unw_word_t *)&context->u.s.Fp );
     unw_get_reg( &cursor, UNW_AARCH64_X30, (unw_word_t *)&context->u.s.Lr );
     unw_get_reg( &cursor, UNW_AARCH64_SP,  (unw_word_t *)&context->Sp );
-    context->Pc = context->u.s.Lr;
+#endif
+    unw_get_reg( &cursor, UNW_REG_IP,      (unw_word_t *)&context->Pc );
     context->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
 
     TRACE( "next function pc=%016lx%s\n", context->Pc, rc ? "" : " (last frame)" );
@@ -255,7 +311,8 @@ static void save_context( CONTEXT *context, const ucontext_t *sigcontext )
 {
     DWORD i;
 
-    context->ContextFlags = CONTEXT_FULL;
+    context->ContextFlags = (CONTEXT_FULL & ~CONTEXT_FLOATING_POINT) |
+                             CONTEXT_ARM64;
     context->u.s.Fp = FP_sig(sigcontext);     /* Frame pointer */
     context->u.s.Lr = LR_sig(sigcontext);     /* Link register */
     context->Sp     = SP_sig(sigcontext);     /* Stack pointer */
@@ -290,6 +347,7 @@ static void restore_context( const CONTEXT *context, ucontext_t *sigcontext )
  */
 static void save_fpu( CONTEXT *context, ucontext_t *sigcontext )
 {
+#ifdef linux
     struct fpsimd_context *fp = get_fpsimd_context( sigcontext );
 
     if (!fp) return;
@@ -297,6 +355,12 @@ static void save_fpu( CONTEXT *context, ucontext_t *sigcontext )
     context->Fpcr = fp->fpcr;
     context->Fpsr = fp->fpsr;
     memcpy( context->V, fp->vregs, sizeof(context->V) );
+#elif defined(__APPLE__)
+    context->ContextFlags |= CONTEXT_FLOATING_POINT;
+    context->Fpcr = sigcontext->uc_mcontext->__ns.__fpcr;
+    context->Fpsr = sigcontext->uc_mcontext->__ns.__fpsr;
+    memcpy( context->V, sigcontext->uc_mcontext->__ns.__v, sizeof(context->V) );
+#endif
 }
 
 
@@ -307,12 +371,18 @@ static void save_fpu( CONTEXT *context, ucontext_t *sigcontext )
  */
 static void restore_fpu( CONTEXT *context, ucontext_t *sigcontext )
 {
+#ifdef linux
     struct fpsimd_context *fp = get_fpsimd_context( sigcontext );
 
     if (!fp) return;
     fp->fpcr = context->Fpcr;
     fp->fpsr = context->Fpsr;
     memcpy( fp->vregs, context->V, sizeof(fp->vregs) );
+#elif defined(__APPLE__)
+    sigcontext->uc_mcontext->__ns.__fpcr = context->Fpcr;
+    sigcontext->uc_mcontext->__ns.__fpsr = context->Fpsr;
+    memcpy( sigcontext->uc_mcontext->__ns.__v, context->V, sizeof(context->V) );
+#endif
 }
 
 
@@ -331,42 +401,6 @@ static unsigned int get_server_context_flags( DWORD flags )
     if (flags & CONTEXT_FLOATING_POINT) ret |= SERVER_CTX_FLOATING_POINT;
     if (flags & CONTEXT_DEBUG_REGISTERS) ret |= SERVER_CTX_DEBUG_REGISTERS;
     return ret;
-}
-
-
-/***********************************************************************
- *           copy_context
- *
- * Copy a register context according to the flags.
- */
-static void copy_context( CONTEXT *to, const CONTEXT *from, DWORD flags )
-{
-    flags &= ~CONTEXT_ARM64;  /* get rid of CPU id */
-    if (flags & CONTEXT_CONTROL)
-    {
-        to->u.s.Fp  = from->u.s.Fp;
-        to->u.s.Lr  = from->u.s.Lr;
-        to->Sp      = from->Sp;
-        to->Pc      = from->Pc;
-        to->Cpsr    = from->Cpsr;
-    }
-    if (flags & CONTEXT_INTEGER)
-    {
-        memcpy( to->u.X, from->u.X, sizeof(to->u.X) );
-    }
-    if (flags & CONTEXT_FLOATING_POINT)
-    {
-        memcpy( to->V, from->V, sizeof(to->V) );
-        to->Fpcr = from->Fpcr;
-        to->Fpsr = from->Fpsr;
-    }
-    if (flags & CONTEXT_DEBUG_REGISTERS)
-    {
-        memcpy( to->Bcr, from->Bcr, sizeof(to->Bcr) );
-        memcpy( to->Bvr, from->Bvr, sizeof(to->Bvr) );
-        memcpy( to->Wcr, from->Wcr, sizeof(to->Wcr) );
-        memcpy( to->Wvr, from->Wvr, sizeof(to->Wvr) );
-    }
 }
 
 
@@ -487,6 +521,8 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     }
     if (self && ret == STATUS_SUCCESS)
     {
+        struct syscall_frame *frame = arm64_thread_data()->syscall_frame;
+        arm64_thread_data()->syscall_frame = frame->prev_frame;
         InterlockedExchangePointer( (void **)&arm64_thread_data()->context, (void *)context );
         raise( SIGUSR2 );
     }
@@ -501,7 +537,8 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
 NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 {
     NTSTATUS ret;
-    DWORD needed_flags = context->ContextFlags;
+    struct syscall_frame *frame = arm64_thread_data()->syscall_frame;
+    DWORD needed_flags = context->ContextFlags & ~CONTEXT_ARM64;
     BOOL self = (handle == GetCurrentThread());
 
     if (!self)
@@ -514,12 +551,26 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         needed_flags &= ~context->ContextFlags;
     }
 
-    if (self && needed_flags)
+    if (self)
     {
-        CONTEXT ctx;
-        RtlCaptureContext( &ctx );
-        copy_context( context, &ctx, ctx.ContextFlags & needed_flags );
-        context->ContextFlags |= ctx.ContextFlags & needed_flags;
+        if (needed_flags & CONTEXT_INTEGER)
+        {
+            memset( context->u.X, 0, sizeof(context->u.X[0]) * 18 );
+            context->u.X[18] = (DWORD64)NtCurrentTeb();
+            memcpy( context->u.X + 19, &frame->x19, sizeof(context->u.X[0]) * 10 );
+            context->ContextFlags |= CONTEXT_INTEGER;
+        }
+        if (needed_flags & CONTEXT_CONTROL)
+        {
+            context->u.s.Fp  = frame->x29;
+            context->u.s.Lr  = frame->ret_addr;
+            context->Sp      = (ULONG64)&frame->thunk_x29;
+            context->Pc      = frame->thunk_addr;
+            context->Cpsr    = 0;
+            context->ContextFlags |= CONTEXT_CONTROL;
+        }
+        if (needed_flags & CONTEXT_FLOATING_POINT) FIXME( "floating point not supported\n" );
+        if (needed_flags & CONTEXT_DEBUG_REGISTERS) FIXME( "debug registers not supported\n" );
     }
     return STATUS_SUCCESS;
 }
@@ -564,6 +615,7 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
     rec->ExceptionAddress = (void *)PC_sig(sigcontext);
     save_context( &context, sigcontext );
     save_fpu( &context, sigcontext );
+    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context.Pc += 4;
 
     status = send_debug_event( rec, &context, TRUE );
     if (status == DBG_CONTINUE || status == DBG_EXCEPTION_HANDLED)
@@ -571,9 +623,6 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
         restore_context( &context, sigcontext );
         return;
     }
-
-    /* fix up instruction pointer in context for EXCEPTION_BREAKPOINT */
-    if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context.Pc += 4;
 
     stack = virtual_setup_exception( stack_ptr, (sizeof(*stack) + 15) & ~15, rec );
     stack->rec = *rec;
@@ -589,11 +638,83 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
     REGn_sig(18, sigcontext) = (ULONG_PTR)NtCurrentTeb();
 }
 
-void WINAPI call_user_exception_dispatcher( EXCEPTION_RECORD *rec, CONTEXT *context,
-                                            NTSTATUS (WINAPI *dispatcher)(EXCEPTION_RECORD*,CONTEXT*) )
-{
-    dispatcher( rec, context );
-}
+
+/***********************************************************************
+ *           call_user_apc_dispatcher
+ */
+__ASM_GLOBAL_FUNC( call_user_apc_dispatcher,
+                   "mov x19, x0\n\t"             /* context */
+                   "mov x20, x1\n\t"             /* ctx */
+                   "mov x21, x2\n\t"             /* arg1 */
+                   "mov x22, x3\n\t"             /* arg2 */
+                   "mov x23, x4\n\t"             /* func */
+                   "mov x24, x5\n\t"             /* dispatcher */
+                   "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
+                   "add x25, x0, #0x2f8\n\t"     /* arm64_thread_data()->syscall_frame */
+                   "ldr x26, [x25]\n\t"
+                   "cbz x19, 1f\n\t"
+                   "ldr x0, [x19, #0x100]\n\t"   /* context.Sp */
+                   "sub x0, x0, #0x440\n\t"      /* sizeof(CONTEXT) + offsetof(frame,thunk_x29) */
+                   "ldr x6, [x26, #88]\n\t"      /* frame->prev_frame */
+                   "str x6, [x25]\n\t"
+                   "mov sp, x0\n\t"
+                   "b 2f\n"
+                   "1:\tsub x19, x26, #0x390\n\t"
+                   "mov x0, sp\n\t"
+                   "cmp x19, x0\n\t"
+                   "csel x0, x19, x0, lo\n\t"
+                   "mov sp, x0\n\t"
+                   "mov w2, #0x400000\n\t"       /* context.ContextFlags = CONTEXT_FULL */
+                   "movk w2, #7\n\t"
+                   "mov x1, x19\n\t"
+                   "str w2, [x19]\n\t"
+                   "mov x0, #~1\n\t"
+                   "bl " __ASM_NAME("NtGetContextThread") "\n\t"
+                   "mov w2, #0xc0\n\t"           /* context.X0 = STATUS_USER_APC */
+                   "str x2, [x19, #8]\n\t"
+                   "ldr x6, [x26, #88]\n\t"      /* frame->prev_frame */
+                   "str x6, [x25]\n\t"
+                   "mov x0, x19\n"               /* context */
+                   "2:\tldr lr, [x0, #0xf8]\n\t" /* context.Lr */
+                   "mov x1, x20\n\t"             /* ctx */
+                   "mov x2, x21\n\t"             /* arg1 */
+                   "mov x3, x22\n\t"             /* arg2 */
+                   "mov x4, x23\n\t"             /* func */
+                   "br x24" )
+
+
+/***********************************************************************
+ *           call_raise_user_exception_dispatcher
+ */
+__ASM_GLOBAL_FUNC( call_raise_user_exception_dispatcher,
+                   "mov x2, x0\n\t"  /* dispatcher */
+                   "b " __ASM_NAME("call_user_exception_dispatcher") )
+
+
+/***********************************************************************
+ *           call_user_exception_dispatcher
+ */
+__ASM_GLOBAL_FUNC( call_user_exception_dispatcher,
+                   "mov x19, x0\n\t"
+                   "mov x20, x1\n\t"
+                   "mov x21, x2\n\t"
+                   "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
+                   "add x4, x0, #0x2f8\n\t"        /* arm64_thread_data()->syscall_frame */
+                   "ldr x5, [x4]\n\t"
+                   "ldr x6, [x5, #88]\n\t"         /* frame->prev_frame */
+                   "str x6, [x4]\n\t"
+                   "mov x0, x19\n\t"
+                   "mov x1, x20\n\t"
+                   "mov x2, x21\n\t"
+                   "ldp x19, x20, [x5, #96]\n\t"   /* frame->x19,x20 */
+                   "ldp x21, x22, [x5, #112]\n\t"  /* frame->x21,x22 */
+                   "ldp x23, x24, [x5, #128]\n\t"  /* frame->x23,x24 */
+                   "ldp x25, x26, [x5, #144]\n\t"  /* frame->x25,x26 */
+                   "ldp x27, x28, [x5, #160]\n\t"  /* frame->x27,x28 */
+                   "ldp x29, x30, [x5, #176]\n\t"  /* frame->thunk_x29,ret_addr */
+                   "add sp, x5, #192\n\t"
+                   "br x2" )
+
 
 /**********************************************************************
  *		segv_handler
@@ -658,6 +779,7 @@ static void trap_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     case TRAP_BRKPT:
     default:
         rec.ExceptionCode = EXCEPTION_BREAKPOINT;
+        rec.NumberParameters = 1;
         break;
     }
     setup_exception( sigcontext, &rec );
@@ -896,10 +1018,10 @@ static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry,
 
 
 /***********************************************************************
- *           attach_thread
+ *           get_initial_context
  */
-PCONTEXT DECLSPEC_HIDDEN attach_thread( LPTHREAD_START_ROUTINE entry, void *arg,
-                                        BOOL suspend, void *relay )
+PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void *arg,
+                                              BOOL suspend, void *relay )
 {
     CONTEXT *ctx;
 
@@ -919,7 +1041,6 @@ PCONTEXT DECLSPEC_HIDDEN attach_thread( LPTHREAD_START_ROUTINE entry, void *arg,
     }
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
     ctx->ContextFlags = CONTEXT_FULL;
-    pLdrInitializeThunk( ctx, (void **)&ctx->u.s.X0, 0, 0 );
     return ctx;
 }
 
@@ -929,50 +1050,26 @@ PCONTEXT DECLSPEC_HIDDEN attach_thread( LPTHREAD_START_ROUTINE entry, void *arg,
  */
 __ASM_GLOBAL_FUNC( signal_start_thread,
                    "stp x29, x30, [sp,#-16]!\n\t"
-                   "mov x18, x4\n\t"             /* teb */
+                   "mov x19, x4\n\t"             /* thunk */
+                   "mov x18, x5\n\t"             /* teb */
                    /* store exit frame */
                    "mov x29, sp\n\t"
-                   "str x29, [x4, #0x300]\n\t"  /* arm64_thread_data()->exit_frame */
+                   "str x29, [x5, #0x2f0]\n\t"  /* arm64_thread_data()->exit_frame */
                    /* switch to thread stack */
-                   "ldr x5, [x4, #8]\n\t"       /* teb->Tib.StackBase */
+                   "ldr x5, [x5, #8]\n\t"       /* teb->Tib.StackBase */
                    "sub sp, x5, #0x1000\n\t"
                    /* attach dlls */
-                   "bl " __ASM_NAME("attach_thread") "\n\t"
-                   "mov sp, x0\n\t"
-                   /* clear the stack */
-                   "and x0, x0, #~0xfff\n\t"  /* round down to page size */
-                   "bl " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
-                   /* switch to the initial context */
-                   "mov x0, sp\n\t"
-                   "ldp q0, q1, [x0, #0x110]\n\t"      /* context->V[0,1] */
-                   "ldp q2, q3, [x0, #0x130]\n\t"      /* context->V[2,3] */
-                   "ldp q4, q5, [x0, #0x150]\n\t"      /* context->V[4,5] */
-                   "ldp q6, q7, [x0, #0x170]\n\t"      /* context->V[6,7] */
-                   "ldp q8, q9, [x0, #0x190]\n\t"      /* context->V[8,9] */
-                   "ldp q10, q11, [x0, #0x1b0]\n\t"    /* context->V[10,11] */
-                   "ldp q12, q13, [x0, #0x1d0]\n\t"    /* context->V[12,13] */
-                   "ldp q14, q15, [x0, #0x1f0]\n\t"    /* context->V[14,15] */
-                   "ldp q16, q17, [x0, #0x210]\n\t"    /* context->V[16,17] */
-                   "ldp q18, q19, [x0, #0x230]\n\t"    /* context->V[18,19] */
-                   "ldp q20, q21, [x0, #0x250]\n\t"    /* context->V[20,21] */
-                   "ldp q22, q23, [x0, #0x270]\n\t"    /* context->V[22,23] */
-                   "ldp q24, q25, [x0, #0x290]\n\t"    /* context->V[24,25] */
-                   "ldp q26, q27, [x0, #0x2b0]\n\t"    /* context->V[26,27] */
-                   "ldp q28, q29, [x0, #0x2d0]\n\t"    /* context->V[28,29] */
-                   "ldp q30, q31, [x0, #0x2f0]\n\t"    /* context->V[30,31] */
-                   "ldr w1, [x0, #0x310]\n\t"          /* context->Fpcr */
-                   "msr fpcr, x1\n\t"
-                   "ldr w1, [x0, #0x314]\n\t"          /* context->Fpsr */
-                   "msr fpsr, x1\n\t"
-                   "mov x1, #1\n\t"
-                   "b " __ASM_NAME("NtContinue") )
+                   "bl " __ASM_NAME("get_initial_context") "\n\t"
+                   "add x1, x0, #4\n\t"        /* &context->X0 */
+                   "mov lr, #0\n\t"
+                   "br x19" )
 
 
 extern void DECLSPEC_NORETURN call_thread_exit_func( int status, void (*func)(int), TEB *teb );
 __ASM_GLOBAL_FUNC( call_thread_exit_func,
                    "stp x29, x30, [sp,#-16]!\n\t"
-                   "ldr x3, [x2, #0x300]\n\t"  /* arm64_thread_data()->exit_frame */
-                   "str xzr, [x2, #0x300]\n\t"
+                   "ldr x3, [x2, #0x2f0]\n\t"  /* arm64_thread_data()->exit_frame */
+                   "str xzr, [x2, #0x2f0]\n\t"
                    "cbz x3, 1f\n\t"
                    "mov sp, x3\n"
                    "1:\tldp x29, x30, [sp], #16\n\t"

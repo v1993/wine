@@ -24,7 +24,6 @@ C_SRCS = \
 	locale.c \
 	misc.c \
 	nt.c \
-	om.c \
 	path.c \
 	printf.c \
 	process.c \
@@ -52,6 +51,7 @@ C_SRCS = \
 	unix/loader.c \
 	unix/process.c \
 	unix/registry.c \
+	unix/security.c \
 	unix/serial.c \
 	unix/server.c \
 	unix/signal_arm.c \

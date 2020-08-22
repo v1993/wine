@@ -349,23 +349,19 @@ static int wait_select_reply( void *cookie )
 }
 
 
-static void invoke_apc( const user_apc_t *apc )
+static void invoke_apc( CONTEXT *context, const user_apc_t *apc )
 {
     switch( apc->type )
     {
     case APC_USER:
-    {
-        void (WINAPI *func)(ULONG_PTR,ULONG_PTR,ULONG_PTR) = wine_server_get_ptr( apc->user.func );
-        func( apc->user.args[0], apc->user.args[1], apc->user.args[2] );
+        call_user_apc_dispatcher( context, apc->user.args[0], apc->user.args[1], apc->user.args[2],
+                                  wine_server_get_ptr( apc->user.func ), pKiUserApcDispatcher );
         break;
-    }
     case APC_TIMER:
-    {
-        void (WINAPI *func)(void*, unsigned int, unsigned int) = wine_server_get_ptr( apc->user.func );
-        func( wine_server_get_ptr( apc->user.args[1] ),
-              (DWORD)apc->timer.time, (DWORD)(apc->timer.time >> 32) );
+        call_user_apc_dispatcher( context, (ULONG_PTR)wine_server_get_ptr( apc->user.args[1] ),
+                                  (DWORD)apc->timer.time, (DWORD)(apc->timer.time >> 32),
+                                  wine_server_get_ptr( apc->user.func ), pKiUserApcDispatcher );
         break;
-    }
     default:
         server_protocol_error( "get_apc_request: bad type %d\n", apc->type );
         break;
@@ -672,7 +668,6 @@ unsigned int server_wait( const select_op_t *select_op, data_size_t size, UINT f
                           const LARGE_INTEGER *timeout )
 {
     timeout_t abs_timeout = timeout ? timeout->QuadPart : TIMEOUT_INFINITE;
-    BOOL user_apc = FALSE;
     unsigned int ret;
     user_apc_t apc;
 
@@ -684,30 +679,28 @@ unsigned int server_wait( const select_op_t *select_op, data_size_t size, UINT f
         abs_timeout -= now.QuadPart;
     }
 
-    for (;;)
-    {
-        ret = server_select( select_op, size, flags, abs_timeout, NULL, NULL, &apc );
-        if (ret != STATUS_USER_APC) break;
-        invoke_apc( &apc );
-
-        /* if we ran a user apc we have to check once more if additional apcs are queued,
-         * but we don't want to wait */
-        abs_timeout = 0;
-        user_apc = TRUE;
-        size = 0;
-        /* don't signal multiple times */
-        if (size >= sizeof(select_op->signal_and_wait) && select_op->op == SELECT_SIGNAL_AND_WAIT)
-            size = offsetof( select_op_t, signal_and_wait.signal );
-    }
-
-    if (ret == STATUS_TIMEOUT && user_apc) ret = STATUS_USER_APC;
+    ret = server_select( select_op, size, flags, abs_timeout, NULL, NULL, &apc );
+    if (ret == STATUS_USER_APC) invoke_apc( NULL, &apc );
 
     /* A test on Windows 2000 shows that Windows always yields during
        a wait, but a wait that is hit by an event gets a priority
        boost as well.  This seems to model that behavior the closest.  */
     if (ret == STATUS_TIMEOUT) NtYieldExecution();
-
     return ret;
+}
+
+
+/***********************************************************************
+ *              NtContinue  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtContinue( CONTEXT *context, BOOLEAN alertable )
+{
+    user_apc_t apc;
+    NTSTATUS status;
+
+    status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, NULL, &apc );
+    if (status == STATUS_USER_APC) invoke_apc( context, &apc );
+    return NtSetContextThread( GetCurrentThread(), context );
 }
 
 
@@ -1471,6 +1464,7 @@ void CDECL server_init_process_done( void *relay )
 #ifdef __APPLE__
     send_server_task_port();
 #endif
+    if (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) virtual_set_large_address_space();
 
     /* Install signal handlers; this cannot be done earlier, since we cannot
      * send exceptions to the debugger before the create process event that
@@ -1492,7 +1486,7 @@ void CDECL server_init_process_done( void *relay )
     SERVER_END_REQ;
 
     assert( !status );
-    signal_start_thread( entry, peb, suspend, relay, NtCurrentTeb() );
+    signal_start_thread( entry, peb, suspend, relay, pLdrInitializeThunk, NtCurrentTeb() );
 }
 
 
@@ -1550,8 +1544,18 @@ size_t server_init_thread( void *entry_point, BOOL *suspend )
     }
     SERVER_END_REQ;
 
-    is_wow64 = !is_win64 && (server_cpus & ((1 << CPU_x86_64) | (1 << CPU_ARM64))) != 0;
-    ntdll_get_thread_data()->wow64_redir = is_wow64;
+#ifndef _WIN64
+    is_wow64 = (server_cpus & ((1 << CPU_x86_64) | (1 << CPU_ARM64))) != 0;
+    if (is_wow64)
+    {
+        TEB64 *teb64 = (TEB64 *)((char *)NtCurrentTeb() - teb_offset);
+
+        NtCurrentTeb()->GdiBatchCount = PtrToUlong( teb64 );
+        NtCurrentTeb()->WowTebOffset  = -teb_offset;
+        teb64->ClientId.UniqueProcess = PtrToUlong( NtCurrentTeb()->ClientId.UniqueProcess );
+        teb64->ClientId.UniqueThread  = PtrToUlong( NtCurrentTeb()->ClientId.UniqueThread );
+    }
+#endif
 
     switch (ret)
     {
@@ -1629,6 +1633,7 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
  */
 NTSTATUS WINAPI NtClose( HANDLE handle )
 {
+    HANDLE port;
     NTSTATUS ret;
     int fd = remove_fd_from_cache( handle );
 
@@ -1639,5 +1644,13 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
     }
     SERVER_END_REQ;
     if (fd != -1) close( fd );
+
+    if (ret != STATUS_INVALID_HANDLE || !handle) return ret;
+    if (!NtCurrentTeb()->Peb->BeingDebugged) return ret;
+    if (!NtQueryInformationProcess( NtCurrentProcess(), ProcessDebugPort, &port, sizeof(port), NULL) && port)
+    {
+        NtCurrentTeb()->ExceptionCode = ret;
+        call_raise_user_exception_dispatcher( pKiRaiseUserExceptionDispatcher );
+    }
     return ret;
 }

@@ -191,6 +191,63 @@ static DWORD set_reg_value_dword( HKEY hkey, const WCHAR *name, DWORD value )
     return RegSetValueExW( hkey, name, 0, REG_DWORD, (const BYTE *)&value, sizeof(value) );
 }
 
+#if defined(__i386__) || defined(__x86_64__)
+
+static void initialize_xstate_features(struct _KUSER_SHARED_DATA *data)
+{
+    XSTATE_CONFIGURATION *xstate = &data->XState;
+    unsigned int i;
+    int regs[4];
+
+    if (!data->ProcessorFeatures[PF_AVX_INSTRUCTIONS_AVAILABLE])
+        return;
+
+    __cpuidex(regs, 0, 0);
+
+    TRACE("Max cpuid level %#x.\n", regs[0]);
+    if (regs[0] < 0xd)
+        return;
+
+    __cpuidex(regs, 1, 0);
+    TRACE("CPU features %#x, %#x, %#x, %#x.\n", regs[0], regs[1], regs[2], regs[3]);
+    if (!(regs[2] & (0x1 << 27))) /* xsave OS enabled */
+        return;
+
+    __cpuidex(regs, 0xd, 0);
+    TRACE("XSAVE details %#x, %#x, %#x, %#x.\n", regs[0], regs[1], regs[2], regs[3]);
+    if (!(regs[0] & XSTATE_AVX))
+        return;
+
+    xstate->EnabledFeatures = (1 << XSTATE_LEGACY_FLOATING_POINT) | (1 << XSTATE_LEGACY_SSE) | (1 << XSTATE_AVX);
+    xstate->EnabledVolatileFeatures = xstate->EnabledFeatures;
+    xstate->Size = sizeof(XSAVE_FORMAT) + sizeof(XSTATE);
+    xstate->AllFeatureSize = regs[1];
+    xstate->AllFeatures[0] = offsetof(XSAVE_FORMAT, XmmRegisters);
+    xstate->AllFeatures[1] = sizeof(M128A) * 16;
+    xstate->AllFeatures[2] = sizeof(YMMCONTEXT);
+
+    for (i = 0; i < 3; ++i)
+        xstate->Features[i].Size = xstate->AllFeatures[i];
+
+    xstate->Features[1].Offset = xstate->Features[0].Size;
+    xstate->Features[2].Offset = sizeof(XSAVE_FORMAT) + offsetof(XSTATE, YmmContext);
+
+    __cpuidex(regs, 0xd, 1);
+    xstate->OptimizedSave = regs[0] & 1;
+    xstate->CompactionEnabled = !!(regs[0] & 2);
+
+    __cpuidex(regs, 0xd, 2);
+    TRACE("XSAVE feature 2 %#x, %#x, %#x, %#x.\n", regs[0], regs[1], regs[2], regs[3]);
+}
+
+#else
+
+static void initialize_xstate_features(struct _KUSER_SHARED_DATA *data)
+{
+}
+
+#endif
+
 static void create_user_shared_data(void)
 {
     struct _KUSER_SHARED_DATA *data;
@@ -248,6 +305,7 @@ static void create_user_shared_data(void)
         features[PF_PAE_ENABLED]                          = !!(sci.FeatureSet & CPU_FEATURE_PAE);
         features[PF_XMMI64_INSTRUCTIONS_AVAILABLE]        = !!(sci.FeatureSet & CPU_FEATURE_SSE2);
         features[PF_SSE3_INSTRUCTIONS_AVAILABLE]          = !!(sci.FeatureSet & CPU_FEATURE_SSE3);
+        features[PF_SSSE3_INSTRUCTIONS_AVAILABLE]         = !!(sci.FeatureSet & CPU_FEATURE_SSSE3);
         features[PF_XSAVE_ENABLED]                        = !!(sci.FeatureSet & CPU_FEATURE_XSAVE);
         features[PF_COMPARE_EXCHANGE128]                  = !!(sci.FeatureSet & CPU_FEATURE_CX128);
         features[PF_SSE_DAZ_MODE_AVAILABLE]               = !!(sci.FeatureSet & CPU_FEATURE_DAZ);
@@ -256,6 +314,10 @@ static void create_user_shared_data(void)
         features[PF_VIRT_FIRMWARE_ENABLED]                = !!(sci.FeatureSet & CPU_FEATURE_VIRT);
         features[PF_RDWRFSGSBASE_AVAILABLE]               = !!(sci.FeatureSet & CPU_FEATURE_RDFS);
         features[PF_FASTFAIL_AVAILABLE]                   = TRUE;
+        features[PF_SSE4_1_INSTRUCTIONS_AVAILABLE]        = !!(sci.FeatureSet & CPU_FEATURE_SSE41);
+        features[PF_SSE4_2_INSTRUCTIONS_AVAILABLE]        = !!(sci.FeatureSet & CPU_FEATURE_SSE42);
+        features[PF_AVX_INSTRUCTIONS_AVAILABLE]           = !!(sci.FeatureSet & CPU_FEATURE_AVX);
+        features[PF_AVX2_INSTRUCTIONS_AVAILABLE]          = !!(sci.FeatureSet & CPU_FEATURE_AVX2);
         break;
     case PROCESSOR_ARCHITECTURE_ARM:
         features[PF_ARM_VFP_32_REGISTERS_AVAILABLE]       = !!(sci.FeatureSet & CPU_FEATURE_ARM_VFP_32);
@@ -270,6 +332,8 @@ static void create_user_shared_data(void)
     }
     data->ActiveProcessorCount = NtCurrentTeb()->Peb->NumberOfProcessors;
     data->ActiveGroupCount = 1;
+
+    initialize_xstate_features( data );
 
     UnmapViewOfFile( data );
 }

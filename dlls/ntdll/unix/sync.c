@@ -69,6 +69,7 @@
 #include "winternl.h"
 #include "ddk/wdm.h"
 #include "wine/server.h"
+#include "wine/exception.h"
 #include "wine/debug.h"
 #include "unix_private.h"
 
@@ -1361,8 +1362,16 @@ NTSTATUS WINAPI NtDelayExecution( BOOLEAN alertable, const LARGE_INTEGER *timeou
  */
 NTSTATUS WINAPI NtQueryPerformanceCounter( LARGE_INTEGER *counter, LARGE_INTEGER *frequency )
 {
-    counter->QuadPart = monotonic_counter();
-    if (frequency) frequency->QuadPart = TICKSPERSEC;
+    __TRY
+    {
+        counter->QuadPart = monotonic_counter();
+        if (frequency) frequency->QuadPart = TICKSPERSEC;
+    }
+    __EXCEPT_PAGE_FAULT
+    {
+        return STATUS_ACCESS_VIOLATION;
+    }
+    __ENDTRY
     return STATUS_SUCCESS;
 }
 
@@ -1834,6 +1843,110 @@ NTSTATUS WINAPI NtOpenSection( HANDLE *handle, ACCESS_MASK access, const OBJECT_
 }
 
 
+/***********************************************************************
+ *             NtCreatePort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtCreatePort( HANDLE *handle, OBJECT_ATTRIBUTES *attr, ULONG info_len,
+                              ULONG data_len, ULONG *reserved )
+{
+    FIXME( "(%p,%p,%u,%u,%p),stub!\n", handle, attr, info_len, data_len, reserved );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtConnectPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtConnectPort( HANDLE *handle, UNICODE_STRING *name, SECURITY_QUALITY_OF_SERVICE *qos,
+                               LPC_SECTION_WRITE *write, LPC_SECTION_READ *read, ULONG *max_len,
+                               void *info, ULONG *info_len )
+{
+    FIXME( "(%p,%s,%p,%p,%p,%p,%p,%p),stub!\n", handle, debugstr_us(name), qos,
+           write, read, max_len, info, info_len );
+    if (info && info_len) TRACE("msg = %s\n", debugstr_an( info, *info_len ));
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtSecureConnectPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtSecureConnectPort( HANDLE *handle, UNICODE_STRING *name, SECURITY_QUALITY_OF_SERVICE *qos,
+                                     LPC_SECTION_WRITE *write, PSID sid, LPC_SECTION_READ *read,
+                                     ULONG *max_len, void *info, ULONG *info_len )
+{
+    FIXME( "(%p,%s,%p,%p,%p,%p,%p,%p,%p),stub!\n", handle, debugstr_us(name), qos,
+           write, sid, read, max_len, info, info_len );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtListenPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtListenPort( HANDLE handle, LPC_MESSAGE *msg )
+{
+    FIXME("(%p,%p),stub!\n", handle, msg );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtAcceptConnectPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtAcceptConnectPort( HANDLE *handle, ULONG id, LPC_MESSAGE *msg, BOOLEAN accept,
+                                     LPC_SECTION_WRITE *write, LPC_SECTION_READ *read )
+{
+    FIXME("(%p,%u,%p,%d,%p,%p),stub!\n", handle, id, msg, accept, write, read );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtCompleteConnectPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtCompleteConnectPort( HANDLE handle )
+{
+    FIXME( "(%p),stub!\n", handle );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtRegisterThreadTerminatePort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtRegisterThreadTerminatePort( HANDLE handle )
+{
+    FIXME( "(%p),stub!\n", handle );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtRequestWaitReplyPort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtRequestWaitReplyPort( HANDLE handle, LPC_MESSAGE *msg_in, LPC_MESSAGE *msg_out )
+{
+    FIXME( "(%p,%p,%p),stub!\n", handle, msg_in, msg_out );
+    if (msg_in)
+        TRACE("datasize %u msgsize %u type %u ranges %u client %p/%p msgid %lu size %lu data %s\n",
+              msg_in->DataSize, msg_in->MessageSize, msg_in->MessageType, msg_in->VirtualRangesOffset,
+              msg_in->ClientId.UniqueProcess, msg_in->ClientId.UniqueThread, msg_in->MessageId,
+              msg_in->SectionSize, debugstr_an( (const char *)msg_in->Data, msg_in->DataSize ));
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
+/***********************************************************************
+ *             NtReplyWaitReceivePort (NTDLL.@)
+ */
+NTSTATUS WINAPI NtReplyWaitReceivePort( HANDLE handle, ULONG *id, LPC_MESSAGE *reply, LPC_MESSAGE *msg )
+{
+    FIXME("(%p,%p,%p,%p),stub!\n", handle, id, reply, msg );
+    return STATUS_NOT_IMPLEMENTED;
+}
+
+
 #define MAX_ATOM_LEN  255
 #define IS_INTATOM(x) (((ULONG_PTR)(x) >> 16) == 0)
 
@@ -2016,16 +2129,9 @@ NTSTATUS WINAPI NtQueryInformationAtom( RTL_ATOM atom, ATOM_INFORMATION_CLASS cl
 }
 
 
-static void *no_debug_info_marker = (void *)(ULONG_PTR)-1;
-
-static BOOL crit_section_has_debuginfo(const RTL_CRITICAL_SECTION *crit)
-{
-    return crit->DebugInfo != NULL && crit->DebugInfo != no_debug_info_marker;
-}
-
 #ifdef __linux__
 
-static inline NTSTATUS fast_critsection_wait( RTL_CRITICAL_SECTION *crit, int timeout )
+NTSTATUS CDECL fast_RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit, int timeout )
 {
     int val;
     struct timespec timespec;
@@ -2044,7 +2150,7 @@ static inline NTSTATUS fast_critsection_wait( RTL_CRITICAL_SECTION *crit, int ti
     return STATUS_WAIT_0;
 }
 
-static inline NTSTATUS fast_critsection_wake( RTL_CRITICAL_SECTION *crit )
+NTSTATUS CDECL fast_RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
     if (!use_futexes()) return STATUS_NOT_IMPLEMENTED;
 
@@ -2076,7 +2182,7 @@ static inline semaphore_t get_mach_semaphore( RTL_CRITICAL_SECTION *crit )
     return ret;
 }
 
-static inline NTSTATUS fast_critsection_wait( RTL_CRITICAL_SECTION *crit, int timeout )
+NTSTATUS CDECL fast_RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit, int timeout )
 {
     mach_timespec_t timespec;
     semaphore_t sem = get_mach_semaphore( crit );
@@ -2099,7 +2205,7 @@ static inline NTSTATUS fast_critsection_wait( RTL_CRITICAL_SECTION *crit, int ti
     }
 }
 
-static inline NTSTATUS fast_critsection_wake( RTL_CRITICAL_SECTION *crit )
+NTSTATUS CDECL fast_RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
     semaphore_t sem = get_mach_semaphore( crit );
     semaphore_signal( sem );
@@ -2114,12 +2220,12 @@ NTSTATUS CDECL fast_RtlDeleteCriticalSection( RTL_CRITICAL_SECTION *crit )
 
 #else  /* __APPLE__ */
 
-static inline NTSTATUS fast_critsection_wait( RTL_CRITICAL_SECTION *crit, int timeout )
+NTSTATUS CDECL fast_RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit, int timeout )
 {
     return STATUS_NOT_IMPLEMENTED;
 }
 
-static inline NTSTATUS fast_critsection_wake( RTL_CRITICAL_SECTION *crit )
+NTSTATUS CDECL fast_RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
 {
     return STATUS_NOT_IMPLEMENTED;
 }
@@ -2130,56 +2236,6 @@ NTSTATUS CDECL fast_RtlDeleteCriticalSection( RTL_CRITICAL_SECTION *crit )
 }
 
 #endif
-
-static inline HANDLE get_critsection_semaphore( RTL_CRITICAL_SECTION *crit )
-{
-    HANDLE ret = crit->LockSemaphore;
-    if (!ret)
-    {
-        HANDLE sem;
-        if (NtCreateSemaphore( &sem, SEMAPHORE_ALL_ACCESS, NULL, 0, 1 )) return 0;
-        if (!(ret = InterlockedCompareExchangePointer( &crit->LockSemaphore, sem, 0 )))
-            ret = sem;
-        else
-            NtClose( sem );  /* somebody beat us to it */
-    }
-    return ret;
-}
-
-NTSTATUS CDECL fast_RtlpWaitForCriticalSection( RTL_CRITICAL_SECTION *crit, int timeout )
-{
-    NTSTATUS ret;
-
-    /* debug info is cleared by MakeCriticalSectionGlobal */
-    if (!crit_section_has_debuginfo( crit ) ||
-        ((ret = fast_critsection_wait( crit, timeout )) == STATUS_NOT_IMPLEMENTED))
-    {
-        HANDLE sem = get_critsection_semaphore( crit );
-        LARGE_INTEGER time;
-        select_op_t select_op;
-
-        time.QuadPart = timeout * (LONGLONG)-10000000;
-        select_op.wait.op = SELECT_WAIT;
-        select_op.wait.handles[0] = wine_server_obj_handle( sem );
-        ret = server_wait( &select_op, offsetof( select_op_t, wait.handles[1] ), 0, &time );
-    }
-    return ret;
-}
-
-NTSTATUS CDECL fast_RtlpUnWaitCriticalSection( RTL_CRITICAL_SECTION *crit )
-{
-    NTSTATUS ret;
-
-    /* debug info is cleared by MakeCriticalSectionGlobal */
-    if (!crit_section_has_debuginfo( crit ) ||
-        ((ret = fast_critsection_wake( crit )) == STATUS_NOT_IMPLEMENTED))
-    {
-        HANDLE sem = get_critsection_semaphore( crit );
-        ret = NtReleaseSemaphore( sem, 1, NULL );
-    }
-    return ret;
-}
-
 
 
 #ifdef __linux__
@@ -2466,9 +2522,20 @@ NTSTATUS CDECL fast_RtlSleepConditionVariableCS( RTL_CONDITION_VARIABLE *variabl
 
     val = *futex;
 
-    RtlLeaveCriticalSection( cs );
-    status = wait_cv( futex, val, timeout );
-    RtlEnterCriticalSection( cs );
+    if (cs->RecursionCount == 1)
+    {
+        /* FIXME: simplified version of RtlLeaveCriticalSection/RtlEnterCriticalSection to avoid imports */
+        cs->RecursionCount = 0;
+        cs->OwningThread   = 0;
+        if (InterlockedDecrement( &cs->LockCount ) >= 0) fast_RtlpUnWaitCriticalSection( cs );
+
+        status = wait_cv( futex, val, timeout );
+
+        if (InterlockedIncrement( &cs->LockCount )) fast_RtlpWaitForCriticalSection( cs, INT_MAX );
+        cs->OwningThread   = ULongToHandle( GetCurrentThreadId() );
+        cs->RecursionCount = 1;
+    }
+    else status = wait_cv( futex, val, timeout );
     return status;
 }
 

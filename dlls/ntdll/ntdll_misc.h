@@ -44,8 +44,6 @@ static const UINT_PTR page_size = 0x1000;
 extern UINT_PTR page_size DECLSPEC_HIDDEN;
 #endif
 
-extern NTSTATUS close_handle( HANDLE ) DECLSPEC_HIDDEN;
-
 /* exceptions */
 extern LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context ) DECLSPEC_HIDDEN;
 extern void DECLSPEC_NORETURN raise_status( NTSTATUS status, EXCEPTION_RECORD *rec ) DECLSPEC_HIDDEN;
@@ -57,7 +55,6 @@ extern RUNTIME_FUNCTION *lookup_function_info( ULONG_PTR pc, ULONG_PTR *base, LD
 
 /* debug helpers */
 extern LPCSTR debugstr_us( const UNICODE_STRING *str ) DECLSPEC_HIDDEN;
-extern LPCSTR debugstr_ObjectAttributes(const OBJECT_ATTRIBUTES *oa) DECLSPEC_HIDDEN;
 
 /* init routines */
 extern void version_init(void) DECLSPEC_HIDDEN;
@@ -68,11 +65,10 @@ extern void init_unix_codepage(void) DECLSPEC_HIDDEN;
 extern void init_locale( HMODULE module ) DECLSPEC_HIDDEN;
 extern void init_user_process_params(void) DECLSPEC_HIDDEN;
 extern NTSTATUS restart_process( RTL_USER_PROCESS_PARAMETERS *params, NTSTATUS status ) DECLSPEC_HIDDEN;
+extern void CDECL DECLSPEC_NORETURN signal_start_thread( CONTEXT *ctx ) DECLSPEC_HIDDEN;
 
 /* server support */
 extern BOOL is_wow64 DECLSPEC_HIDDEN;
-extern NTSTATUS alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct object_attributes **ret,
-                                         data_size_t *ret_len ) DECLSPEC_HIDDEN;
 
 /* module handling */
 extern LIST_ENTRY tls_links DECLSPEC_HIDDEN;
@@ -115,23 +111,9 @@ enum loadorder
 
 extern enum loadorder get_load_order( const WCHAR *app_name, const UNICODE_STRING *nt_name ) DECLSPEC_HIDDEN;
 
-/* thread private data, stored in NtCurrentTeb()->GdiTebBatch */
-struct ntdll_thread_data
-{
-    struct debug_info *debug_info;    /* info for debugstr functions */
-    void              *start_stack;   /* stack for thread startup */
-    int                request_fd;    /* fd for sending server requests */
-    int                reply_fd;      /* fd for receiving server replies */
-    int                wait_fd[2];    /* fd for sleeping server requests */
-    BOOL               wow64_redir;   /* Wow64 filesystem redirection flag */
-};
-
-C_ASSERT( sizeof(struct ntdll_thread_data) <= sizeof(((TEB *)0)->GdiTebBatch) );
-
-static inline struct ntdll_thread_data *ntdll_get_thread_data(void)
-{
-    return (struct ntdll_thread_data *)&NtCurrentTeb()->GdiTebBatch;
-}
+#ifndef _WIN64
+static inline TEB64 *NtCurrentTeb64(void) { return (TEB64 *)NtCurrentTeb()->GdiBatchCount; }
+#endif
 
 #define HASH_STRING_ALGORITHM_DEFAULT  0
 #define HASH_STRING_ALGORITHM_X65599   1

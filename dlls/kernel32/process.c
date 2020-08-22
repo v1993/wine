@@ -742,15 +742,6 @@ DWORD WINAPI GetMaximumProcessorCount(WORD group)
 }
 
 /***********************************************************************
- *           GetEnabledXStateFeatures (KERNEL32.@)
- */
-DWORD64 WINAPI GetEnabledXStateFeatures(void)
-{
-    FIXME("\n");
-    return 0;
-}
-
-/***********************************************************************
  *           GetFirmwareEnvironmentVariableA     (KERNEL32.@)
  */
 DWORD WINAPI GetFirmwareEnvironmentVariableA(LPCSTR name, LPCSTR guid, PVOID buffer, DWORD size)
@@ -768,6 +759,16 @@ DWORD WINAPI GetFirmwareEnvironmentVariableW(LPCWSTR name, LPCWSTR guid, PVOID b
     FIXME("stub: %s %s %p %u\n", debugstr_w(name), debugstr_w(guid), buffer, size);
     SetLastError(ERROR_INVALID_FUNCTION);
     return 0;
+}
+
+/***********************************************************************
+ *           SetFirmwareEnvironmentVariableW     (KERNEL32.@)
+ */
+BOOL WINAPI SetFirmwareEnvironmentVariableW(const WCHAR *name, const WCHAR *guid, void *buffer, DWORD size)
+{
+    FIXME("stub: %s %s %p %u\n", debugstr_w(name), debugstr_w(guid), buffer, size);
+    SetLastError(ERROR_INVALID_FUNCTION);
+    return FALSE;
 }
 
 /**********************************************************************

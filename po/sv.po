@@ -8610,7 +8610,7 @@ msgstr ""
 msgid "&Test Connection"
 msgstr "Återställda anslutningar"
 
-#: version.rc:92 winemine.rc:65
+#: version.rc:92
 msgid "Advanced"
 msgstr "Avancerad"
 
@@ -12808,6 +12808,24 @@ msgstr "Start"
 msgid "&Run..."
 msgstr "&Kör..."
 
+#: fsutil.mc:28
+msgid ""
+"- Supported Commands -\n"
+"\n"
+"hardlink      hardlink management\n"
+msgstr ""
+
+#: fsutil.mc:35
+msgid ""
+"- Hardlink - Supported Commands -\n"
+"\n"
+"create        create a hardlink\n"
+msgstr ""
+
+#: fsutil.mc:40
+msgid "Syntax: fsutil hardlink create <new> <existing>\n"
+msgstr ""
+
 #: hostname.rc:30
 msgid "Usage: hostname\n"
 msgstr "Användning: hostname\n"
@@ -16826,8 +16844,10 @@ msgid "&Beginner"
 msgstr "Ny&börjare"
 
 #: winemine.rc:45
-msgid "&Advanced"
-msgstr "&Avancerad"
+#, fuzzy
+#| msgid "Interface"
+msgid "&Intermediate"
+msgstr "Gränssnitt"
 
 #: winemine.rc:46
 msgid "&Expert"
@@ -16856,6 +16876,12 @@ msgstr "Snabbaste tider"
 #: winemine.rc:64
 msgid "Beginner"
 msgstr "Nybörjare"
+
+#: winemine.rc:65
+#, fuzzy
+#| msgid "Interface"
+msgid "Intermediate"
+msgstr "Gränssnitt"
 
 #: winemine.rc:66
 msgid "Expert"

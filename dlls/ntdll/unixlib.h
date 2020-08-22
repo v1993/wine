@@ -28,15 +28,12 @@ struct msghdr;
 struct _DISPATCHER_CONTEXT;
 
 /* increment this when you change the function table */
-#define NTDLL_UNIXLIB_VERSION 88
+#define NTDLL_UNIXLIB_VERSION 93
 
 struct unix_funcs
 {
     /* Nt* functions */
-    NTSTATUS      (WINAPI *NtClose)( HANDLE handle );
     TEB *         (WINAPI *NtCurrentTeb)(void);
-    NTSTATUS      (WINAPI *NtGetContextThread)( HANDLE handle, CONTEXT *context );
-    NTSTATUS      (WINAPI *NtQueryPerformanceCounter)( LARGE_INTEGER *counter, LARGE_INTEGER *frequency );
 
     /* other Win32 API functions */
     NTSTATUS      (WINAPI *DbgUiIssueRemoteBreakin)( HANDLE process );
@@ -93,14 +90,10 @@ struct unix_funcs
     NTSTATUS      (CDECL *virtual_map_section)( HANDLE handle, PVOID *addr_ptr, unsigned short zero_bits_64, SIZE_T commit_size,
                                                 const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr, ULONG alloc_type,
                                                 ULONG protect, pe_image_info_t *image_info );
-    NTSTATUS      (CDECL *virtual_alloc_thread_stack)( INITIAL_TEB *stack, SIZE_T reserve_size, SIZE_T commit_size, SIZE_T *pthread_size );
     ssize_t       (CDECL *virtual_locked_recvmsg)( int fd, struct msghdr *hdr, int flags );
     void          (CDECL *virtual_release_address_space)(void);
-    void          (CDECL *virtual_set_large_address_space)(void);
 
     /* thread/process functions */
-    void          (CDECL *exit_thread)( int status );
-    void          (CDECL *exit_process)( int status );
     NTSTATUS      (CDECL *exec_process)( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTSTATUS status );
 
     /* server functions */
