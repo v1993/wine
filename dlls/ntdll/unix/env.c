@@ -60,18 +60,13 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(environ);
 
-extern int __wine_main_argc;
-extern char **__wine_main_argv;
-extern char **__wine_main_environ;
-extern WCHAR **__wine_main_wargv;
-
 USHORT *uctable = NULL, *lctable = NULL;
 SIZE_T startup_info_size = 0;
 
 int main_argc = 0;
 char **main_argv = NULL;
 char **main_envp = NULL;
-static WCHAR **main_wargv;
+WCHAR **main_wargv = NULL;
 
 static LCID user_lcid, system_lcid;
 static LANGID user_ui_language, system_ui_language;
@@ -966,10 +961,10 @@ void init_environment( int argc, char *argv[], char *envp[] )
         uctable = case_table + 2;
         lctable = case_table + case_table[1] + 2;
     }
-    __wine_main_argc = main_argc = argc;
-    __wine_main_argv = main_argv = argv;
-    __wine_main_wargv = main_wargv = build_wargv( argv );
-    __wine_main_environ = main_envp = envp;
+    main_argc = argc;
+    main_argv = argv;
+    main_wargv = build_wargv( argv );
+    main_envp = envp;
 }
 
 
@@ -1159,9 +1154,9 @@ void CDECL get_initial_console( HANDLE *handle, HANDLE *std_in, HANDLE *std_out,
 {
     *handle = *std_in = *std_out = *std_err = 0;
     if (isatty(0) || isatty(1) || isatty(2)) *handle = (HANDLE)2; /* see kernel32/kernel_private.h */
-    if (!isatty(0)) server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, std_in );
-    if (!isatty(1)) server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, std_out );
-    if (!isatty(2)) server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, std_err );
+    if (!isatty(0)) wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, std_in );
+    if (!isatty(1)) wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, std_out );
+    if (!isatty(2)) wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, std_err );
 }
 
 

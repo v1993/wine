@@ -1029,9 +1029,9 @@ __ASM_GLOBAL_FUNC( call_consolidate_callback,
                    __ASM_SEH(".seh_pushframe\n\t")
                    __ASM_SEH(".seh_endprologue\n\t")
 
-                   "subq $0xf8,%rsp\n\t" /* 10*16 (float regs) + 7*8 (int regs) + 32 (shadow store). */
-                   __ASM_SEH(".seh_stackalloc 0xf8\n\t")
-                   __ASM_CFI(".cfi_adjust_cfa_offset 0xf8\n\t")
+                   "subq $0x108,%rsp\n\t" /* 10*16 (float regs) + 8*8 (int regs) + 32 (shadow store) + 8 (align). */
+                   __ASM_SEH(".seh_stackalloc 0x108\n\t")
+                   __ASM_CFI(".cfi_adjust_cfa_offset 0x108\n\t")
 
                    /* Setup CFI unwind to context. */
                    "movq %rcx,0x10(%rbp)\n\t"
@@ -1058,6 +1058,9 @@ __ASM_GLOBAL_FUNC( call_consolidate_callback,
                    __ASM_CFI(".cfi_escape 0x10,0x20,0x06,0x76,0x10,0x06,0x23,0x90,0x05\n\t") /* %xmm15 */
 
                    /* Setup SEH unwind registers restore. */
+                   "movq 0xa0(%rcx),%rax\n\t" /* context->Rbp */
+                   "movq %rax,0x100(%rsp)\n\t"
+                   __ASM_SEH(".seh_savereg %rbp, 0x100\n\t")
                    "movq 0x90(%rcx),%rax\n\t" /* context->Rbx */
                    "movq %rax,0x20(%rsp)\n\t"
                    __ASM_SEH(".seh_savereg %rbx, 0x20\n\t")
@@ -1241,7 +1244,9 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
             {
                 ULONG64 frame;
 
-                *context = new_context = *dispatch.ContextRecord;
+                new_context = *dispatch.ContextRecord;
+                new_context.ContextFlags &= ~0x40;
+                *context = new_context;
                 dispatch.ContextRecord = context;
                 RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
                         dispatch.ControlPc, dispatch.FunctionEntry,
@@ -1264,7 +1269,9 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
 
                     teb_frame = __wine_pop_frame( teb_frame );
 
-                    *context = new_context = *dispatch.ContextRecord;
+                    new_context = *dispatch.ContextRecord;
+                    new_context.ContextFlags &= ~0x40;
+                    *context = new_context;
                     dispatch.ContextRecord = context;
                     RtlVirtualUnwind( UNW_FLAG_NHANDLER, dispatch.ImageBase,
                             dispatch.ControlPc, dispatch.FunctionEntry,
@@ -1483,13 +1490,21 @@ USHORT WINAPI RtlCaptureStackBackTrace( ULONG skip, ULONG count, PVOID *buffer, 
  *           signal_start_thread
  */
 __ASM_GLOBAL_FUNC( signal_start_thread,
-                   "movq %rcx,%rbx\n\t"     /* context */
-                   "leaq -32(%rcx),%rcx\n\t"
-                   "movq %rcx,%rsp\n\t"
-                   "andq $~0xfff,%rcx\n\t"  /* round down to page size */
-                   "call " __ASM_NAME("virtual_clear_thread_stack") "\n\t"
-                   "movl $1,%edx\n\t"
+                   "movq %rcx,%rbx\n\t"        /* context */
+                   /* clear the thread stack */
+                   "andq $~0xfff,%rcx\n\t"     /* round down to page size */
+                   "movq %gs:0x30,%rax\n\t"
+                   "movq 0x10(%rax),%rdi\n\t"  /* NtCurrentTeb()->Tib.StackLimit */
+                   "addq $0x2000,%rdi\n\t"
+                   "movq %rdi,%rsp\n\t"
+                   "subq %rdi,%rcx\n\t"
+                   "xorl %eax,%eax\n\t"
+                   "shrq $3,%rcx\n\t"
+                   "rep; stosq\n\t"
+                   /* switch to the initial context */
+                   "leaq -32(%rbx),%rsp\n\t"
                    "movq %rbx,%rcx\n\t"
+                   "movl $1,%edx\n\t"
                    "call " __ASM_NAME("NtContinue") )
 
 

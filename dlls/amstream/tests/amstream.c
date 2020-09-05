@@ -102,9 +102,6 @@ static void _expect_ref(IUnknown* obj, ULONG ref, int line)
     ok_(__FILE__,line)(rc == ref, "expected refcount %d, got %d\n", ref, rc);
 }
 
-static IDirectDraw7* pdd7;
-static IDirectDrawSurface7* pdds7;
-
 static IAMMultiMediaStream *create_ammultimediastream(void)
 {
     IAMMultiMediaStream *stream = NULL;
@@ -112,50 +109,6 @@ static IAMMultiMediaStream *create_ammultimediastream(void)
             &IID_IAMMultiMediaStream, (void **)&stream);
     ok(hr == S_OK, "Got hr %#x.\n", hr);
     return stream;
-}
-
-static int create_directdraw(void)
-{
-    HRESULT hr;
-    IDirectDraw* pdd = NULL;
-    DDSURFACEDESC2 ddsd;
-
-    hr = DirectDrawCreate(NULL, &pdd, NULL);
-    ok(hr==DD_OK, "DirectDrawCreate returned: %x\n", hr);
-    if (hr != DD_OK)
-       goto error;
-
-    hr = IDirectDraw_QueryInterface(pdd, &IID_IDirectDraw7, (LPVOID*)&pdd7);
-    ok(hr==DD_OK, "QueryInterface returned: %x\n", hr);
-    if (hr != DD_OK) goto error;
-
-    hr = IDirectDraw7_SetCooperativeLevel(pdd7, GetDesktopWindow(), DDSCL_NORMAL);
-    ok(hr==DD_OK, "SetCooperativeLevel returned: %x\n", hr);
-
-    ZeroMemory(&ddsd, sizeof(ddsd));
-    ddsd.dwSize = sizeof(ddsd);
-    ddsd.dwFlags = DDSD_CAPS;
-    ddsd.ddsCaps.dwCaps = DDSCAPS_PRIMARYSURFACE;
-    hr = IDirectDraw7_CreateSurface(pdd7, &ddsd, &pdds7, NULL);
-    ok(hr==DD_OK, "CreateSurface returned: %x\n", hr);
-
-    return TRUE;
-
-error:
-    if (pdds7)
-        IDirectDrawSurface7_Release(pdds7);
-    if (pdd7)
-        IDirectDraw7_Release(pdd7);
-    if (pdd)
-        IDirectDraw_Release(pdd);
-
-    return FALSE;
-}
-
-static void release_directdraw(void)
-{
-    IDirectDrawSurface7_Release(pdds7);
-    IDirectDraw7_Release(pdd7);
 }
 
 static ULONG get_refcount(void *iface)
@@ -447,74 +400,6 @@ static void test_mmstream_get_duration(const WCHAR *test_avi_path)
 
     ref = IAMMultiMediaStream_Release(mmstream);
     ok(!ref, "Got outstanding refcount %d.\n", ref);
-}
-
-static void test_renderfile(const WCHAR *test_avi_path)
-{
-    IAMMultiMediaStream *pams;
-    HRESULT hr;
-    IMediaStream *pvidstream = NULL;
-    IDirectDrawMediaStream *pddstream = NULL;
-    IDirectDrawStreamSample *pddsample = NULL;
-    IDirectDrawSurface *surface;
-    RECT rect;
-
-    if (!(pams = create_ammultimediastream()))
-        return;
-    if (!create_directdraw())
-    {
-        IAMMultiMediaStream_Release(pams);
-        return;
-    }
-
-    hr = IAMMultiMediaStream_Initialize(pams, STREAMTYPE_READ, 0, NULL);
-    ok(hr==S_OK, "IAMMultiMediaStream_Initialize returned: %x\n", hr);
-
-    hr = IAMMultiMediaStream_AddMediaStream(pams, (IUnknown*)pdd7, &MSPID_PrimaryVideo, 0, NULL);
-    ok(hr==S_OK, "IAMMultiMediaStream_AddMediaStream returned: %x\n", hr);
-
-    hr = IAMMultiMediaStream_AddMediaStream(pams, NULL, &MSPID_PrimaryAudio, AMMSF_ADDDEFAULTRENDERER, NULL);
-    ok(hr == S_OK || hr == VFW_E_NO_AUDIO_HARDWARE, "Got hr %#x.\n", hr);
-
-    hr = IAMMultiMediaStream_OpenFile(pams, test_avi_path, 0);
-    ok(hr==S_OK, "IAMMultiMediaStream_OpenFile returned: %x\n", hr);
-
-    hr = IAMMultiMediaStream_GetMediaStream(pams, &MSPID_PrimaryVideo, &pvidstream);
-    ok(hr==S_OK, "IAMMultiMediaStream_GetMediaStream returned: %x\n", hr);
-    if (FAILED(hr)) goto error;
-
-    hr = IMediaStream_QueryInterface(pvidstream, &IID_IDirectDrawMediaStream, (LPVOID*)&pddstream);
-    ok(hr==S_OK, "IMediaStream_QueryInterface returned: %x\n", hr);
-    if (FAILED(hr)) goto error;
-
-    hr = IDirectDrawMediaStream_CreateSample(pddstream, NULL, NULL, 0, &pddsample);
-    ok(hr == S_OK, "IDirectDrawMediaStream_CreateSample returned: %x\n", hr);
-
-    surface = NULL;
-    hr = IDirectDrawStreamSample_GetSurface(pddsample, &surface, &rect);
-    ok(hr == S_OK, "got 0x%08x\n", hr);
-    ok(surface != NULL, "Expected non-NULL surface.\n");
-    IDirectDrawSurface_Release(surface);
-    IDirectDrawStreamSample_Release(pddsample);
-
-    hr = IDirectDrawSurface7_QueryInterface(pdds7, &IID_IDirectDrawSurface, (void**)&surface);
-    ok(hr == S_OK, "got 0x%08x\n", hr);
-
-    EXPECT_REF(surface, 1);
-    hr = IDirectDrawMediaStream_CreateSample(pddstream, surface, &rect, 0, &pddsample);
-    ok(hr == S_OK, "IDirectDrawMediaStream_CreateSample returned: %x\n", hr);
-    EXPECT_REF(surface, 2);
-    IDirectDrawStreamSample_Release(pddsample);
-    IDirectDrawSurface_Release(surface);
-
-error:
-    if (pddstream)
-        IDirectDrawMediaStream_Release(pddstream);
-    if (pvidstream)
-        IMediaStream_Release(pvidstream);
-
-    release_directdraw();
-    IAMMultiMediaStream_Release(pams);
 }
 
 static const GUID test_mspid = {0x88888888};
@@ -1405,11 +1290,6 @@ static void test_media_streams(void)
 
     if (!(pams = create_ammultimediastream()))
         return;
-    if (!create_directdraw())
-    {
-        IAMMultiMediaStream_Release(pams);
-        return;
-    }
 
     hr = IAMMultiMediaStream_Initialize(pams, STREAMTYPE_READ, 0, NULL);
     ok(hr == S_OK, "IAMMultiMediaStream_Initialize returned: %x\n", hr);
@@ -1604,7 +1484,6 @@ static void test_media_streams(void)
     if (media_stream_filter)
         IMediaStreamFilter_Release(media_stream_filter);
 
-    release_directdraw();
     IAMMultiMediaStream_Release(pams);
 }
 
@@ -1766,6 +1645,7 @@ static void test_find_pin(void)
 
     IPin_Release(pin2);
     IPin_Release(pin);
+    IMediaStream_Release(stream);
     IMediaStreamFilter_Release(filter);
     ref = IAMMultiMediaStream_Release(mmstream);
     ok(!ref, "Got outstanding refcount %d.\n", ref);
@@ -5436,6 +5316,64 @@ static void test_mediastreamfilter_get_current_stream_time(void)
     ok(!ref, "Got outstanding refcount %d.\n", ref);
 }
 
+static void test_mediastreamfilter_reference_time_to_stream_time(void)
+{
+    IMediaStreamFilter *filter;
+    struct testclock clock;
+    REFERENCE_TIME time;
+    HRESULT hr;
+    ULONG ref;
+
+    hr = CoCreateInstance(&CLSID_MediaStreamFilter, NULL, CLSCTX_INPROC_SERVER,
+            &IID_IMediaStreamFilter, (void **)&filter);
+    ok(hr == S_OK, "Got hr %#x.\n", hr);
+    testclock_init(&clock);
+
+    hr = IMediaStreamFilter_ReferenceTimeToStreamTime(filter, NULL);
+    ok(hr == S_FALSE, "Got hr %#x.\n", hr);
+
+    time = 0xdeadbeefdeadbeef;
+    hr = IMediaStreamFilter_ReferenceTimeToStreamTime(filter, &time);
+    ok(hr == S_FALSE, "Got hr %#x.\n", hr);
+    ok(time == 0xdeadbeefdeadbeef, "Got time %s.\n", wine_dbgstr_longlong(time));
+
+    hr = IMediaStreamFilter_SetSyncSource(filter, &clock.IReferenceClock_iface);
+    ok(hr == S_OK, "Got hr %#x.\n", hr);
+
+    clock.get_time_hr = E_FAIL;
+
+    /* Crashes on native. */
+    if (0)
+    {
+        hr = IMediaStreamFilter_ReferenceTimeToStreamTime(filter, NULL);
+        ok(hr == S_FALSE, "Got hr %#x.\n", hr);
+    }
+
+    time = 0xdeadbeefdeadbeef;
+    hr = IMediaStreamFilter_ReferenceTimeToStreamTime(filter, &time);
+    ok(hr == S_OK, "Got hr %#x.\n", hr);
+    ok(time == 0xdeadbeefdeadbeef, "Got time %s.\n", wine_dbgstr_longlong(time));
+
+    hr = IMediaStreamFilter_Run(filter, 23456789);
+    ok(hr == S_OK, "Got hr %#x.\n", hr);
+
+    time = 0xdeadbeefdeadbeef;
+    hr = IMediaStreamFilter_ReferenceTimeToStreamTime(filter, &time);
+    ok(hr == S_OK, "Got hr %#x.\n", hr);
+    ok(time == 0xdeadbeefdd47d2da, "Got time %s.\n", wine_dbgstr_longlong(time));
+
+    clock.time = 34567890;
+    clock.get_time_hr = S_OK;
+
+    time = 0xdeadbeefdeadbeef;
+    hr = IMediaStreamFilter_ReferenceTimeToStreamTime(filter, &time);
+    ok(hr == S_OK, "Got hr %#x.\n", hr);
+    ok(time == 0xdeadbeefdd47d2da, "Got time %s.\n", wine_dbgstr_longlong(time));
+
+    ref = IMediaStreamFilter_Release(filter);
+    ok(!ref, "Got outstanding refcount %d.\n", ref);
+}
+
 static void test_ddrawstream_getsetdirectdraw(void)
 {
     IAMMultiMediaStream *mmstream = create_ammultimediastream();
@@ -5847,7 +5785,6 @@ START_TEST(amstream)
 
     test_openfile(test_avi_path);
     test_mmstream_get_duration(test_avi_path);
-    test_renderfile(test_avi_path);
 
     unload_resource(test_avi_path);
 
@@ -5892,6 +5829,7 @@ START_TEST(amstream)
     test_mediastreamfilter_get_duration();
     test_mediastreamfilter_get_stop_position();
     test_mediastreamfilter_get_current_stream_time();
+    test_mediastreamfilter_reference_time_to_stream_time();
 
     CoUninitialize();
 }

@@ -70,6 +70,7 @@ struct console_input
     int                          input_cp;      /* console input codepage */
     int                          output_cp;     /* console output codepage */
     user_handle_t                win;           /* window handle if backend supports it */
+    unsigned int                 last_id;       /* id of last created console buffer */
     struct event                *event;         /* event to wait on for input queue */
     struct fd                   *fd;            /* for bare console, attached input fd */
     struct async_queue           ioctl_q;       /* ioctl queue */
@@ -183,6 +184,7 @@ static const struct fd_ops console_input_events_fd_ops =
 struct console_host_ioctl
 {
     unsigned int          code;        /* ioctl code */
+    int                   output;      /* output id for screen buffer ioctls */
     struct async         *async;       /* ioctl async */
     struct list           entry;       /* list entry */
 };
@@ -190,14 +192,17 @@ struct console_host_ioctl
 struct console_server
 {
     struct object         obj;         /* object header */
+    struct fd            *fd;          /* pseudo-fd for ioctls */
     struct console_input *console;     /* attached console */
     struct list           queue;       /* ioctl queue */
+    struct list           read_queue;  /* blocking read queue */
     int                   busy;        /* flag if server processing an ioctl */
 };
 
 static void console_server_dump( struct object *obj, int verbose );
 static void console_server_destroy( struct object *obj );
 static int console_server_signaled( struct object *obj, struct wait_queue_entry *entry );
+static struct fd *console_server_get_fd( struct object *obj );
 static struct object *console_server_lookup_name( struct object *obj, struct unicode_str *name, unsigned int attr );
 static struct object *console_server_open_file( struct object *obj, unsigned int access,
                                                 unsigned int sharing, unsigned int options );
@@ -212,7 +217,7 @@ static const struct object_ops console_server_ops =
     console_server_signaled,          /* signaled */
     no_satisfied,                     /* satisfied */
     no_signal,                        /* signal */
-    no_get_fd,                        /* get_fd */
+    console_server_get_fd,            /* get_fd */
     default_fd_map_access,            /* map_access */
     default_get_sd,                   /* get_sd */
     default_set_sd,                   /* set_sd */
@@ -223,6 +228,23 @@ static const struct object_ops console_server_ops =
     no_kernel_obj_list,               /* get_kernel_obj_list */
     fd_close_handle,                  /* close_handle */
     console_server_destroy            /* destroy */
+};
+
+static int console_server_ioctl( struct fd *fd, ioctl_code_t code, struct async *async );
+
+static const struct fd_ops console_server_fd_ops =
+{
+    default_fd_get_poll_events,   /* get_poll_events */
+    default_poll_event,           /* poll_event */
+    console_get_fd_type,          /* get_fd_type */
+    no_fd_read,                   /* read */
+    no_fd_write,                  /* write */
+    no_fd_flush,                  /* flush */
+    no_fd_get_file_info,          /* get_file_info */
+    no_fd_get_volume_info,        /* get_volume_info */
+    console_server_ioctl,         /* ioctl */
+    default_fd_queue_async,       /* queue_async */
+    default_fd_reselect_async     /* reselect_async */
 };
 
 struct font_info
@@ -240,6 +262,7 @@ struct screen_buffer
     struct object         obj;           /* object header */
     struct list           entry;         /* entry in list of all screen buffers */
     struct console_input *input;         /* associated console input */
+    unsigned int          id;            /* buffer id */
     unsigned int          mode;          /* output mode */
     int                   cursor_size;   /* size of cursor (percentage filled) */
     int                   cursor_visible;/* cursor visibility flag */
@@ -257,6 +280,7 @@ struct screen_buffer
 					  * as seen in wineconsole */
     struct font_info      font;          /* console font information */
     struct fd            *fd;            /* for bare console, attached output fd */
+    struct async_queue    ioctl_q;       /* ioctl queue */
 };
 
 static void screen_buffer_dump( struct object *obj, int verbose );
@@ -511,6 +535,7 @@ static struct object *create_console_input( int fd )
     console_input->win           = 0;
     console_input->event         = create_event( NULL, NULL, 0, 1, 0, NULL );
     console_input->fd            = NULL;
+    console_input->last_id       = 0;
     init_async_queue( &console_input->ioctl_q );
     init_async_queue( &console_input->read_q );
 
@@ -550,14 +575,15 @@ static void console_host_ioctl_terminate( struct console_host_ioctl *call, unsig
     free( call );
 }
 
-static int queue_host_ioctl( struct console_server *server, unsigned int code,
+static int queue_host_ioctl( struct console_server *server, unsigned int code, unsigned int output,
                              struct async *async, struct async_queue *queue )
 {
     struct console_host_ioctl *ioctl;
 
     if (!(ioctl = mem_alloc( sizeof(*ioctl) ))) return 0;
-    ioctl->code  = code;
-    ioctl->async = NULL;
+    ioctl->code   = code;
+    ioctl->output = output;
+    ioctl->async  = NULL;
     if (async)
     {
         ioctl->async = (struct async *)grab_object( async );
@@ -577,6 +603,12 @@ static void disconnect_console_server( struct console_server *server )
         list_remove( &call->entry );
         console_host_ioctl_terminate( call, STATUS_CANCELLED );
     }
+    while (!list_empty( &server->read_queue ))
+    {
+        struct console_host_ioctl *call = LIST_ENTRY( list_head( &server->read_queue ), struct console_host_ioctl, entry );
+        list_remove( &call->entry );
+        console_host_ioctl_terminate( call, STATUS_CANCELLED );
+    }
 
     if (server->console)
     {
@@ -587,10 +619,16 @@ static void disconnect_console_server( struct console_server *server )
     }
 }
 
-static void generate_sb_initial_events( struct console_input *console_input )
+static void set_active_screen_buffer( struct console_input *console_input, struct screen_buffer *screen_buffer )
 {
-    struct screen_buffer *screen_buffer = console_input->active;
     struct condrv_renderer_event evt;
+
+    if (console_input->active == screen_buffer) return;
+    if (console_input->active) release_object( console_input->active );
+    console_input->active = (struct screen_buffer *)grab_object( screen_buffer );
+
+    if (console_input->server) queue_host_ioctl( console_input->server, IOCTL_CONDRV_ACTIVATE,
+                                                 screen_buffer->id, NULL, NULL );
 
     evt.event = CONSOLE_RENDERER_SB_RESIZE_EVENT;
     evt.u.resize.width  = screen_buffer->width;
@@ -625,11 +663,18 @@ static struct object *create_console_output( struct console_input *console_input
     struct screen_buffer *screen_buffer;
     int	i;
 
+    if (console_input->last_id == ~0)
+    {
+        set_error( STATUS_NO_MEMORY );
+        return NULL;
+    }
+
     if (!(screen_buffer = alloc_object( &screen_buffer_ops )))
     {
         if (fd != -1) close( fd );
         return NULL;
     }
+    screen_buffer->id             = ++console_input->last_id;
     screen_buffer->mode           = ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT;
     screen_buffer->input          = console_input;
     screen_buffer->cursor_size    = 100;
@@ -654,6 +699,7 @@ static struct object *create_console_output( struct console_input *console_input
     screen_buffer->font.face_name = NULL;
     screen_buffer->font.face_len  = 0;
     memset( screen_buffer->color_map, 0, sizeof(screen_buffer->color_map) );
+    init_async_queue( &screen_buffer->ioctl_q );
     list_add_head( &screen_buffer_list, &screen_buffer->entry );
 
     if (fd != -1)
@@ -682,11 +728,9 @@ static struct object *create_console_output( struct console_input *console_input
         memcpy( &screen_buffer->data[i * screen_buffer->width], screen_buffer->data,
                 screen_buffer->width * sizeof(char_info_t) );
 
-    if (!console_input->active)
-    {
-	console_input->active = (struct screen_buffer*)grab_object( screen_buffer );
-        generate_sb_initial_events( console_input );
-    }
+    if (console_input->server) queue_host_ioctl( console_input->server, IOCTL_CONDRV_INIT_OUTPUT,
+                                                 screen_buffer->id, NULL, NULL );
+    if (!console_input->active) set_active_screen_buffer( console_input, screen_buffer );
     return &screen_buffer->obj;
 }
 
@@ -1263,22 +1307,11 @@ static void screen_buffer_destroy( struct object *obj )
     assert( obj->ops == &screen_buffer_ops );
 
     list_remove( &screen_buffer->entry );
-
-    if (screen_buffer->input && screen_buffer->input->active == screen_buffer)
-    {
-        struct screen_buffer *sb;
-
-        screen_buffer->input->active = NULL;
-        LIST_FOR_EACH_ENTRY( sb, &screen_buffer_list, struct screen_buffer, entry )
-        {
-            if (sb->input == screen_buffer->input)
-            {
-                sb->input->active = sb;
-                break;
-            }
-        }
-    }
+    if (screen_buffer->input && screen_buffer->input->server)
+        queue_host_ioctl( screen_buffer->input->server, IOCTL_CONDRV_CLOSE_OUTPUT,
+                          screen_buffer->id, NULL, NULL );
     if (screen_buffer->fd) release_object( screen_buffer->fd );
+    free_async_queue( &screen_buffer->ioctl_q );
     free( screen_buffer->data );
     free( screen_buffer->font.face_name );
 }
@@ -1584,6 +1617,7 @@ static void console_server_destroy( struct object *obj )
     struct console_server *server = (struct console_server *)obj;
     assert( obj->ops == &console_server_ops );
     disconnect_console_server( server );
+    if (server->fd) release_object( server->fd );
 }
 
 static struct object *console_server_lookup_name( struct object *obj, struct unicode_str *name, unsigned int attr )
@@ -1624,6 +1658,13 @@ static int console_server_signaled( struct object *obj, struct wait_queue_entry 
     return !server->console || !list_empty( &server->queue );
 }
 
+static struct fd *console_server_get_fd( struct object* obj )
+{
+    struct console_server *server = (struct console_server*)obj;
+    assert( obj->ops == &console_server_ops );
+    return (struct fd *)grab_object( server->fd );
+}
+
 static struct object *console_server_open_file( struct object *obj, unsigned int access,
                                                 unsigned int sharing, unsigned int options )
 {
@@ -1638,8 +1679,21 @@ static struct object *create_console_server( void )
     server->console = NULL;
     server->busy    = 0;
     list_init( &server->queue );
+    list_init( &server->read_queue );
+    server->fd = alloc_pseudo_fd( &console_server_fd_ops, &server->obj, FILE_SYNCHRONOUS_IO_NONALERT );
+    if (!server->fd)
+    {
+        release_object( server );
+        return NULL;
+    }
+    allow_fd_caching(server->fd);
 
     return &server->obj;
+}
+
+static int is_blocking_read_ioctl( unsigned int code )
+{
+    return code == IOCTL_CONDRV_READ_INPUT;
 }
 
 static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
@@ -1650,7 +1704,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
     {
     case IOCTL_CONDRV_GET_MODE:
         if (console->server)
-            return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+            return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
         if (get_reply_max_size() != sizeof(console->mode))
         {
             set_error( STATUS_INVALID_PARAMETER );
@@ -1660,7 +1714,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
 
     case IOCTL_CONDRV_SET_MODE:
         if (console->server)
-            return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+            return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
         if (get_req_data_size() != sizeof(console->mode))
         {
             set_error( STATUS_INVALID_PARAMETER );
@@ -1673,7 +1727,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         {
             int blocking = 0;
             if (console->server)
-                return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+                return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
             if (get_reply_max_size() % sizeof(INPUT_RECORD))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -1699,12 +1753,12 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
 
     case IOCTL_CONDRV_WRITE_INPUT:
         if (console->server)
-            return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+            return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
         return write_console_input( console, get_req_data_size() / sizeof(INPUT_RECORD), get_req_data() );
 
     case IOCTL_CONDRV_PEEK:
         if (console->server)
-            return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+            return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
         if (get_reply_max_size() % sizeof(INPUT_RECORD))
         {
             set_error( STATUS_INVALID_PARAMETER );
@@ -1717,7 +1771,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         {
             struct condrv_input_info info;
             if (console->server)
-                return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+                return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
             if (get_reply_max_size() != sizeof(info))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -1738,7 +1792,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         {
             const struct condrv_input_info_params *params = get_req_data();
             if (console->server)
-                return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+                return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
             if (get_req_data_size() != sizeof(*params))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -1797,7 +1851,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
 
     case IOCTL_CONDRV_GET_TITLE:
         if (console->server)
-            return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+            return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
         if (!console->title_len) return 1;
         return set_reply_data( console->title, min( console->title_len, get_reply_max_size() )) != NULL;
 
@@ -1808,7 +1862,7 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
             WCHAR *title = NULL;
 
             if (console->server)
-                return queue_host_ioctl( console->server, code, async, &console->ioctl_q );
+                return queue_host_ioctl( console->server, code, 0, async, &console->ioctl_q );
             if (len % sizeof(WCHAR))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -1824,6 +1878,25 @@ static int console_input_ioctl( struct fd *fd, ioctl_code_t code, struct async *
             return 1;
         }
 
+    case IOCTL_CONDRV_CTRL_EVENT:
+        {
+            const struct condrv_ctrl_event *event = get_req_data();
+            process_id_t group;
+            if (get_req_data_size() != sizeof(*event))
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return 0;
+            }
+            group = event->group_id ? event->group_id : current->process->group_id;
+            if (!group)
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return 0;
+            }
+            propagate_console_signal( console, event->event, group );
+            return !get_error();
+        }
+
     default:
         set_error( STATUS_INVALID_HANDLE );
         return 0;
@@ -1837,6 +1910,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
     switch (code)
     {
     case IOCTL_CONDRV_GET_MODE:
+        if (screen_buffer->input && screen_buffer->input->server)
+            return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                     async, &screen_buffer->ioctl_q );
         if (get_reply_max_size() != sizeof(screen_buffer->mode))
         {
             set_error( STATUS_INVALID_PARAMETER );
@@ -1845,6 +1921,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         return set_reply_data( &screen_buffer->mode, sizeof(screen_buffer->mode) ) != NULL;
 
     case IOCTL_CONDRV_SET_MODE:
+        if (screen_buffer->input && screen_buffer->input->server)
+            return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                     async, &screen_buffer->ioctl_q );
         if (get_req_data_size() != sizeof(screen_buffer->mode))
         {
             set_error( STATUS_INVALID_PARAMETER );
@@ -1856,6 +1935,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
     case IOCTL_CONDRV_READ_OUTPUT:
         {
             const struct condrv_output_params *params = get_req_data();
+            if (screen_buffer->input && screen_buffer->input->server)
+                return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                         async, &screen_buffer->ioctl_q );
             if (get_req_data_size() != sizeof(*params))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -1871,6 +1953,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         }
 
     case IOCTL_CONDRV_WRITE_OUTPUT:
+        if (screen_buffer->input && screen_buffer->input->server)
+            return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                     async, &screen_buffer->ioctl_q );
         if (get_req_data_size() < sizeof(struct condrv_output_params) ||
             (get_reply_max_size() != sizeof(SMALL_RECT) && get_reply_max_size() != sizeof(unsigned int)))
         {
@@ -1890,6 +1975,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
             struct condrv_output_info *info;
             data_size_t size;
 
+            if (screen_buffer->input && screen_buffer->input->server)
+                return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                         async, &screen_buffer->ioctl_q );
             size = min( sizeof(*info) + screen_buffer->font.face_len, get_reply_max_size() );
             if (size < sizeof(*info))
             {
@@ -1925,6 +2013,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
     case IOCTL_CONDRV_SET_OUTPUT_INFO:
         {
             const struct condrv_output_info_params *params = get_req_data();
+            if (screen_buffer->input && screen_buffer->input->server)
+                return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                         async, &screen_buffer->ioctl_q );
             if (get_req_data_size() < sizeof(*params))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -1939,18 +2030,17 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         }
 
     case IOCTL_CONDRV_ACTIVATE:
+        if (screen_buffer->input && screen_buffer->input->server)
+            return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                     async, &screen_buffer->ioctl_q );
+
         if (!screen_buffer->input)
         {
             set_error( STATUS_INVALID_HANDLE );
             return 0;
         }
 
-        if (screen_buffer != screen_buffer->input->active)
-        {
-            if (screen_buffer->input->active) release_object( screen_buffer->input->active );
-            screen_buffer->input->active = (struct screen_buffer *)grab_object( screen_buffer );
-            generate_sb_initial_events( screen_buffer->input );
-        }
+        set_active_screen_buffer( screen_buffer->input, screen_buffer );
         return 1;
 
     case IOCTL_CONDRV_FILL_OUTPUT:
@@ -1958,6 +2048,9 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
             const struct condrv_fill_output_params *params = get_req_data();
             char_info_t data;
             DWORD written;
+            if (screen_buffer->input && screen_buffer->input->server)
+                return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                         async, &screen_buffer->ioctl_q );
             if (get_req_data_size() != sizeof(*params) ||
                 (get_reply_max_size() && get_reply_max_size() != sizeof(written)))
             {
@@ -1977,6 +2070,11 @@ static int screen_buffer_ioctl( struct fd *fd, ioctl_code_t code, struct async *
         {
             const struct condrv_scroll_params *params = get_req_data();
             rectangle_t clip;
+
+            if (screen_buffer->input && screen_buffer->input->server)
+                return queue_host_ioctl( screen_buffer->input->server, code, screen_buffer->id,
+                                         async, &screen_buffer->ioctl_q );
+
             if (get_req_data_size() != sizeof(*params))
             {
                 set_error( STATUS_INVALID_PARAMETER );
@@ -2070,6 +2168,35 @@ static int console_input_events_ioctl( struct fd *fd, ioctl_code_t code, struct 
             return 0;
         }
         return console_input_ioctl( evts->console->fd, code, async );
+    }
+}
+
+static int console_server_ioctl( struct fd *fd, ioctl_code_t code, struct async *async )
+{
+    struct console_server *server = get_fd_user( fd );
+
+    switch (code)
+    {
+    case IOCTL_CONDRV_CTRL_EVENT:
+        {
+            const struct condrv_ctrl_event *event = get_req_data();
+            if (get_req_data_size() != sizeof(*event))
+            {
+                set_error( STATUS_INVALID_PARAMETER );
+                return 0;
+            }
+            if (!server->console)
+            {
+                set_error( STATUS_INVALID_HANDLE );
+                return 0;
+            }
+            propagate_console_signal( server->console, event->event, event->group_id );
+            return !get_error();
+        }
+
+    default:
+        set_error( STATUS_INVALID_HANDLE );
+        return 0;
     }
 }
 
@@ -2330,19 +2457,6 @@ DECL_HANDLER(create_console_output)
     release_object( console );
 }
 
-/* sends a signal to a console (process, group...) */
-DECL_HANDLER(send_console_signal)
-{
-    process_id_t group;
-
-    group = req->group_id ? req->group_id : current->process->group_id;
-
-    if (!group)
-        set_error( STATUS_INVALID_PARAMETER );
-    else
-        propagate_console_signal( current->process->console, req->signal, group );
-}
-
 /* get console which renderer is 'current' */
 static int cgwe_enum( struct process* process, void* user)
 {
@@ -2385,10 +2499,9 @@ DECL_HANDLER(get_console_wait_event)
 /* retrieve the next pending console ioctl request */
 DECL_HANDLER(get_next_console_request)
 {
-    struct console_host_ioctl *ioctl = NULL;
+    struct console_host_ioctl *ioctl = NULL, *next;
     struct console_server *server;
     struct iosb *iosb = NULL;
-
 
     server = (struct console_server *)get_handle_obj( current->process, req->handle, 0, &console_server_ops );
     if (!server) return;
@@ -2403,12 +2516,30 @@ DECL_HANDLER(get_next_console_request)
     if (req->signal) set_event( server->console->event);
     else reset_event( server->console->event );
 
-    /* set result of previous ioctl, if any */
-    if (server->busy)
+    if (req->read)
     {
-        unsigned int status = req->status;
+        /* set result of current pending ioctl */
+        if (list_empty( &server->read_queue ))
+        {
+            set_error( STATUS_INVALID_HANDLE );
+            release_object( server );
+            return;
+        }
+
+        ioctl = LIST_ENTRY( list_head( &server->read_queue ), struct console_host_ioctl, entry );
+        list_remove( &ioctl->entry );
+        list_move_tail( &server->queue, &server->read_queue );
+    }
+    else if (server->busy)
+    {
+        /* set result of previous ioctl */
         ioctl = LIST_ENTRY( list_head( &server->queue ), struct console_host_ioctl, entry );
         list_remove( &ioctl->entry );
+    }
+
+    if (ioctl)
+    {
+        unsigned int status = req->status;
         if (ioctl->async)
         {
             iosb = async_get_iosb( ioctl->async );
@@ -2430,7 +2561,30 @@ DECL_HANDLER(get_next_console_request)
         }
         console_host_ioctl_terminate( ioctl, status );
         if (iosb) release_object( iosb );
+
+        if (req->read)
+        {
+            release_object( server );
+            return;
+        }
         server->busy = 0;
+    }
+
+    /* if we have a blocking read ioctl in queue head and previous blocking read is still waiting,
+     * move it to read queue for execution after current read is complete. move all blocking
+     * ioctl at the same time to preserve their order. */
+    if (!list_empty( &server->queue ) && !list_empty( &server->read_queue ))
+    {
+        ioctl = LIST_ENTRY( list_head( &server->queue ), struct console_host_ioctl, entry );
+        if (is_blocking_read_ioctl( ioctl->code ))
+        {
+            LIST_FOR_EACH_ENTRY_SAFE( ioctl, next, &server->queue, struct console_host_ioctl, entry )
+            {
+                if (!is_blocking_read_ioctl( ioctl->code )) continue;
+                list_remove( &ioctl->entry );
+                list_add_tail( &server->read_queue, &ioctl->entry );
+            }
+        }
     }
 
     /* return the next ioctl */
@@ -2441,7 +2595,8 @@ DECL_HANDLER(get_next_console_request)
 
         if (!iosb || get_reply_max_size() >= iosb->in_size)
         {
-            reply->code = ioctl->code;
+            reply->code   = ioctl->code;
+            reply->output = ioctl->output;
 
             if (iosb)
             {
@@ -2450,7 +2605,13 @@ DECL_HANDLER(get_next_console_request)
                 iosb->in_data = NULL;
             }
 
-            server->busy = 1;
+            if (is_blocking_read_ioctl( ioctl->code ))
+            {
+                list_remove( &ioctl->entry );
+                assert( list_empty( &server->read_queue ));
+                list_add_tail( &server->read_queue, &ioctl->entry );
+            }
+            else server->busy = 1;
         }
         else
         {

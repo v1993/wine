@@ -5,7 +5,7 @@ msgstr ""
 "Project-Id-Version: Wine\n"
 "Report-Msgid-Bugs-To: https://bugs.winehq.org\n"
 "POT-Creation-Date: N/A\n"
-"PO-Revision-Date: 2020-08-21 11:13+0300\n"
+"PO-Revision-Date: 2020-08-26 09:41+0300\n"
 "Last-Translator: Aurimas Fišeras <aurimas@members.fsf.org>\n"
 "Language-Team: Lithuanian <komp_lt@konf.lt>\n"
 "Language: lt\n"
@@ -6801,6 +6801,10 @@ msgstr "Šis tinklo ryšys neegzistuoja.\n"
 #: winerror.mc:3748
 msgid "Connection reset by peer.\n"
 msgstr "Sujungimas nutrauktas kito serverio.\n"
+
+#: winerror.mc:3767
+msgid "Not implemented.\n"
+msgstr "Nerealizuota.\n"
 
 #: winerror.mc:3760
 msgid "No Signature found in file.\n"

@@ -35,16 +35,9 @@
 #include "winternl.h"
 #include "ntdll_misc.h"
 #include "wine/exception.h"
-#include "wine/server.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(process);
 
-static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
-
-
-/*
- *	Process object
- */
 
 /******************************************************************************
  *  RtlGetCurrentPeb  [NTDLL.@]
@@ -53,70 +46,6 @@ static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
 PEB * WINAPI RtlGetCurrentPeb(void)
 {
     return NtCurrentTeb()->Peb;
-}
-
-/***********************************************************************
- *           __wine_make_process_system   (NTDLL.@)
- *
- * Mark the current process as a system process.
- * Returns the event that is signaled when all non-system processes have exited.
- */
-HANDLE CDECL __wine_make_process_system(void)
-{
-    HANDLE ret = 0;
-    SERVER_START_REQ( make_process_system )
-    {
-        if (!wine_server_call( req )) ret = wine_server_ptr_handle( reply->event );
-    }
-    SERVER_END_REQ;
-    return ret;
-}
-
-/***********************************************************************
- *           restart_process
- */
-NTSTATUS restart_process( RTL_USER_PROCESS_PARAMETERS *params, NTSTATUS status )
-{
-    static const WCHAR argsW[] = {'%','s','%','s',' ','-','-','a','p','p','-','n','a','m','e',' ','"','%','s','"',' ','%','s',0};
-    static const WCHAR winevdm[] = {'w','i','n','e','v','d','m','.','e','x','e',0};
-    static const WCHAR comW[] = {'.','c','o','m',0};
-    static const WCHAR pifW[] = {'.','p','i','f',0};
-
-    DWORD len;
-    WCHAR *p, *cmdline;
-    UNICODE_STRING pathW, cmdW;
-
-    /* check for .com or .pif extension */
-    if (status == STATUS_INVALID_IMAGE_NOT_MZ &&
-        (p = wcsrchr( params->ImagePathName.Buffer, '.' )) &&
-        (!wcsicmp( p, comW ) || !wcsicmp( p, pifW )))
-        status = STATUS_INVALID_IMAGE_WIN_16;
-
-    switch (status)
-    {
-    case STATUS_CONFLICTING_ADDRESSES:
-    case STATUS_NO_MEMORY:
-    case STATUS_INVALID_IMAGE_FORMAT:
-    case STATUS_INVALID_IMAGE_NOT_MZ:
-        if (!RtlDosPathNameToNtPathName_U( params->ImagePathName.Buffer, &pathW, NULL, NULL ))
-            return status;
-        status = unix_funcs->exec_process( &pathW, &params->CommandLine, status );
-        break;
-    case STATUS_INVALID_IMAGE_WIN_16:
-    case STATUS_INVALID_IMAGE_NE_FORMAT:
-    case STATUS_INVALID_IMAGE_PROTECT:
-        len = (wcslen(system_dir) + wcslen(winevdm) + 16 + wcslen(params->ImagePathName.Buffer) +
-               wcslen(params->CommandLine.Buffer));
-        if (!(cmdline = RtlAllocateHeap( GetProcessHeap(), 0, len * sizeof(WCHAR) )))
-            return STATUS_NO_MEMORY;
-        swprintf( cmdline, len, argsW, (is_win64 || is_wow64) ? syswow64_dir : system_dir,
-                  winevdm, params->ImagePathName.Buffer, params->CommandLine.Buffer );
-        RtlInitUnicodeString( &pathW, winevdm );
-        RtlInitUnicodeString( &cmdW, cmdline );
-        status = unix_funcs->exec_process( &pathW, &cmdW, status );
-        break;
-    }
-    return status;
 }
 
 

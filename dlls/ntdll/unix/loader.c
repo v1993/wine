@@ -87,12 +87,9 @@
 #include "winternl.h"
 #include "unix_private.h"
 #include "wine/list.h"
-#include "wine/library.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(module);
-
-extern IMAGE_NT_HEADERS __wine_spec_nt_header;
 
 void     (WINAPI *pDbgUiRemoteBreakin)( void *arg ) = NULL;
 NTSTATUS (WINAPI *pKiRaiseUserExceptionDispatcher)(void) = NULL;
@@ -101,7 +98,7 @@ NTSTATUS (WINAPI *pKiUserExceptionDispatcher)(EXCEPTION_RECORD*,CONTEXT*) = NULL
 void     (WINAPI *pLdrInitializeThunk)(CONTEXT*,void**,ULONG_PTR,ULONG_PTR) = NULL;
 void     (WINAPI *pRtlUserThreadStart)( PRTL_THREAD_START_ROUTINE entry, void *arg ) = NULL;
 
-static void (CDECL *p__wine_set_unix_funcs)( int version, const struct unix_funcs *funcs );
+static NTSTATUS (CDECL *p__wine_set_unix_funcs)( int version, const struct unix_funcs *funcs );
 
 #ifdef __GNUC__
 static void fatal_error( const char *err, ... ) __attribute__((noreturn, format(printf,1,2)));
@@ -126,7 +123,6 @@ const char *build_dir = NULL;
 const char *config_dir = NULL;
 const char **dll_paths = NULL;
 const char *user_name = NULL;
-static HMODULE ntdll_module;
 
 struct file_id
 {
@@ -158,11 +154,6 @@ static NTSTATUS add_builtin_module( void *module, void *handle, const struct sta
     else memset( &builtin->id, 0, sizeof(builtin->id) );
     list_add_tail( &builtin_modules, &builtin->entry );
     return STATUS_SUCCESS;
-}
-
-static inline void *get_rva( const IMAGE_NT_HEADERS *nt, ULONG_PTR addr )
-{
-    return (BYTE *)nt + addr;
 }
 
 /* adjust an array of pointers to make them into RVAs */
@@ -362,18 +353,18 @@ static void init_paths( int argc, char *argv[], char *envp[] )
 
 
 /*********************************************************************
- *                  get_version
+ *                  wine_get_version
  */
-const char * CDECL get_version(void)
+const char * CDECL wine_get_version(void)
 {
     return PACKAGE_VERSION;
 }
 
 
 /*********************************************************************
- *                  get_build_id
+ *                  wine_get_build_id
  */
-const char * CDECL get_build_id(void)
+const char * CDECL wine_get_build_id(void)
 {
     extern const char wine_build[];
     return wine_build;
@@ -381,9 +372,9 @@ const char * CDECL get_build_id(void)
 
 
 /*********************************************************************
- *                  get_host_version
+ *                  wine_get_host_version
  */
-void CDECL get_host_version( const char **sysname, const char **release )
+void CDECL wine_get_host_version( const char **sysname, const char **release )
 {
 #ifdef HAVE_SYS_UTSNAME_H
     static struct utsname buf;
@@ -618,7 +609,7 @@ static NTSTATUS map_so_dll( const IMAGE_NT_HEADERS *nt_descr, HMODULE module )
                   + sizeof(IMAGE_NT_HEADERS)
                   + nb_sections * sizeof(IMAGE_SECTION_HEADER));
 
-    if (wine_anon_mmap( addr, size, PROT_READ | PROT_WRITE, MAP_FIXED ) != addr) return STATUS_NO_MEMORY;
+    if (anon_mmap_fixed( addr, size, PROT_READ | PROT_WRITE, 0 ) != addr) return STATUS_NO_MEMORY;
 
     dos = (IMAGE_DOS_HEADER *)addr;
     nt  = (IMAGE_NT_HEADERS *)((BYTE *)(dos + 1) + sizeof(builtin_signature));
@@ -780,63 +771,15 @@ static ULONG_PTR find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY
     return 0;
 }
 
-static ULONG_PTR find_pe_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
-                                 const IMAGE_IMPORT_BY_NAME *name )
+static void load_ntdll_functions( HMODULE module )
 {
-    const WORD *ordinals = (const WORD *)((BYTE *)module + exports->AddressOfNameOrdinals);
-    const DWORD *names = (const DWORD *)((BYTE *)module + exports->AddressOfNames);
-
-    if (name->Hint < exports->NumberOfNames)
-    {
-        char *ename = (char *)module + names[name->Hint];
-        if (!strcmp( ename, (char *)name->Name ))
-            return find_ordinal_export( module, exports, ordinals[name->Hint] );
-    }
-    return find_named_export( module, exports, (char *)name->Name );
-}
-
-static void fixup_ntdll_imports( const IMAGE_NT_HEADERS *nt )
-{
-    const IMAGE_EXPORT_DIRECTORY *ntdll_exports = get_export_dir( ntdll_module );
-    const IMAGE_IMPORT_DESCRIPTOR *descr;
-    const IMAGE_THUNK_DATA *import_list;
-    IMAGE_THUNK_DATA *thunk_list;
+    const IMAGE_EXPORT_DIRECTORY *ntdll_exports = get_export_dir( module );
     void **ptr;
 
     assert( ntdll_exports );
 
-    descr = get_rva( nt, nt->OptionalHeader.DataDirectory[IMAGE_FILE_IMPORT_DIRECTORY].VirtualAddress );
-
-    /* ntdll must be the only import */
-    assert( !strcmp( get_rva( nt, descr->Name ), "ntdll.dll" ));
-    assert( !descr[1].Name );
-
-    thunk_list = get_rva( nt, (DWORD)descr->FirstThunk );
-    if (descr->u.OriginalFirstThunk)
-        import_list = get_rva( nt, (DWORD)descr->u.OriginalFirstThunk );
-    else
-        import_list = thunk_list;
-
-    while (import_list->u1.Ordinal)
-    {
-        if (IMAGE_SNAP_BY_ORDINAL( import_list->u1.Ordinal ))
-        {
-            int ordinal = IMAGE_ORDINAL( import_list->u1.Ordinal ) - ntdll_exports->Base;
-            thunk_list->u1.Function = find_ordinal_export( ntdll_module, ntdll_exports, ordinal );
-            if (!thunk_list->u1.Function) ERR( "ordinal %u not found\n", ordinal );
-        }
-        else  /* import by name */
-        {
-            IMAGE_IMPORT_BY_NAME *pe_name = get_rva( nt, import_list->u1.AddressOfData );
-            thunk_list->u1.Function = find_pe_export( ntdll_module, ntdll_exports, pe_name );
-            if (!thunk_list->u1.Function) ERR( "%s not found\n", pe_name->Name );
-        }
-        import_list++;
-        thunk_list++;
-    }
-
 #define GET_FUNC(name) \
-    if (!(p##name = (void *)find_named_export( ntdll_module, ntdll_exports, #name ))) \
+    if (!(p##name = (void *)find_named_export( module, ntdll_exports, #name ))) \
         ERR( "%s not found\n", #name )
 
     GET_FUNC( DbgUiRemoteBreakin );
@@ -848,7 +791,7 @@ static void fixup_ntdll_imports( const IMAGE_NT_HEADERS *nt )
     GET_FUNC( __wine_set_unix_funcs );
 #undef GET_FUNC
 #define SET_PTR(name,val) \
-    if ((ptr = (void *)find_named_export( ntdll_module, ntdll_exports, #name ))) *ptr = val; \
+    if ((ptr = (void *)find_named_export( module, ntdll_exports, #name ))) *ptr = val; \
     else ERR( "%s not found\n", #name )
 
     SET_PTR( __wine_syscall_dispatcher, __wine_syscall_dispatcher );
@@ -870,6 +813,48 @@ static void load_builtin_callback( void *module, const char *filename )
 {
     callback_module = module;
 }
+
+
+/***********************************************************************
+ *           load_libwine
+ */
+static void load_libwine(void)
+{
+#ifdef __APPLE__
+#define LIBWINE "libwine.1.dylib"
+#elif defined(__ANDROID__)
+#define LIBWINE "libwine.so"
+#else
+#define LIBWINE "libwine.so.1"
+#endif
+    typedef void (*load_dll_callback_t)( void *, const char * );
+    static void (*p_wine_dll_set_callback)( load_dll_callback_t load );
+    static int *p___wine_main_argc;
+    static char ***p___wine_main_argv;
+    static char ***p___wine_main_environ;
+    static WCHAR ***p___wine_main_wargv;
+
+    char *path;
+    void *handle;
+
+    if (build_dir) path = build_path( build_dir, "libs/wine/" LIBWINE );
+    else path = build_path( dll_dir, "../" LIBWINE );
+
+    if (!(handle = dlopen( path, RTLD_NOW )) && !(handle = dlopen( LIBWINE, RTLD_NOW ))) return;
+
+    p_wine_dll_set_callback = dlsym( handle, "wine_dll_set_callback" );
+    p___wine_main_argc      = dlsym( handle, "__wine_main_argc" );
+    p___wine_main_argv      = dlsym( handle, "__wine_main_argv" );
+    p___wine_main_wargv     = dlsym( handle, "__wine_main_wargv" );
+    p___wine_main_environ   = dlsym( handle, "__wine_main_environ" );
+
+    if (p_wine_dll_set_callback) p_wine_dll_set_callback( load_builtin_callback );
+    if (p___wine_main_argc) *p___wine_main_argc = main_argc;
+    if (p___wine_main_argv) *p___wine_main_argv = main_argv;
+    if (p___wine_main_wargv) *p___wine_main_wargv = main_wargv;
+    if (p___wine_main_environ) *p___wine_main_environ = main_envp;
+}
+
 
 /***********************************************************************
  *           dlopen_dll
@@ -952,6 +937,23 @@ static NTSTATUS CDECL load_so_dll( UNICODE_STRING *nt_name, void **module )
 }
 
 
+/* check a PE library architecture */
+static BOOL is_valid_binary( HMODULE module, const SECTION_IMAGE_INFORMATION *info )
+{
+#ifdef __i386__
+    return info->Machine == IMAGE_FILE_MACHINE_I386;
+#elif defined(__arm__)
+    return info->Machine == IMAGE_FILE_MACHINE_ARM ||
+           info->Machine == IMAGE_FILE_MACHINE_THUMB ||
+           info->Machine == IMAGE_FILE_MACHINE_ARMNT;
+#elif defined(__x86_64__)
+    /* we don't support 32-bit IL-only builtins yet */
+    return info->Machine == IMAGE_FILE_MACHINE_AMD64;
+#elif defined(__aarch64__)
+    return info->Machine == IMAGE_FILE_MACHINE_ARM64;
+#endif
+}
+
 /* check if the library is the correct architecture */
 /* only returns false for a valid library of the wrong arch */
 static int check_library_arch( int fd )
@@ -999,7 +1001,7 @@ static inline char *prepend( char *buffer, const char *str, size_t len )
  *
  * Open a file for a new dll. Helper for find_dll_file.
  */
-static NTSTATUS open_dll_file( const char *name, void **module, pe_image_info_t *image_info )
+static NTSTATUS open_dll_file( const char *name, void **module, SECTION_IMAGE_INFORMATION *image_info )
 {
     struct builtin_module *builtin;
     OBJECT_ATTRIBUTES attr = { sizeof(attr) };
@@ -1051,20 +1053,22 @@ static NTSTATUS open_dll_file( const char *name, void **module, pe_image_info_t 
         NtUnmapViewOfSection( NtCurrentProcess(), *module );
         *module = NULL;
     }
-    status = virtual_map_section( mapping, module, 0, 0, NULL, &len, 0, PAGE_EXECUTE_READ, image_info );
+    NtQuerySection( mapping, SectionImageInformation, image_info, sizeof(*image_info), NULL );
+    status = NtMapViewOfSection( mapping, NtCurrentProcess(), module, 0, 0, NULL, &len,
+                                 ViewShare, 0, PAGE_EXECUTE_READ );
     if (status == STATUS_IMAGE_NOT_AT_BASE) status = STATUS_SUCCESS;
     NtClose( mapping );
     if (status) return status;
 
     /* ignore non-builtins */
-    if (!(image_info->image_flags & IMAGE_FLAGS_WineBuiltin))
+    if (!(image_info->u.ImageFlags & IMAGE_FLAGS_WineBuiltin))
     {
         WARN( "%s found in WINEDLLPATH but not a builtin, ignoring\n", debugstr_a(name) );
         status = STATUS_DLL_NOT_FOUND;
     }
-    else if (image_info->cpu != client_cpu)
+    else if (!is_valid_binary( *module, image_info ))
     {
-        TRACE( "%s is for CPU %u, continuing search\n", debugstr_a(name), image_info->cpu );
+        TRACE( "%s is for arch %x, continuing search\n", debugstr_a(name), image_info->Machine );
         status = STATUS_IMAGE_MACHINE_TYPE_MISMATCH;
     }
 
@@ -1082,7 +1086,7 @@ static NTSTATUS open_dll_file( const char *name, void **module, pe_image_info_t 
 /***********************************************************************
  *           open_builtin_file
  */
-static NTSTATUS open_builtin_file( char *name, void **module, pe_image_info_t *image_info )
+static NTSTATUS open_builtin_file( char *name, void **module, SECTION_IMAGE_INFORMATION *image_info )
 {
     NTSTATUS status;
     int fd;
@@ -1102,7 +1106,7 @@ static NTSTATUS open_builtin_file( char *name, void **module, pe_image_info_t *i
             if (!dlopen_dll( name, module ))
             {
                 memset( image_info, 0, sizeof(*image_info) );
-                image_info->image_flags = IMAGE_FLAGS_WineBuiltin;
+                image_info->u.ImageFlags = IMAGE_FLAGS_WineBuiltin;
                 status = STATUS_SUCCESS;
             }
             else
@@ -1121,7 +1125,8 @@ static NTSTATUS open_builtin_file( char *name, void **module, pe_image_info_t *i
 /***********************************************************************
  *           load_builtin_dll
  */
-static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module, pe_image_info_t *image_info )
+static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module,
+                                        SECTION_IMAGE_INFORMATION *image_info )
 {
     unsigned int i, pos, len, namelen, maxlen = 0;
     char *ptr, *file;
@@ -1294,7 +1299,7 @@ found:
 /***********************************************************************
  *           load_ntdll
  */
-static HMODULE load_ntdll(void)
+static void load_ntdll(void)
 {
     NTSTATUS status;
     void *module;
@@ -1317,7 +1322,7 @@ static HMODULE load_ntdll(void)
     }
     if (status) fatal_error( "failed to load %s error %x\n", name, status );
     free( name );
-    return module;
+    load_ntdll_functions( module );
 }
 
 
@@ -1383,9 +1388,8 @@ static struct unix_funcs unix_funcs =
     fast_RtlAcquireSRWLockShared,
     fast_RtlReleaseSRWLockExclusive,
     fast_RtlReleaseSRWLockShared,
-    fast_RtlSleepConditionVariableSRW,
-    fast_RtlSleepConditionVariableCS,
     fast_RtlWakeConditionVariable,
+    fast_wait_cv,
     ntdll_atan,
     ntdll_ceil,
     ntdll_cos,
@@ -1403,21 +1407,7 @@ static struct unix_funcs unix_funcs =
     get_initial_directory,
     get_unix_codepage_data,
     get_locales,
-    get_version,
-    get_build_id,
-    get_host_version,
-    virtual_map_section,
-    virtual_locked_recvmsg,
     virtual_release_address_space,
-    exec_process,
-    wine_server_call,
-    server_send_fd,
-    server_fd_to_handle,
-    server_handle_to_fd,
-    server_release_fd,
-    server_init_process_done,
-    wine_nt_to_unix_file_name,
-    wine_unix_to_nt_file_name,
     set_show_dot_files,
     load_so_dll,
     load_builtin_dll,
@@ -1437,6 +1427,7 @@ static struct unix_funcs unix_funcs =
 static void start_main_thread(void)
 {
     BOOL suspend;
+    NTSTATUS status;
     TEB *teb = virtual_alloc_first_teb();
 
     signal_init_threading();
@@ -1449,47 +1440,18 @@ static void start_main_thread(void)
     init_cpu_info();
     init_files();
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
-    p__wine_set_unix_funcs( NTDLL_UNIXLIB_VERSION, &unix_funcs );
+    status = p__wine_set_unix_funcs( NTDLL_UNIXLIB_VERSION, &unix_funcs );
+    if (status) exec_process( status );
+    server_init_process_done();
 }
 
 
 #ifdef __APPLE__
-struct apple_stack_info
-{
-    void *stack;
-    size_t desired_size;
-};
-
 static void *apple_wine_thread( void *arg )
 {
     start_main_thread();
     return NULL;
 }
-
-/***********************************************************************
- *           apple_alloc_thread_stack
- *
- * Callback for mmap_enum_reserved_areas to allocate space for
- * the secondary thread's stack.
- */
-#ifndef _WIN64
-static int CDECL apple_alloc_thread_stack( void *base, size_t size, void *arg )
-{
-    struct apple_stack_info *info = arg;
-
-    /* For mysterious reasons, putting the thread stack at the very top
-     * of the address space causes subsequent execs to fail, even on the
-     * child side of a fork.  Avoid the top 16MB. */
-    char * const limit = (char*)0xff000000;
-    if ((char *)base >= limit) return 0;
-    if (size > limit - (char*)base)
-        size = limit - (char*)base;
-    if (size < info->desired_size) return 0;
-    info->stack = wine_anon_mmap( (char *)base + size - info->desired_size,
-                                  info->desired_size, PROT_READ|PROT_WRITE, MAP_FIXED );
-    return (info->stack != (void *)-1);
-}
-#endif
 
 /***********************************************************************
  *           apple_create_wine_thread
@@ -1501,33 +1463,13 @@ static int CDECL apple_alloc_thread_stack( void *base, size_t size, void *arg )
  */
 static void apple_create_wine_thread( void *arg )
 {
-    int success = 0;
     pthread_t thread;
     pthread_attr_t attr;
 
-    if (!pthread_attr_init( &attr ))
-    {
-#ifndef _WIN64
-        struct apple_stack_info info;
-
-        /* Try to put the new thread's stack in the reserved area.  If this
-         * fails, just let it go wherever.  It'll be a waste of space, but we
-         * can go on. */
-        if (!pthread_attr_getstacksize( &attr, &info.desired_size ) &&
-            mmap_enum_reserved_areas( apple_alloc_thread_stack, &info, 1 ))
-        {
-            mmap_remove_reserved_area( info.stack, info.desired_size );
-            pthread_attr_setstackaddr( &attr, (char*)info.stack + info.desired_size );
-        }
-#endif
-
-        if (!pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_JOINABLE ) &&
-            !pthread_create( &thread, &attr, apple_wine_thread, NULL ))
-            success = 1;
-
-        pthread_attr_destroy( &attr );
-    }
-    if (!success) exit(1);
+    pthread_attr_init( &attr );
+    pthread_attr_setdetachstate( &attr, PTHREAD_CREATE_JOINABLE );
+    if (pthread_create( &thread, &attr, apple_wine_thread, NULL )) exit(1);
+    pthread_attr_destroy( &attr );
 }
 
 
@@ -1668,7 +1610,7 @@ static void check_command_line( int argc, char *argv[] )
     }
     if (!strcmp( argv[1], "--version" ))
     {
-        printf( "%s\n", get_build_id() );
+        printf( "%s\n", wine_get_build_id() );
         exit(0);
     }
 }
@@ -1706,12 +1648,10 @@ void __wine_main( int argc, char *argv[], char *envp[] )
 #endif
 
     virtual_init();
-
-    ntdll_module = load_ntdll();
-    fixup_ntdll_imports( &__wine_spec_nt_header );
+    load_ntdll();
 
     init_environment( argc, argv, envp );
-    wine_dll_set_callback( load_builtin_callback );
+    load_libwine();
 
 #ifdef __APPLE__
     apple_main_thread();

@@ -24,11 +24,10 @@
 #include "wine/server.h"
 #include "wine/debug.h"
 
-struct msghdr;
 struct _DISPATCHER_CONTEXT;
 
 /* increment this when you change the function table */
-#define NTDLL_UNIXLIB_VERSION 93
+#define NTDLL_UNIXLIB_VERSION 104
 
 struct unix_funcs
 {
@@ -53,13 +52,9 @@ struct unix_funcs
     NTSTATUS      (CDECL *fast_RtlAcquireSRWLockShared)( RTL_SRWLOCK *lock );
     NTSTATUS      (CDECL *fast_RtlReleaseSRWLockExclusive)( RTL_SRWLOCK *lock );
     NTSTATUS      (CDECL *fast_RtlReleaseSRWLockShared)( RTL_SRWLOCK *lock );
-    NTSTATUS      (CDECL *fast_RtlSleepConditionVariableSRW)( RTL_CONDITION_VARIABLE *variable,
-                                                              RTL_SRWLOCK *lock,
-                                                              const LARGE_INTEGER *timeout, ULONG flags );
-    NTSTATUS      (CDECL *fast_RtlSleepConditionVariableCS)( RTL_CONDITION_VARIABLE *variable,
-                                                             RTL_CRITICAL_SECTION *cs,
-                                                             const LARGE_INTEGER *timeout );
     NTSTATUS      (CDECL *fast_RtlWakeConditionVariable)( RTL_CONDITION_VARIABLE *variable, int count );
+    NTSTATUS      (CDECL *fast_wait_cv)( RTL_CONDITION_VARIABLE *variable, const void *value,
+                                         const LARGE_INTEGER *timeout );
 
     /* math functions */
     double        (CDECL *atan)( double d );
@@ -82,40 +77,17 @@ struct unix_funcs
     void          (CDECL *get_initial_directory)( UNICODE_STRING *dir );
     USHORT *      (CDECL *get_unix_codepage_data)(void);
     void          (CDECL *get_locales)( WCHAR *sys, WCHAR *user );
-    const char *  (CDECL *get_version)(void);
-    const char *  (CDECL *get_build_id)(void);
-    void          (CDECL *get_host_version)( const char **sysname, const char **release );
 
     /* virtual memory functions */
-    NTSTATUS      (CDECL *virtual_map_section)( HANDLE handle, PVOID *addr_ptr, unsigned short zero_bits_64, SIZE_T commit_size,
-                                                const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr, ULONG alloc_type,
-                                                ULONG protect, pe_image_info_t *image_info );
-    ssize_t       (CDECL *virtual_locked_recvmsg)( int fd, struct msghdr *hdr, int flags );
     void          (CDECL *virtual_release_address_space)(void);
 
-    /* thread/process functions */
-    NTSTATUS      (CDECL *exec_process)( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTSTATUS status );
-
-    /* server functions */
-    unsigned int  (CDECL *server_call)( void *req_ptr );
-    void          (CDECL *server_send_fd)( int fd );
-    NTSTATUS      (CDECL *server_fd_to_handle)( int fd, unsigned int access, unsigned int attributes,
-                                                HANDLE *handle );
-    NTSTATUS      (CDECL *server_handle_to_fd)( HANDLE handle, unsigned int access, int *unix_fd,
-                                                unsigned int *options );
-    void          (CDECL *server_release_fd)( HANDLE handle, int unix_fd );
-    void          (CDECL *server_init_process_done)( void *relay );
-
     /* file functions */
-    NTSTATUS      (CDECL *nt_to_unix_file_name)( const UNICODE_STRING *nameW, char *nameA, SIZE_T *size,
-                                                 UINT disposition );
-    NTSTATUS      (CDECL *unix_to_nt_file_name)( const char *name, WCHAR *buffer, SIZE_T *size );
     void          (CDECL *set_show_dot_files)( BOOL enable );
 
     /* loader functions */
     NTSTATUS      (CDECL *load_so_dll)( UNICODE_STRING *nt_name, void **module );
     NTSTATUS      (CDECL *load_builtin_dll)( const WCHAR *name, void **module,
-                                             pe_image_info_t *image_info );
+                                             SECTION_IMAGE_INFORMATION *image_info );
     NTSTATUS      (CDECL *unload_builtin_dll)( void *module );
     void          (CDECL *init_builtin_dll)( void *module );
     NTSTATUS      (CDECL *unwind_builtin_dll)( ULONG type, struct _DISPATCHER_CONTEXT *dispatch,

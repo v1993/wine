@@ -1515,21 +1515,16 @@ enum server_fd_type
 @END
 
 
-/* Sends a signal to a process group */
-@REQ(send_console_signal)
-    int          signal;        /* the signal to send */
-    process_id_t group_id;      /* the group to send the signal to */
-@END
-
-
 /* Retrieve the next pending console ioctl request */
 @REQ(get_next_console_request)
     obj_handle_t handle;        /* console server handle */
     int          signal;        /* server signal state */
+    int          read;          /* 1 if reporting result of blocked read ioctl */
     unsigned int status;        /* status of previous ioctl */
     VARARG(out_data,bytes);     /* out_data of previous ioctl */
 @REPLY
     unsigned int code;          /* ioctl code */
+    unsigned int output;        /* output id or 0 for input */
     data_size_t  out_size;      /* ioctl output size */
     VARARG(in_data,bytes);      /* ioctl in_data */
 @END

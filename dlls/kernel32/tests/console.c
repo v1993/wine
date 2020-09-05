@@ -3659,6 +3659,8 @@ static void test_FreeConsole(void)
     ok(title[0] == 0xc0c0, "title byffer changed\n");
     ok(GetLastError() == ERROR_INVALID_HANDLE, "last error %u\n", GetLastError());
 
+    if (skip_nt) return;
+
     SetLastError(0xdeadbeef);
     ret = SetConsoleTitleW( L"test" );
     ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "SetConsoleTitleW returned %x(%u)\n", ret, GetLastError());
@@ -3668,15 +3670,16 @@ static void test_FreeConsole(void)
     ok(!hwnd, "hwnd = %p\n", hwnd);
     ok(GetLastError() == ERROR_INVALID_HANDLE, "last error %u\n", GetLastError());
 
-    if (!skip_nt)
-    {
-        SetStdHandle( STD_INPUT_HANDLE, (HANDLE)0xdeadbeef );
-        handle = GetConsoleInputWaitHandle();
-        ok(handle == (HANDLE)0xdeadbeef, "GetConsoleInputWaitHandle returned %p\n", handle);
-        SetStdHandle( STD_INPUT_HANDLE, NULL );
-        handle = GetConsoleInputWaitHandle();
-        ok(!handle, "GetConsoleInputWaitHandle returned %p\n", handle);
-    }
+    ret = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "GenerateConsoleCtrlEvent returned %x(%u)\n",
+       ret, GetLastError());
+
+    SetStdHandle( STD_INPUT_HANDLE, (HANDLE)0xdeadbeef );
+    handle = GetConsoleInputWaitHandle();
+    ok(handle == (HANDLE)0xdeadbeef, "GetConsoleInputWaitHandle returned %p\n", handle);
+    SetStdHandle( STD_INPUT_HANDLE, NULL );
+    handle = GetConsoleInputWaitHandle();
+    ok(!handle, "GetConsoleInputWaitHandle returned %p\n", handle);
 }
 
 static void test_SetConsoleScreenBufferInfoEx(HANDLE std_output)
@@ -3945,6 +3948,46 @@ static void test_AllocConsole(void)
     CloseHandle(pipe_write);
 }
 
+static void test_pseudo_console_child(HANDLE input, HANDLE output)
+{
+    DWORD mode;
+    BOOL ret;
+
+    ret = GetConsoleMode(input, &mode);
+    ok(ret, "GetConsoleMode failed: %u\n", GetLastError());
+    ok(mode == (ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT |
+                ENABLE_INSERT_MODE | ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION),
+       "mode = %x\n", mode);
+
+    ret = SetConsoleMode(input, mode & ~ENABLE_AUTO_POSITION);
+    ok(ret, "SetConsoleMode failed: %u\n", GetLastError());
+
+    ret = GetConsoleMode(input, &mode);
+    ok(ret, "GetConsoleMode failed: %u\n", GetLastError());
+    ok(mode == (ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT |
+                ENABLE_INSERT_MODE | ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS), "mode = %x\n", mode);
+
+    ret = SetConsoleMode(input, mode | ENABLE_AUTO_POSITION);
+    ok(ret, "SetConsoleMode failed: %u\n", GetLastError());
+
+    ret = GetConsoleMode(output, &mode);
+    ok(ret, "GetConsoleMode failed: %u\n", GetLastError());
+    ok(mode == (ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT), "mode = %x\n", mode);
+
+    ret = SetConsoleMode(output, mode & ~ENABLE_WRAP_AT_EOL_OUTPUT);
+    ok(ret, "SetConsoleMode failed: %u\n", GetLastError());
+
+    ret = GetConsoleMode(output, &mode);
+    ok(ret, "GetConsoleMode failed: %u\n", GetLastError());
+    ok(mode == ENABLE_PROCESSED_OUTPUT, "mode = %x\n", mode);
+
+    ret = SetConsoleMode(output, mode | ENABLE_WRAP_AT_EOL_OUTPUT);
+    ok(ret, "SetConsoleMode failed: %u\n", GetLastError());
+
+    test_console_title();
+    test_WriteConsoleInputW(input);
+}
+
 static DWORD WINAPI read_pipe_proc( void *handle )
 {
     char buf[64];
@@ -4118,13 +4161,7 @@ START_TEST(console)
 
     if (using_pseudo_console)
     {
-        DWORD mode;
-
-        ret = GetConsoleMode(hConIn, &mode);
-        ok(ret, "GetConsoleMode failed: %u\n", GetLastError());
-        ok(mode == (ENABLE_PROCESSED_INPUT | ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_MOUSE_INPUT |
-                    ENABLE_INSERT_MODE | ENABLE_QUICK_EDIT_MODE | ENABLE_EXTENDED_FLAGS | ENABLE_AUTO_POSITION),
-           "mode = %x\n", mode);
+        test_pseudo_console_child(hConIn, hConOut);
         return;
     }
 

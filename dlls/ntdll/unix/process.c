@@ -474,14 +474,39 @@ static ULONG get_env_size( const RTL_USER_PROCESS_PARAMETERS *params, char **win
 
 
 /***********************************************************************
+ *           get_nt_pathname
+ *
+ * Simplified version of RtlDosPathNameToNtPathName_U.
+ */
+static WCHAR *get_nt_pathname( const UNICODE_STRING *str )
+{
+    static const WCHAR ntprefixW[] = {'\\','?','?','\\',0};
+    static const WCHAR uncprefixW[] = {'U','N','C','\\',0};
+    const WCHAR *name = str->Buffer;
+    WCHAR *ret;
+
+    if (!(ret = malloc( str->Length + 8 * sizeof(WCHAR) ))) return NULL;
+
+    wcscpy( ret, ntprefixW );
+    if (name[0] == '\\' && name[1] == '\\')
+    {
+        if ((name[2] == '.' || name[2] == '?') && name[3] == '\\') name += 4;
+        else
+        {
+            wcscat( ret, uncprefixW );
+            name += 2;
+        }
+    }
+    wcscat( ret, name );
+    return ret;
+}
+
+
+/***********************************************************************
  *           get_unix_curdir
  */
 static int get_unix_curdir( const RTL_USER_PROCESS_PARAMETERS *params )
 {
-    static const WCHAR ntprefixW[] = {'\\','?','?','\\',0};
-    static const WCHAR uncprefixW[] = {'U','N','C','\\',0};
-    const UNICODE_STRING *curdir = &params->CurrentDirectory.DosPath;
-    const WCHAR *dir = curdir->Buffer;
     UNICODE_STRING nt_name;
     OBJECT_ATTRIBUTES attr;
     IO_STATUS_BLOCK io;
@@ -489,20 +514,7 @@ static int get_unix_curdir( const RTL_USER_PROCESS_PARAMETERS *params )
     HANDLE handle;
     int fd = -1;
 
-    if (!(nt_name.Buffer = malloc( curdir->Length + 8 * sizeof(WCHAR) ))) return -1;
-
-    /* simplified version of RtlDosPathNameToNtPathName_U */
-    wcscpy( nt_name.Buffer, ntprefixW );
-    if (dir[0] == '\\' && dir[1] == '\\')
-    {
-        if ((dir[2] == '.' || dir[2] == '?') && dir[3] == '\\') dir += 4;
-        else
-        {
-            wcscat( nt_name.Buffer, uncprefixW );
-            dir += 2;
-        }
-    }
-    wcscat( nt_name.Buffer, dir );
+    if (!(nt_name.Buffer = get_nt_pathname( &params->CurrentDirectory.DosPath ))) return -1;
     nt_name.Length = wcslen( nt_name.Buffer ) * sizeof(WCHAR);
 
     InitializeObjectAttributes( &attr, &nt_name, OBJ_CASE_INSENSITIVE, 0, NULL );
@@ -511,7 +523,7 @@ static int get_unix_curdir( const RTL_USER_PROCESS_PARAMETERS *params )
                          FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT );
     free( nt_name.Buffer );
     if (status) return -1;
-    server_handle_to_fd( handle, FILE_TRAVERSE, &fd, NULL );
+    wine_server_handle_to_fd( handle, FILE_TRAVERSE, &fd, NULL );
     NtClose( handle );
     return fd;
 }
@@ -548,8 +560,8 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
     pid_t pid;
     char **argv;
 
-    server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL );
-    server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL );
+    wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL );
+    wine_server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL );
 
     if (!(pid = fork()))  /* child */
     {
@@ -601,14 +613,15 @@ static NTSTATUS spawn_process( const RTL_USER_PROCESS_PARAMETERS *params, int so
 /***********************************************************************
  *           exec_process
  */
-NTSTATUS CDECL exec_process( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTSTATUS status )
+void DECLSPEC_NORETURN exec_process( NTSTATUS status )
 {
+    RTL_USER_PROCESS_PARAMETERS *params = NtCurrentTeb()->Peb->ProcessParameters;
     pe_image_info_t pe_info;
     int unixdir, socketfd[2];
     char **argv;
     HANDLE handle;
 
-    if (startup_info_size) return status;  /* started from another Win32 process */
+    if (startup_info_size) goto done;  /* started from another Win32 process */
 
     switch (status)
     {
@@ -616,9 +629,14 @@ NTSTATUS CDECL exec_process( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTST
     case STATUS_NO_MEMORY:
     case STATUS_INVALID_IMAGE_FORMAT:
     case STATUS_INVALID_IMAGE_NOT_MZ:
-        if (getenv( "WINEPRELOADRESERVE" )) return status;
-        if ((status = get_pe_file_info( path, &handle, &pe_info ))) return status;
+    {
+        UNICODE_STRING image;
+        if (getenv( "WINEPRELOADRESERVE" )) goto done;
+        image.Buffer = get_nt_pathname( &params->ImagePathName );
+        image.Length = wcslen( image.Buffer ) * sizeof(WCHAR);
+        if ((status = get_pe_file_info( &image, &handle, &pe_info ))) goto done;
         break;
+    }
     case STATUS_INVALID_IMAGE_WIN_16:
     case STATUS_INVALID_IMAGE_NE_FORMAT:
     case STATUS_INVALID_IMAGE_PROTECT:
@@ -627,12 +645,16 @@ NTSTATUS CDECL exec_process( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTST
         pe_info.cpu = CPU_x86;
         break;
     default:
-        return status;
+        goto done;
     }
 
-    unixdir = get_unix_curdir( NtCurrentTeb()->Peb->ProcessParameters );
+    unixdir = get_unix_curdir( params );
 
-    if (socketpair( PF_UNIX, SOCK_STREAM, 0, socketfd ) == -1) return STATUS_TOO_MANY_OPENED_FILES;
+    if (socketpair( PF_UNIX, SOCK_STREAM, 0, socketfd ) == -1)
+    {
+        status = STATUS_TOO_MANY_OPENED_FILES;
+        goto done;
+    }
 #ifdef SO_PASSCRED
     else
     {
@@ -640,7 +662,7 @@ NTSTATUS CDECL exec_process( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTST
         setsockopt( socketfd[0], SOL_SOCKET, SO_PASSCRED, &enable, sizeof(enable) );
     }
 #endif
-    server_send_fd( socketfd[1] );
+    wine_server_send_fd( socketfd[1] );
     close( socketfd[1] );
 
     SERVER_START_REQ( exec_process )
@@ -653,7 +675,11 @@ NTSTATUS CDECL exec_process( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTST
 
     if (!status)
     {
-        if (!(argv = build_argv( cmdline, 2 ))) return STATUS_NO_MEMORY;
+        if (!(argv = build_argv( &params->CommandLine, 2 )))
+        {
+            status = STATUS_NO_MEMORY;
+            goto done;
+        }
         fchdir( unixdir );
         do
         {
@@ -667,7 +693,19 @@ NTSTATUS CDECL exec_process( UNICODE_STRING *path, UNICODE_STRING *cmdline, NTST
         free( argv );
     }
     close( socketfd[0] );
-    return status;
+
+done:
+    switch (status)
+    {
+    case STATUS_INVALID_IMAGE_FORMAT:
+    case STATUS_INVALID_IMAGE_NOT_MZ:
+        ERR( "%s not supported on this system\n", debugstr_us(&params->ImagePathName) );
+        break;
+    default:
+        ERR( "failed to load %s error %x\n", debugstr_us(&params->ImagePathName), status );
+        break;
+    }
+    for (;;) NtTerminateProcess( GetCurrentProcess(), status );
 }
 
 
@@ -701,8 +739,8 @@ static NTSTATUS fork_and_exec( UNICODE_STRING *path, int unixdir,
         fcntl( fd[1], F_SETFD, FD_CLOEXEC );
     }
 
-    server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL );
-    server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL );
+    wine_server_handle_to_fd( params->hStdInput, FILE_READ_DATA, &stdin_fd, NULL );
+    wine_server_handle_to_fd( params->hStdOutput, FILE_WRITE_DATA, &stdout_fd, NULL );
 
     if (!(pid = fork()))  /* child */
     {
@@ -861,7 +899,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
 #endif
 
-    server_send_fd( socketfd[1] );
+    wine_server_send_fd( socketfd[1] );
     close( socketfd[1] );
 
     /* create the process on the server side */
@@ -1662,6 +1700,25 @@ NTSTATUS WINAPI NtResumeProcess( HANDLE handle )
     {
         req->handle = wine_server_obj_handle( handle );
         ret = wine_server_call( req );
+    }
+    SERVER_END_REQ;
+    return ret;
+}
+
+
+/***********************************************************************
+ *           __wine_make_process_system   (NTDLL.@)
+ *
+ * Mark the current process as a system process.
+ * Returns the event that is signaled when all non-system processes have exited.
+ */
+HANDLE CDECL __wine_make_process_system(void)
+{
+    HANDLE ret = 0;
+
+    SERVER_START_REQ( make_process_system )
+    {
+        if (!wine_server_call( req )) ret = wine_server_ptr_handle( reply->event );
     }
     SERVER_END_REQ;
     return ret;

@@ -593,7 +593,7 @@ BOOL WINAPI DECLSPEC_HOTPATCH FreeConsole(void)
  */
 BOOL WINAPI DECLSPEC_HOTPATCH GenerateConsoleCtrlEvent( DWORD event, DWORD group )
 {
-    BOOL ret;
+    struct condrv_ctrl_event ctrl_event;
 
     TRACE( "(%d, %x)\n", event, group );
 
@@ -603,14 +603,10 @@ BOOL WINAPI DECLSPEC_HOTPATCH GenerateConsoleCtrlEvent( DWORD event, DWORD group
 	return FALSE;
     }
 
-    SERVER_START_REQ( send_console_signal )
-    {
-        req->signal = event;
-        req->group_id = group;
-        ret = !wine_server_call_err( req );
-    }
-    SERVER_END_REQ;
-    return ret;
+    ctrl_event.event = event;
+    ctrl_event.group_id = group;
+    return console_ioctl( RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle,
+                          IOCTL_CONDRV_CTRL_EVENT, &ctrl_event, sizeof(ctrl_event), NULL, 0, NULL );
 }
 
 
@@ -1729,5 +1725,15 @@ HRESULT WINAPI ResizePseudoConsole( HPCON handle, COORD size )
 
 void init_console( void )
 {
+    RTL_USER_PROCESS_PARAMETERS *params = RtlGetCurrentPeb()->ProcessParameters;
+
+    if (params->ConsoleHandle == CONSOLE_HANDLE_ALLOC)
+    {
+        HMODULE mod = GetModuleHandleW( NULL );
+        params->ConsoleHandle = NULL;
+        if (RtlImageNtHeader( mod )->OptionalHeader.Subsystem == IMAGE_SUBSYSTEM_WINDOWS_CUI)
+            AllocConsole();
+    }
+
     RtlAddVectoredExceptionHandler( FALSE, handle_ctrl_c );
 }

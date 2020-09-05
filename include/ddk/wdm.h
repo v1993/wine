@@ -1836,12 +1836,25 @@ HANDLE    WINAPI PsGetProcessInheritedFromUniqueProcessId(PEPROCESS);
 BOOLEAN   WINAPI PsGetVersion(ULONG*,ULONG*,ULONG*,UNICODE_STRING*);
 NTSTATUS  WINAPI PsTerminateSystemThread(NTSTATUS);
 
+#if defined(__x86_64__) || defined(__i386__)
+NTSTATUS  WINAPI RtlCopyExtendedContext(CONTEXT_EX*,ULONG,CONTEXT_EX*);
+NTSTATUS  WINAPI RtlInitializeExtendedContext(void*,ULONG,CONTEXT_EX**);
+NTSTATUS  WINAPI RtlInitializeExtendedContext2(void*,ULONG,CONTEXT_EX**,ULONG64);
+ULONG64   WINAPI RtlGetEnabledExtendedFeatures(ULONG64);
+NTSTATUS  WINAPI RtlGetExtendedContextLength(ULONG,ULONG*);
+NTSTATUS  WINAPI RtlGetExtendedContextLength2(ULONG,ULONG*,ULONG64);
+void *    WINAPI RtlLocateLegacyContext(CONTEXT_EX*,ULONG*);
+void *    WINAPI RtlLocateExtendedFeature(CONTEXT_EX*,ULONG,ULONG*);
+void *    WINAPI RtlLocateExtendedFeature2(CONTEXT_EX*,ULONG,XSTATE_CONFIGURATION*,ULONG*);
+ULONG64   WINAPI RtlGetExtendedFeaturesMask(CONTEXT_EX*);
+void      WINAPI RtlSetExtendedFeaturesMask(CONTEXT_EX*,ULONG64);
+#endif
+
 #ifdef __x86_64__
 void      WINAPI RtlCopyMemoryNonTemporal(void*,const void*,SIZE_T);
 #else
 #define RtlCopyMemoryNonTemporal RtlCopyMemory
 #endif
-ULONG64   WINAPI RtlGetEnabledExtendedFeatures(ULONG64);
 BOOLEAN   WINAPI RtlIsNtDdiVersionAvailable(ULONG);
 
 NTSTATUS  WINAPI ZwAddBootEntry(PUNICODE_STRING,PUNICODE_STRING);

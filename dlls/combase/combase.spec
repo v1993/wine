@@ -73,7 +73,7 @@
 @ stub CleanupOleStateInAllTls
 @ stdcall CleanupTlsOleState(ptr)
 @ stub ClearCleanupFlag
-@ stdcall CoAddRefServerProcess() ole32.CoAddRefServerProcess
+@ stdcall CoAddRefServerProcess()
 @ stub CoAllowUnmarshalerCLSID
 @ stub CoCancelCall
 @ stdcall CoCopyProxy(ptr ptr)
@@ -86,22 +86,22 @@
 @ stub CoCreateObjectInContext
 @ stub CoDeactivateObject
 @ stub CoDecodeProxy
-@ stdcall CoDecrementMTAUsage(ptr) ole32.CoDecrementMTAUsage
-@ stdcall CoDisableCallCancellation(ptr) ole32.CoDisableCallCancellation
+@ stdcall CoDecrementMTAUsage(ptr)
+@ stdcall CoDisableCallCancellation(ptr)
 @ stub CoDisconnectContext
-@ stdcall CoDisconnectObject(ptr long) ole32.CoDisconnectObject
-@ stdcall CoEnableCallCancellation(ptr) ole32.CoEnableCallCancellation
+@ stdcall CoDisconnectObject(ptr long)
+@ stdcall CoEnableCallCancellation(ptr)
 @ stdcall CoFileTimeNow(ptr)
 @ stdcall CoFreeUnusedLibraries()
-@ stdcall CoFreeUnusedLibrariesEx(long long) ole32.CoFreeUnusedLibrariesEx
+@ stdcall CoFreeUnusedLibrariesEx(long long)
 @ stdcall CoGetActivationState(int128 long ptr)
 @ stub CoGetApartmentID
-@ stdcall CoGetApartmentType(ptr ptr) ole32.CoGetApartmentType
+@ stdcall CoGetApartmentType(ptr ptr)
 @ stdcall CoGetCallContext(ptr ptr)
 @ stdcall CoGetCallState(long ptr)
-@ stdcall CoGetCallerTID(ptr) ole32.CoGetCallerTID
+@ stdcall CoGetCallerTID(ptr)
 @ stub CoGetCancelObject
-@ stdcall CoGetClassObject(ptr long ptr ptr ptr) ole32.CoGetClassObject
+@ stdcall CoGetClassObject(ptr long ptr ptr ptr)
 @ stub CoGetClassVersion
 @ stdcall CoGetContextToken(ptr)
 @ stdcall CoGetCurrentLogicalThreadId(ptr)
@@ -117,18 +117,18 @@
 @ stdcall CoGetObjectContext(ptr ptr)
 @ stdcall CoGetPSClsid(ptr ptr)
 @ stub CoGetProcessIdentifier
-@ stdcall CoGetStandardMarshal(ptr ptr long ptr long ptr) ole32.CoGetStandardMarshal
+@ stdcall CoGetStandardMarshal(ptr ptr long ptr long ptr)
 @ stub CoGetStdMarshalEx
 @ stub CoGetSystemSecurityPermissions
 @ stdcall CoGetTreatAsClass(ptr ptr)
 @ stdcall CoImpersonateClient()
-@ stdcall CoIncrementMTAUsage(ptr) ole32.CoIncrementMTAUsage
-@ stdcall CoInitializeEx(ptr long) ole32.CoInitializeEx
+@ stdcall CoIncrementMTAUsage(ptr)
+@ stdcall CoInitializeEx(ptr long)
 @ stdcall CoInitializeSecurity(ptr long ptr ptr long long ptr long ptr)
-@ stdcall CoInitializeWOW(long long) ole32.CoInitializeWOW
+@ stdcall CoInitializeWOW(long long)
 @ stub CoInvalidateRemoteMachineBindings
-@ stdcall CoIsHandlerConnected(ptr) ole32.CoIsHandlerConnected
-@ stdcall CoLockObjectExternal(ptr long long) ole32.CoLockObjectExternal
+@ stdcall CoIsHandlerConnected(ptr)
+@ stdcall CoLockObjectExternal(ptr long long)
 @ stdcall CoMarshalHresult(ptr long)
 @ stdcall CoMarshalInterThreadInterfaceInStream(ptr ptr ptr)
 @ stdcall CoMarshalInterface(ptr ptr ptr long ptr long)
@@ -139,43 +139,44 @@
 @ stdcall CoQueryProxyBlanket(ptr ptr ptr ptr ptr ptr ptr ptr)
 @ stub CoReactivateObject
 @ stub CoRegisterActivationFilter
-@ stdcall CoRegisterClassObject(ptr ptr long long ptr) ole32.CoRegisterClassObject
+@ stdcall CoRegisterChannelHook(ptr ptr)
+@ stdcall CoRegisterClassObject(ptr ptr long long ptr)
 @ stdcall CoRegisterInitializeSpy(ptr ptr)
 @ stdcall CoRegisterMallocSpy(ptr)
 @ stdcall CoRegisterMessageFilter(ptr ptr)
 @ stdcall CoRegisterPSClsid(ptr ptr)
-@ stdcall CoRegisterSurrogate(ptr) ole32.CoRegisterSurrogate
-@ stdcall CoRegisterSurrogateEx(ptr ptr) ole32.CoRegisterSurrogateEx
-@ stdcall CoReleaseMarshalData(ptr) ole32.CoReleaseMarshalData
-@ stdcall CoReleaseServerProcess() ole32.CoReleaseServerProcess
-@ stdcall CoResumeClassObjects() ole32.CoResumeClassObjects
+@ stdcall CoRegisterSurrogate(ptr)
+@ stdcall CoRegisterSurrogateEx(ptr ptr)
+@ stdcall CoReleaseMarshalData(ptr)
+@ stdcall CoReleaseServerProcess()
+@ stdcall CoResumeClassObjects()
 @ stub CoRetireServer
 @ stdcall CoRevertToSelf()
-@ stdcall CoRevokeClassObject(long) ole32.CoRevokeClassObject
+@ stdcall CoRevokeClassObject(long)
 @ stdcall CoRevokeInitializeSpy(int64)
 @ stdcall CoRevokeMallocSpy()
 @ stub CoSetCancelObject
 @ stdcall CoSetErrorInfo(long ptr) SetErrorInfo
 @ stdcall CoSetProxyBlanket(ptr long long ptr long long ptr long)
-@ stdcall CoSuspendClassObjects() ole32.CoSuspendClassObjects
+@ stdcall CoSuspendClassObjects()
 @ stdcall CoSwitchCallContext(ptr ptr)
 @ stdcall CoTaskMemAlloc(long)
 @ stdcall CoTaskMemFree(ptr)
 @ stdcall CoTaskMemRealloc(ptr long)
 @ stub CoTestCancel
-@ stdcall CoUninitialize() ole32.CoUninitialize
+@ stdcall CoUninitialize()
 @ stub CoUnloadingWOW
 @ stdcall CoUnmarshalHresult(ptr ptr)
-@ stdcall CoUnmarshalInterface(ptr ptr ptr) ole32.CoUnmarshalInterface
+@ stdcall CoUnmarshalInterface(ptr ptr ptr)
 @ stub CoVrfCheckThreadState
 @ stub CoVrfGetThreadState
 @ stub CoVrfReleaseThreadState
 @ stdcall CoWaitForMultipleHandles(long long long ptr ptr)
 @ stub CoWaitForMultipleObjects
 @ stdcall CreateErrorInfo(ptr)
-@ stdcall CreateStreamOnHGlobal(ptr long ptr) ole32.CreateStreamOnHGlobal
+@ stdcall CreateStreamOnHGlobal(ptr long ptr)
 @ stub DcomChannelSetHResult
-@ stdcall DllDebugObjectRPCHook(long ptr) ole32.DllDebugObjectRPCHook
+@ stdcall DllDebugObjectRPCHook(long ptr)
 @ stdcall DllGetActivationFactory(ptr ptr)
 @ stdcall -private DllGetClassObject(ptr ptr ptr) ole32.DllGetClassObject
 @ stub EnableHookObject
@@ -184,7 +185,7 @@
 @ stub GetCatalogHelper
 @ stdcall GetErrorInfo(long ptr)
 @ stub GetFuncDescs
-@ stdcall GetHGlobalFromStream(ptr ptr) ole32.GetHGlobalFromStream
+@ stdcall GetHGlobalFromStream(ptr ptr)
 @ stub GetHookInterface
 @ stdcall GetRestrictedErrorInfo(ptr)
 @ stdcall HACCEL_UserFree(ptr ptr)
@@ -246,7 +247,7 @@
 @ stub InternalCoIsSurrogateProcess
 @ stub InternalCoRegisterDisconnectCallback
 @ stub InternalCoRegisterSurrogatedObject
-@ stub InternalCoStdMarshalObject
+@ stdcall InternalCoStdMarshalObject(ptr long ptr ptr)
 @ stub InternalCoUnregisterDisconnectCallback
 @ stub InternalCompleteObjRef
 @ stub InternalCreateCAggId
@@ -255,20 +256,19 @@
 @ stub InternalFillLocalOXIDInfo
 @ stub InternalFreeObjRef
 @ stub InternalGetWindowPropInterface
-@ stub InternalIrotEnumRunning
-@ stub InternalIrotGetObject
-@ stub InternalIrotGetTimeOfLastChange
-@ stub InternalIrotIsRunning
-@ stub InternalIrotNoteChangeTime
-@ stub InternalIrotRegister
-@ stub InternalIrotRevoke
+@ stdcall InternalIrotEnumRunning(ptr)
+@ stdcall InternalIrotGetObject(ptr ptr ptr)
+@ stdcall InternalIrotGetTimeOfLastChange(ptr ptr)
+@ stdcall InternalIrotIsRunning(ptr)
+@ stdcall InternalIrotNoteChangeTime(long ptr)
+@ stdcall InternalIrotRegister(ptr ptr ptr ptr long ptr ptr)
+@ stdcall InternalIrotRevoke(long ptr ptr ptr)
 @ stub InternalIsApartmentInitialized
-@ stub InternalIsProcessInitialized
+@ stdcall InternalIsProcessInitialized()
 @ stub InternalMarshalObjRef
 @ stub InternalNotifyDDStartOrStop
 @ stub InternalOleModalLoopBlockFn
 @ stub InternalRegisterWindowPropInterface
-@ stdcall InternalRevokeAllPSClsids()
 @ stub InternalReleaseMarshalObjRef
 @ stub InternalSTAInvoke
 @ stub InternalServerExceptionFilter

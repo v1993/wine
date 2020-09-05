@@ -59,7 +59,6 @@
 #include "windef.h"
 #include "winnt.h"
 #include "winternl.h"
-#include "wine/library.h"
 #include "wine/exception.h"
 #include "wine/list.h"
 #include "wine/rbtree.h"
@@ -91,6 +90,8 @@ struct file_view
     size_t        size;          /* size in bytes */
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
 };
+
+#define __EXCEPT_SYSCALL __EXCEPT_HANDLER(0)
 
 /* per-page protection flags */
 #define VPROT_READ       0x01
@@ -171,12 +172,6 @@ static struct list teb_list = LIST_INIT( teb_list );
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
 #endif
-#ifndef MAP_TRYFIXED
-#define MAP_TRYFIXED 0
-#endif
-#ifndef MAP_FIXED_NOREPLACE
-#define MAP_FIXED_NOREPLACE 0
-#endif
 
 #ifdef _WIN64  /* on 64-bit the page protection bytes use a 2-level table */
 static const size_t pages_vprot_shift = 20;
@@ -209,6 +204,217 @@ static inline BOOL is_inside_signal_stack( void *ptr )
             (char *)ptr < (char *)get_signal_stack() + signal_stack_size);
 }
 
+static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *limit )
+{
+    return (addr >= limit || (const char *)addr + size > (const char *)limit);
+}
+
+/* mmap() anonymous memory at a fixed address */
+void *anon_mmap_fixed( void *start, size_t size, int prot, int flags )
+{
+    return mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | MAP_FIXED | flags, -1, 0 );
+}
+
+/* allocate anonymous mmap() memory at any address */
+void *anon_mmap_alloc( size_t size, int prot )
+{
+    return mmap( NULL, size, prot, MAP_PRIVATE | MAP_ANON, -1, 0 );
+}
+
+
+static void mmap_add_reserved_area( void *addr, SIZE_T size )
+{
+    struct reserved_area *area;
+    struct list *ptr;
+
+    if (!((char *)addr + size)) size--;  /* avoid wrap-around */
+
+    LIST_FOR_EACH( ptr, &reserved_areas )
+    {
+        area = LIST_ENTRY( ptr, struct reserved_area, entry );
+        if (area->base > addr)
+        {
+            /* try to merge with the next one */
+            if ((char *)addr + size == (char *)area->base)
+            {
+                area->base = addr;
+                area->size += size;
+                return;
+            }
+            break;
+        }
+        else if ((char *)area->base + area->size == (char *)addr)
+        {
+            /* merge with the previous one */
+            area->size += size;
+
+            /* try to merge with the next one too */
+            if ((ptr = list_next( &reserved_areas, ptr )))
+            {
+                struct reserved_area *next = LIST_ENTRY( ptr, struct reserved_area, entry );
+                if ((char *)addr + size == (char *)next->base)
+                {
+                    area->size += next->size;
+                    list_remove( &next->entry );
+                    free( next );
+                }
+            }
+            return;
+        }
+    }
+
+    if ((area = malloc( sizeof(*area) )))
+    {
+        area->base = addr;
+        area->size = size;
+        list_add_before( ptr, &area->entry );
+    }
+}
+
+static void mmap_remove_reserved_area( void *addr, SIZE_T size )
+{
+    struct reserved_area *area;
+    struct list *ptr;
+
+    if (!((char *)addr + size)) size--;  /* avoid wrap-around */
+
+    ptr = list_head( &reserved_areas );
+    /* find the first area covering address */
+    while (ptr)
+    {
+        area = LIST_ENTRY( ptr, struct reserved_area, entry );
+        if ((char *)area->base >= (char *)addr + size) break;  /* outside the range */
+        if ((char *)area->base + area->size > (char *)addr)  /* overlaps range */
+        {
+            if (area->base >= addr)
+            {
+                if ((char *)area->base + area->size > (char *)addr + size)
+                {
+                    /* range overlaps beginning of area only -> shrink area */
+                    area->size -= (char *)addr + size - (char *)area->base;
+                    area->base = (char *)addr + size;
+                    break;
+                }
+                else
+                {
+                    /* range contains the whole area -> remove area completely */
+                    ptr = list_next( &reserved_areas, ptr );
+                    list_remove( &area->entry );
+                    free( area );
+                    continue;
+                }
+            }
+            else
+            {
+                if ((char *)area->base + area->size > (char *)addr + size)
+                {
+                    /* range is in the middle of area -> split area in two */
+                    struct reserved_area *new_area = malloc( sizeof(*new_area) );
+                    if (new_area)
+                    {
+                        new_area->base = (char *)addr + size;
+                        new_area->size = (char *)area->base + area->size - (char *)new_area->base;
+                        list_add_after( ptr, &new_area->entry );
+                    }
+                    else size = (char *)area->base + area->size - (char *)addr;
+                    area->size = (char *)addr - (char *)area->base;
+                    break;
+                }
+                else
+                {
+                    /* range overlaps end of area only -> shrink area */
+                    area->size = (char *)addr - (char *)area->base;
+                }
+            }
+        }
+        ptr = list_next( &reserved_areas, ptr );
+    }
+}
+
+static int mmap_is_in_reserved_area( void *addr, SIZE_T size )
+{
+    struct reserved_area *area;
+    struct list *ptr;
+
+    LIST_FOR_EACH( ptr, &reserved_areas )
+    {
+        area = LIST_ENTRY( ptr, struct reserved_area, entry );
+        if (area->base > addr) break;
+        if ((char *)area->base + area->size <= (char *)addr) continue;
+        /* area must contain block completely */
+        if ((char *)area->base + area->size < (char *)addr + size) return -1;
+        return 1;
+    }
+    return 0;
+}
+
+static int mmap_enum_reserved_areas( int (CDECL *enum_func)(void *base, SIZE_T size, void *arg),
+                                     void *arg, int top_down )
+{
+    int ret = 0;
+    struct list *ptr;
+
+    if (top_down)
+    {
+        for (ptr = reserved_areas.prev; ptr != &reserved_areas; ptr = ptr->prev)
+        {
+            struct reserved_area *area = LIST_ENTRY( ptr, struct reserved_area, entry );
+            if ((ret = enum_func( area->base, area->size, arg ))) break;
+        }
+    }
+    else
+    {
+        for (ptr = reserved_areas.next; ptr != &reserved_areas; ptr = ptr->next)
+        {
+            struct reserved_area *area = LIST_ENTRY( ptr, struct reserved_area, entry );
+            if ((ret = enum_func( area->base, area->size, arg ))) break;
+        }
+    }
+    return ret;
+}
+
+static void *anon_mmap_tryfixed( void *start, size_t size, int prot, int flags )
+{
+    void *ptr;
+
+#ifdef MAP_FIXED_NOREPLACE
+    ptr = mmap( start, size, prot, MAP_FIXED_NOREPLACE | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
+#elif defined(MAP_TRYFIXED)
+    ptr = mmap( start, size, prot, MAP_TRYFIXED | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+    ptr = mmap( start, size, prot, MAP_FIXED | MAP_EXCL | MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
+    if (ptr == MAP_FAILED && errno == EINVAL) errno = EEXIST;
+#elif defined(__APPLE__)
+    mach_vm_address_t result = (mach_vm_address_t)start;
+    kern_return_t ret = mach_vm_map( mach_task_self(), &result, size, 0, VM_FLAGS_FIXED,
+                                     MEMORY_OBJECT_NULL, 0, 0, prot, VM_PROT_ALL, VM_INHERIT_COPY );
+
+    if (!ret)
+    {
+        if ((ptr = anon_mmap_fixed( start, size, prot, flags )) == MAP_FAILED)
+            mach_vm_deallocate( mach_task_self(), result, size );
+    }
+    else
+    {
+        errno = (ret == KERN_NO_SPACE ? EEXIST : ENOMEM);
+        ptr = MAP_FAILED;
+    }
+#else
+    ptr = mmap( start, size, prot, MAP_PRIVATE | MAP_ANON | flags, -1, 0 );
+#endif
+    if (ptr != MAP_FAILED && ptr != start)
+    {
+        if (is_beyond_limit( ptr, size, user_space_limit ))
+        {
+            anon_mmap_fixed( ptr, size, PROT_NONE, MAP_NORESERVE );
+            mmap_add_reserved_area( ptr, size );
+        }
+        else munmap( ptr, size );
+        ptr = MAP_FAILED;
+        errno = EEXIST;
+    }
+    return ptr;
+}
 
 static void reserve_area( void *addr, void *end )
 {
@@ -266,23 +472,15 @@ static void reserve_area( void *addr, void *end )
     }
 #else
     void *ptr;
-    int flags = MAP_PRIVATE | MAP_ANON | MAP_NORESERVE | MAP_TRYFIXED;
     size_t size = (char *)end - (char *)addr;
 
     if (!size) return;
 
-#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
-    ptr = mmap( addr, size, PROT_NONE, flags | MAP_FIXED | MAP_EXCL, -1, 0 );
-#else
-    ptr = mmap( addr, size, PROT_NONE, flags, -1, 0 );
-#endif
-    if (ptr == addr)
+    if ((ptr = anon_mmap_tryfixed( addr, size, PROT_NONE, MAP_NORESERVE )) != MAP_FAILED)
     {
         mmap_add_reserved_area( addr, size );
         return;
     }
-    if (ptr != (void *)-1) munmap( ptr, size );
-
     size = (size / 2) & ~granularity_mask;
     if (size)
     {
@@ -348,158 +546,6 @@ static void mmap_init( const struct preload_info *preload_info )
 
 #endif
 }
-
-void CDECL mmap_add_reserved_area( void *addr, SIZE_T size )
-{
-    struct reserved_area *area;
-    struct list *ptr;
-
-    if (!((char *)addr + size)) size--;  /* avoid wrap-around */
-
-    LIST_FOR_EACH( ptr, &reserved_areas )
-    {
-        area = LIST_ENTRY( ptr, struct reserved_area, entry );
-        if (area->base > addr)
-        {
-            /* try to merge with the next one */
-            if ((char *)addr + size == (char *)area->base)
-            {
-                area->base = addr;
-                area->size += size;
-                return;
-            }
-            break;
-        }
-        else if ((char *)area->base + area->size == (char *)addr)
-        {
-            /* merge with the previous one */
-            area->size += size;
-
-            /* try to merge with the next one too */
-            if ((ptr = list_next( &reserved_areas, ptr )))
-            {
-                struct reserved_area *next = LIST_ENTRY( ptr, struct reserved_area, entry );
-                if ((char *)addr + size == (char *)next->base)
-                {
-                    area->size += next->size;
-                    list_remove( &next->entry );
-                    free( next );
-                }
-            }
-            return;
-        }
-    }
-
-    if ((area = malloc( sizeof(*area) )))
-    {
-        area->base = addr;
-        area->size = size;
-        list_add_before( ptr, &area->entry );
-    }
-}
-
-void CDECL mmap_remove_reserved_area( void *addr, SIZE_T size )
-{
-    struct reserved_area *area;
-    struct list *ptr;
-
-    if (!((char *)addr + size)) size--;  /* avoid wrap-around */
-
-    ptr = list_head( &reserved_areas );
-    /* find the first area covering address */
-    while (ptr)
-    {
-        area = LIST_ENTRY( ptr, struct reserved_area, entry );
-        if ((char *)area->base >= (char *)addr + size) break;  /* outside the range */
-        if ((char *)area->base + area->size > (char *)addr)  /* overlaps range */
-        {
-            if (area->base >= addr)
-            {
-                if ((char *)area->base + area->size > (char *)addr + size)
-                {
-                    /* range overlaps beginning of area only -> shrink area */
-                    area->size -= (char *)addr + size - (char *)area->base;
-                    area->base = (char *)addr + size;
-                    break;
-                }
-                else
-                {
-                    /* range contains the whole area -> remove area completely */
-                    ptr = list_next( &reserved_areas, ptr );
-                    list_remove( &area->entry );
-                    free( area );
-                    continue;
-                }
-            }
-            else
-            {
-                if ((char *)area->base + area->size > (char *)addr + size)
-                {
-                    /* range is in the middle of area -> split area in two */
-                    struct reserved_area *new_area = malloc( sizeof(*new_area) );
-                    if (new_area)
-                    {
-                        new_area->base = (char *)addr + size;
-                        new_area->size = (char *)area->base + area->size - (char *)new_area->base;
-                        list_add_after( ptr, &new_area->entry );
-                    }
-                    else size = (char *)area->base + area->size - (char *)addr;
-                    area->size = (char *)addr - (char *)area->base;
-                    break;
-                }
-                else
-                {
-                    /* range overlaps end of area only -> shrink area */
-                    area->size = (char *)addr - (char *)area->base;
-                }
-            }
-        }
-        ptr = list_next( &reserved_areas, ptr );
-    }
-}
-
-int CDECL mmap_is_in_reserved_area( void *addr, SIZE_T size )
-{
-    struct reserved_area *area;
-    struct list *ptr;
-
-    LIST_FOR_EACH( ptr, &reserved_areas )
-    {
-        area = LIST_ENTRY( ptr, struct reserved_area, entry );
-        if (area->base > addr) break;
-        if ((char *)area->base + area->size <= (char *)addr) continue;
-        /* area must contain block completely */
-        if ((char *)area->base + area->size < (char *)addr + size) return -1;
-        return 1;
-    }
-    return 0;
-}
-
-int CDECL mmap_enum_reserved_areas( int (CDECL *enum_func)(void *base, SIZE_T size, void *arg),
-                                    void *arg, int top_down )
-{
-    int ret = 0;
-    struct list *ptr;
-
-    if (top_down)
-    {
-        for (ptr = reserved_areas.prev; ptr != &reserved_areas; ptr = ptr->prev)
-        {
-            struct reserved_area *area = LIST_ENTRY( ptr, struct reserved_area, entry );
-            if ((ret = enum_func( area->base, area->size, arg ))) break;
-        }
-    }
-    else
-    {
-        for (ptr = reserved_areas.next; ptr != &reserved_areas; ptr = ptr->next)
-        {
-            struct reserved_area *area = LIST_ENTRY( ptr, struct reserved_area, entry );
-            if ((ret = enum_func( area->base, area->size, arg ))) break;
-        }
-    }
-    return ret;
-}
-
 
 /***********************************************************************
  *           free_ranges_lower_bound
@@ -749,7 +795,7 @@ static BOOL alloc_pages_vprot( const void *addr, size_t size )
     for (i = idx >> pages_vprot_shift; i < (end + pages_vprot_mask) >> pages_vprot_shift; i++)
     {
         if (pages_vprot[i]) continue;
-        if ((ptr = wine_anon_mmap( NULL, pages_vprot_mask + 1, PROT_READ | PROT_WRITE, 0 )) == (void *)-1)
+        if ((ptr = anon_mmap_alloc( pages_vprot_mask + 1, PROT_READ | PROT_WRITE )) == MAP_FAILED)
             return FALSE;
         pages_vprot[i] = ptr;
     }
@@ -1014,20 +1060,14 @@ static void* try_map_free_area( void *base, void *end, ptrdiff_t step,
 
     while (start && base <= start && (char*)start + size <= (char*)end)
     {
-        if ((ptr = wine_anon_mmap( start, size, unix_prot, MAP_FIXED_NOREPLACE )) == start)
-            return start;
+        if ((ptr = anon_mmap_tryfixed( start, size, unix_prot, 0 )) != MAP_FAILED) return start;
         TRACE( "Found free area is already mapped, start %p.\n", start );
-
-        if (ptr == (void *)-1 && errno != EEXIST)
+        if (errno != EEXIST)
         {
-            ERR( "wine_anon_mmap() error %s, range %p-%p, unix_prot %#x.\n",
-                    strerror(errno), start, (char *)start + size, unix_prot );
+            ERR( "mmap() error %s, range %p-%p, unix_prot %#x.\n",
+                 strerror(errno), start, (char *)start + size, unix_prot );
             return NULL;
         }
-
-        if (ptr != (void *)-1)
-            munmap( ptr, size );
-
         if ((step > 0 && (char *)end - (char *)start < step) ||
             (step < 0 && (char *)start - (char *)base < -step) ||
             step == 0)
@@ -1161,7 +1201,7 @@ static void add_reserved_area( void *addr, size_t size )
         addr = user_space_limit;
     }
     /* blow away existing mappings */
-    wine_anon_mmap( addr, size, PROT_NONE, MAP_NORESERVE | MAP_FIXED );
+    anon_mmap_fixed( addr, size, PROT_NONE, MAP_NORESERVE );
     mmap_add_reserved_area( addr, size );
 }
 
@@ -1230,17 +1270,6 @@ static int CDECL get_area_boundary_callback( void *start, SIZE_T size, void *arg
 
 
 /***********************************************************************
- *           is_beyond_limit
- *
- * Check if an address range goes beyond a given limit.
- */
-static inline BOOL is_beyond_limit( const void *addr, size_t size, const void *limit )
-{
-    return (addr >= limit || (const char *)addr + size > (const char *)limit);
-}
-
-
-/***********************************************************************
  *           unmap_area
  *
  * Unmap an area, or simply replace it by an empty mapping if it is
@@ -1264,7 +1293,7 @@ static inline void unmap_area( void *addr, size_t size )
         break;
     }
     case 1:  /* in a reserved area */
-        wine_anon_mmap( addr, size, PROT_NONE, MAP_NORESERVE | MAP_FIXED );
+        anon_mmap_fixed( addr, size, PROT_NONE, MAP_NORESERVE );
         break;
     default:
     case 0:  /* not in a reserved area */
@@ -1292,8 +1321,8 @@ static struct file_view *alloc_view(void)
     }
     if (view_block_start == view_block_end)
     {
-        void *ptr = wine_anon_mmap( NULL, view_block_size, PROT_READ | PROT_WRITE, 0 );
-        if (ptr == (void *)-1) return NULL;
+        void *ptr = anon_mmap_alloc( view_block_size, PROT_READ | PROT_WRITE );
+        if (ptr == MAP_FAILED) return NULL;
         view_block_start = ptr;
         view_block_end = view_block_start + view_block_size / sizeof(*view_block_start);
     }
@@ -1664,17 +1693,11 @@ static NTSTATUS map_fixed_area( void *base, size_t size, unsigned int vprot )
         return status;
     }
     case 0:  /* not in a reserved area, do a normal allocation */
-        if ((ptr = wine_anon_mmap( base, size, get_unix_prot(vprot), 0 )) == (void *)-1)
+        if ((ptr = anon_mmap_tryfixed( base, size, get_unix_prot(vprot), 0 )) == MAP_FAILED)
         {
             if (errno == ENOMEM) return STATUS_NO_MEMORY;
+            if (errno == EEXIST) return STATUS_CONFLICTING_ADDRESSES;
             return STATUS_INVALID_PARAMETER;
-        }
-        if (ptr != base)
-        {
-            /* We couldn't get the address we wanted */
-            if (is_beyond_limit( ptr, size, user_space_limit )) add_reserved_area( ptr, size );
-            else munmap( ptr, size );
-            return STATUS_CONFLICTING_ADDRESSES;
         }
         break;
 
@@ -1682,7 +1705,7 @@ static NTSTATUS map_fixed_area( void *base, size_t size, unsigned int vprot )
     case 1:  /* in a reserved area, make sure the address is available */
         if (find_view_range( base, size )) return STATUS_CONFLICTING_ADDRESSES;
         /* replace the reserved area by our mapping */
-        if ((ptr = wine_anon_mmap( base, size, get_unix_prot(vprot), MAP_FIXED )) != base)
+        if ((ptr = anon_mmap_fixed( base, size, get_unix_prot(vprot), 0 )) != base)
             return STATUS_INVALID_PARAMETER;
         break;
     }
@@ -1723,7 +1746,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
         {
             ptr = alloc.result;
             TRACE( "got mem in reserved area %p-%p\n", ptr, (char *)ptr + size );
-            if (wine_anon_mmap( ptr, size, get_unix_prot(vprot), MAP_FIXED ) != ptr)
+            if (anon_mmap_fixed( ptr, size, get_unix_prot(vprot), 0 ) != ptr)
                 return STATUS_INVALID_PARAMETER;
             goto done;
         }
@@ -1739,7 +1762,7 @@ static NTSTATUS map_view( struct file_view **view_ret, void *base, size_t size,
 
         for (;;)
         {
-            if ((ptr = wine_anon_mmap( NULL, view_size, get_unix_prot(vprot), 0 )) == (void *)-1)
+            if ((ptr = anon_mmap_alloc( view_size, get_unix_prot(vprot) )) == MAP_FAILED)
             {
                 if (errno == ENOMEM) return STATUS_NO_MEMORY;
                 return STATUS_INVALID_PARAMETER;
@@ -1815,8 +1838,8 @@ static NTSTATUS map_file_into_view( struct file_view *view, int fd, size_t start
     }
 
     /* Reserve the memory with an anonymous mmap */
-    ptr = wine_anon_mmap( (char *)view->base + start, size, PROT_READ | PROT_WRITE, MAP_FIXED );
-    if (ptr == (void *)-1) return STATUS_NO_MEMORY;
+    ptr = anon_mmap_fixed( (char *)view->base + start, size, PROT_READ | PROT_WRITE, 0 );
+    if (ptr == MAP_FAILED) return STATUS_NO_MEMORY;
     /* Now read in the file */
     pread( fd, ptr, size, offset );
     if (prot != (PROT_READ|PROT_WRITE)) mprotect( ptr, size, prot );  /* Set the right protection */
@@ -1873,7 +1896,7 @@ static SIZE_T get_committed_size( struct file_view *view, void *base, BYTE *vpro
  */
 static NTSTATUS decommit_pages( struct file_view *view, size_t start, size_t size )
 {
-    if (wine_anon_mmap( (char *)view->base + start, size, PROT_NONE, MAP_FIXED ) != (void *)-1)
+    if (anon_mmap_fixed( (char *)view->base + start, size, PROT_NONE, 0 ) != MAP_FAILED)
     {
         set_page_vprot_bits( (char *)view->base + start, size, 0, VPROT_COMMITTED );
         return STATUS_SUCCESS;
@@ -1903,22 +1926,18 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
 
     if (mmap_is_in_reserved_area( low_64k, dosmem_size - 0x10000 ) != 1)
     {
-        addr = wine_anon_mmap( low_64k, dosmem_size - 0x10000, unix_prot, 0 );
-        if (addr != low_64k)
-        {
-            if (addr != (void *)-1) munmap( addr, dosmem_size - 0x10000 );
-            return map_view( view, NULL, dosmem_size, FALSE, vprot, 0 );
-        }
+        addr = anon_mmap_tryfixed( low_64k, dosmem_size - 0x10000, unix_prot, 0 );
+        if (addr == MAP_FAILED) return map_view( view, NULL, dosmem_size, FALSE, vprot, 0 );
     }
 
     /* now try to allocate the low 64K too */
 
     if (mmap_is_in_reserved_area( NULL, 0x10000 ) != 1)
     {
-        addr = wine_anon_mmap( (void *)page_size, 0x10000 - page_size, unix_prot, 0 );
-        if (addr == (void *)page_size)
+        addr = anon_mmap_tryfixed( (void *)page_size, 0x10000 - page_size, unix_prot, 0 );
+        if (addr != MAP_FAILED)
         {
-            if (!wine_anon_mmap( NULL, page_size, unix_prot, MAP_FIXED ))
+            if (!anon_mmap_fixed( NULL, page_size, unix_prot, 0 ))
             {
                 addr = NULL;
                 TRACE( "successfully mapped low 64K range\n" );
@@ -1927,7 +1946,6 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
         }
         else
         {
-            if (addr != (void *)-1) munmap( addr, 0x10000 - page_size );
             addr = low_64k;
             TRACE( "failed to map low 64K range\n" );
         }
@@ -1936,7 +1954,7 @@ static NTSTATUS allocate_dos_memory( struct file_view **view, unsigned int vprot
     /* now reserve the whole range */
 
     size = (char *)dosmem_size - (char *)addr;
-    wine_anon_mmap( addr, size, unix_prot, MAP_FIXED );
+    anon_mmap_fixed( addr, size, unix_prot, 0 );
     return create_view( view, addr, size, vprot );
 }
 
@@ -2179,9 +2197,9 @@ static NTSTATUS map_image_into_view( struct file_view *view, int fd, void *orig_
  *
  * Map a file section into memory.
  */
-NTSTATUS CDECL virtual_map_section( HANDLE handle, PVOID *addr_ptr, unsigned short zero_bits_64, SIZE_T commit_size,
-                              const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr, ULONG alloc_type,
-                              ULONG protect, pe_image_info_t *image_info )
+static NTSTATUS virtual_map_section( HANDLE handle, PVOID *addr_ptr, unsigned short zero_bits_64,
+                                     SIZE_T commit_size, const LARGE_INTEGER *offset_ptr, SIZE_T *size_ptr,
+                                     ULONG alloc_type, ULONG protect, pe_image_info_t *image_info )
 {
     NTSTATUS res;
     mem_size_t full_size;
@@ -2348,9 +2366,8 @@ static int CDECL alloc_virtual_heap( void *base, SIZE_T size, void *arg )
     if (is_beyond_limit( base, size, address_space_limit )) address_space_limit = (char *)base + size;
     if (size < alloc->size) return 0;
     if (is_win64 && base < (void *)0x80000000) return 0;
-    alloc->base = wine_anon_mmap( (char *)base + size - alloc->size, alloc->size,
-                                  PROT_READ|PROT_WRITE, MAP_FIXED );
-    return (alloc->base != (void *)-1);
+    alloc->base = anon_mmap_fixed( (char *)base + size - alloc->size, alloc->size, PROT_READ|PROT_WRITE, 0 );
+    return (alloc->base != MAP_FAILED);
 }
 
 /***********************************************************************
@@ -2399,9 +2416,9 @@ void virtual_init(void)
     if (mmap_enum_reserved_areas( alloc_virtual_heap, &alloc_views, 1 ))
         mmap_remove_reserved_area( alloc_views.base, alloc_views.size );
     else
-        alloc_views.base = wine_anon_mmap( NULL, alloc_views.size, PROT_READ | PROT_WRITE, 0 );
+        alloc_views.base = anon_mmap_alloc( alloc_views.size, PROT_READ | PROT_WRITE );
 
-    assert( alloc_views.base != (void *)-1 );
+    assert( alloc_views.base != MAP_FAILED );
     view_block_start = alloc_views.base;
     view_block_end = view_block_start + view_block_size / sizeof(*view_block_start);
     free_ranges = (void *)((char *)alloc_views.base + view_block_size);
@@ -2415,7 +2432,7 @@ void virtual_init(void)
     /* make the DOS area accessible (except the low 64K) to hide bugs in broken apps like Excel 2003 */
     size = (char *)address_space_start - (char *)0x10000;
     if (size && mmap_is_in_reserved_area( (void*)0x10000, size ) == 1)
-        wine_anon_mmap( (void *)0x10000, size, PROT_READ | PROT_WRITE, MAP_FIXED );
+        anon_mmap_fixed( (void *)0x10000, size, PROT_READ | PROT_WRITE, 0 );
 }
 
 
@@ -3070,9 +3087,9 @@ ssize_t virtual_locked_pread( int fd, void *addr, size_t size, off_t offset )
 
 
 /***********************************************************************
- *           virtual_locked_recvmsg
+ *           __wine_locked_recvmsg   (NTDLL.@)
  */
-ssize_t CDECL virtual_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
+ssize_t CDECL __wine_locked_recvmsg( int fd, struct msghdr *hdr, int flags )
 {
     sigset_t sigset;
     size_t i;
@@ -3142,7 +3159,7 @@ BOOL virtual_check_buffer_for_read( const void *ptr, SIZE_T size )
         dummy = p[0];
         dummy = p[count - 1];
     }
-    __EXCEPT_PAGE_FAULT
+    __EXCEPT_SYSCALL
     {
         return FALSE;
     }
@@ -3175,7 +3192,7 @@ BOOL virtual_check_buffer_for_write( void *ptr, SIZE_T size )
         p[0] |= 0;
         p[count - 1] |= 0;
     }
-    __EXCEPT_PAGE_FAULT
+    __EXCEPT_SYSCALL
     {
         return FALSE;
     }
@@ -3197,7 +3214,7 @@ BOOL WINAPI IsBadStringPtrA( LPCSTR str, UINT_PTR max )
         volatile const char *p = str;
         while (p != str + max) if (!*p++) break;
     }
-    __EXCEPT_PAGE_FAULT
+    __EXCEPT_SYSCALL
     {
         return TRUE;
     }
@@ -3219,7 +3236,7 @@ BOOL WINAPI IsBadStringPtrW( LPCWSTR str, UINT_PTR max )
         volatile const WCHAR *p = str;
         while (p != str + max) if (!*p++) break;
     }
-    __EXCEPT_PAGE_FAULT
+    __EXCEPT_SYSCALL
     {
         return TRUE;
     }
@@ -4161,7 +4178,7 @@ void virtual_fill_image_information( const pe_image_info_t *pe_info, SECTION_IMA
     info->DllCharacteristics   = pe_info->dll_charact;
     info->Machine              = pe_info->machine;
     info->ImageContainsCode    = pe_info->contains_code;
-    info->ImageFlags           = pe_info->image_flags & ~(IMAGE_FLAGS_WineBuiltin|IMAGE_FLAGS_WineFakeDll);
+    info->ImageFlags           = pe_info->image_flags;
     info->LoaderFlags          = pe_info->loader_flags;
     info->ImageFileSize        = pe_info->file_size;
     info->CheckSum             = pe_info->checksum;

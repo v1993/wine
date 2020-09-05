@@ -525,6 +525,7 @@
 @ stub RtlConvertUiListToApiList
 @ stdcall -arch=win32 -ret64 RtlConvertUlongToLargeInteger(long)
 # @ stub RtlConvertVariantToProperty
+@ stdcall RtlCopyExtendedContext(ptr long ptr)
 @ stdcall RtlCopyLuid(ptr ptr)
 @ stdcall RtlCopyLuidAndAttributesArray(long ptr ptr)
 @ stdcall -arch=x86_64 RtlCopyMemory(ptr ptr long)
@@ -695,6 +696,9 @@
 # @ stub RtlGetElementGenericTableAvl
 @ stdcall RtlGetEnabledExtendedFeatures(int64)
 @ stdcall RtlGetExePath(wstr ptr)
+@ stdcall RtlGetExtendedContextLength(long ptr)
+@ stdcall RtlGetExtendedContextLength2(long ptr int64)
+@ stdcall -ret64 RtlGetExtendedFeaturesMask(ptr)
 # @ stub RtlGetFirstRange
 @ stdcall RtlGetFrame()
 @ stdcall RtlGetFullPathName_U(wstr long ptr ptr)
@@ -755,6 +759,8 @@
 @ stdcall RtlInitializeCriticalSection(ptr)
 @ stdcall RtlInitializeCriticalSectionAndSpinCount(ptr long)
 @ stdcall RtlInitializeCriticalSectionEx(ptr long long)
+@ stdcall RtlInitializeExtendedContext(ptr long ptr)
+@ stdcall RtlInitializeExtendedContext2(ptr long ptr int64)
 @ stdcall RtlInitializeGenericTable(ptr ptr ptr ptr ptr)
 @ stdcall RtlInitializeGenericTableAvl(ptr ptr ptr ptr ptr)
 @ stdcall RtlInitializeHandleTable(long long ptr)
@@ -822,6 +828,9 @@
 @ stdcall RtlLengthSid(ptr)
 @ stdcall RtlLocalTimeToSystemTime(ptr ptr)
 @ stdcall RtlLocaleNameToLcid(wstr ptr long)
+@ stdcall RtlLocateExtendedFeature(ptr long ptr)
+@ stdcall RtlLocateExtendedFeature2(ptr long ptr ptr)
+@ stdcall RtlLocateLegacyContext(ptr ptr)
 # @ stub RtlLockBootStatusData
 @ stdcall RtlLockHeap(long)
 # @ stub RtlLockMemoryStreamRegion
@@ -939,6 +948,7 @@
 @ stdcall RtlSetCurrentTransaction(ptr)
 @ stdcall RtlSetDaclSecurityDescriptor(ptr long ptr long)
 @ stdcall RtlSetEnvironmentVariable(ptr ptr ptr)
+@ stdcall RtlSetExtendedFeaturesMask(ptr int64)
 @ stdcall RtlSetGroupSecurityDescriptor(ptr ptr long)
 @ stdcall RtlSetHeapInformation(long long ptr long)
 @ stub RtlSetInformationAcl
@@ -1581,12 +1591,12 @@
 # or 'wine_' (for user-visible functions) to avoid namespace conflicts.
 
 # Server interface
-@ cdecl -norelay wine_server_call(ptr)
-@ cdecl wine_server_fd_to_handle(long long long ptr)
-@ cdecl wine_server_handle_to_fd(long long ptr ptr)
-@ cdecl wine_server_release_fd(long long)
-@ cdecl wine_server_send_fd(long)
-@ cdecl __wine_make_process_system()
+@ cdecl -syscall -norelay wine_server_call(ptr)
+@ cdecl -syscall wine_server_fd_to_handle(long long long ptr)
+@ cdecl -syscall wine_server_handle_to_fd(long long ptr ptr)
+@ cdecl -syscall wine_server_release_fd(long long)
+@ cdecl -syscall wine_server_send_fd(long)
+@ cdecl -syscall __wine_make_process_system()
 @ cdecl __wine_set_unix_funcs(long ptr)
 @ extern __wine_syscall_dispatcher
 @ extern -arch=i386 __wine_ldt_copy
@@ -1598,16 +1608,16 @@
 @ cdecl -norelay __wine_dbg_strdup(str)
 
 # Virtual memory
-@ cdecl __wine_locked_recvmsg(long ptr long)
+@ cdecl -syscall __wine_locked_recvmsg(long ptr long)
 
 # Version
-@ cdecl wine_get_version()
-@ cdecl wine_get_build_id()
-@ cdecl wine_get_host_version(ptr ptr)
+@ cdecl -syscall wine_get_version()
+@ cdecl -syscall wine_get_build_id()
+@ cdecl -syscall wine_get_host_version(ptr ptr)
 
 # Codepages
 @ cdecl __wine_get_unix_codepage()
 
 # Filesystem
-@ cdecl wine_nt_to_unix_file_name(ptr ptr ptr long)
-@ cdecl wine_unix_to_nt_file_name(str ptr ptr)
+@ cdecl -syscall wine_nt_to_unix_file_name(ptr ptr ptr long)
+@ cdecl -syscall wine_unix_to_nt_file_name(str ptr ptr)

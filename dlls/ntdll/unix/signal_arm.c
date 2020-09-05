@@ -174,7 +174,7 @@ enum arm_trap_code
 
 struct syscall_frame
 {
-    struct syscall_frame *prev_frame;
+    DWORD                 pad;
     DWORD                 cpsr;
     DWORD                 r5;
     DWORD                 r6;
@@ -463,8 +463,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     ret = set_thread_context( handle, &server_context, &self );
     if (self && ret == STATUS_SUCCESS)
     {
-        struct syscall_frame *frame = arm_thread_data()->syscall_frame;
-        arm_thread_data()->syscall_frame = frame->prev_frame;
+        arm_thread_data()->syscall_frame = NULL;
         set_cpu_context( context );
     }
     return ret;
@@ -594,29 +593,27 @@ __ASM_GLOBAL_FUNC( call_user_apc_dispatcher,
                    "ldr r9, [sp, #4]\n\t"     /* dispatcher */
                    "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
                    "add r10, r0, #0x1d8\n\t"  /* arm_thread_data()->syscall_frame */
-                   "ldr r12, [r10]\n\t"
                    "movs r0, r4\n\t"
                    "beq 1f\n\t"
                    "ldr r0, [r0, #0x38]\n\t"  /* context_ptr->Sp */
                    "sub r0, r0, #0x1c8\n\t"   /* sizeof(CONTEXT) + offsetof(frame,r4) */
-                   "ldr r12, [r12]\n\t"       /* frame->prev_frame */
-                   "str r12, [r10]\n\t"
+                   "mov ip, #0\n\t"
+                   "str ip, [r10]\n\t"
                    "mov sp, r0\n\t"
                    "b 2f\n"
-                   "1:\tsub r11, r12, #0x1a0\n\t"
-                   "cmp r11, sp\n\t"
-                   "movlo sp, r11\n\t"
+                   "1:\tldr r0, [r10]\n\t"
+                   "sub sp, r0, #0x1a0\n\t"
                    "mov r0, #3\n\t"
                    "movt r0, #32\n\t"
-                   "str r0, [r11]\n\t"         /* context.ContextFlags = CONTEXT_FULL */
-                   "mov r1, r11\n\t"
+                   "str r0, [sp]\n\t"         /* context.ContextFlags = CONTEXT_FULL */
+                   "mov r1, sp\n\t"
                    "mov r0, #~1\n\t"
                    "bl " __ASM_NAME("NtGetContextThread") "\n\t"
                    "mov r0, #0xc0\n\t"
-                   "str r0, [r11, #4]\n\t"    /* context.R0 = STATUS_USER_APC */
-                   "mov r0, r11\n\t"
-                   "ldr r12, [r12]\n\t"       /* frame->prev_frame */
-                   "str r12, [r10]\n"
+                   "str r0, [sp, #4]\n\t"     /* context.R0 = STATUS_USER_APC */
+                   "mov r0, sp\n\t"
+                   "mov ip, #0\n\t"
+                   "str ip, [r10]\n\t"
                    "2:\tmov r1, r5\n\t"       /* ctx */
                    "mov r2, r6\n\t"           /* arg1 */
                    "mov r3, r7\n\t"           /* arg2 */
@@ -646,14 +643,72 @@ __ASM_GLOBAL_FUNC( call_user_exception_dispatcher,
                    "mov r1, r5\n\t"
                    "mov r2, r6\n\t"
                    "ldr r3, [r7]\n\t"
-                   "ldr r4, [r3]\n\t"        /* frame->prev_frame */
-                   "str r4, [r7]\n\t"
+                   "mov ip, #0\n\t"
+                   "str ip, [r7]\n\t"
                    "add r3, r3, #8\n\t"
                    "ldm r3, {r5-r11}\n\t"
                    "ldr r4, [r3, #32]\n\t"
                    "ldr lr, [r3, #36]\n\t"
                    "add sp, r3, #40\n\t"
                    "bx r2" )
+
+
+/***********************************************************************
+ *           handle_syscall_fault
+ *
+ * Handle a page fault happening during a system call.
+ */
+static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
+{
+    struct syscall_frame *frame = arm_thread_data()->syscall_frame;
+    __WINE_FRAME *wine_frame = (__WINE_FRAME *)NtCurrentTeb()->Tib.ExceptionList;
+    DWORD i;
+
+    if (!frame) return FALSE;
+
+    TRACE( "code=%x flags=%x addr=%p pc=%08x tid=%04x\n",
+           rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
+           (DWORD)PC_sig(context), GetCurrentThreadId() );
+    for (i = 0; i < rec->NumberParameters; i++)
+        TRACE( " info[%d]=%08lx\n", i, rec->ExceptionInformation[i] );
+
+    TRACE( " r0=%08x r1=%08x r2=%08x r3=%08x r4=%08x r5=%08x\n",
+           (DWORD)REGn_sig(0, context), (DWORD)REGn_sig(1, context), (DWORD)REGn_sig(2, context),
+           (DWORD)REGn_sig(3, context), (DWORD)REGn_sig(4, context), (DWORD)REGn_sig(5, context) );
+    TRACE( " r6=%08x r7=%08x r8=%08x r9=%08x r10=%08x r11=%08x\n",
+           (DWORD)REGn_sig(6, context), (DWORD)REGn_sig(7, context), (DWORD)REGn_sig(8, context),
+           (DWORD)REGn_sig(9, context), (DWORD)REGn_sig(10, context), (DWORD)FP_sig(context) );
+    TRACE( " r12=%08x sp=%08x lr=%08x pc=%08x cpsr=%08x\n",
+           (DWORD)IP_sig(context), (DWORD)SP_sig(context), (DWORD)LR_sig(context),
+           (DWORD)PC_sig(context), (DWORD)CPSR_sig(context) );
+
+    if ((char *)wine_frame < (char *)frame)
+    {
+        TRACE( "returning to handler\n" );
+        REGn_sig(0, context) = (DWORD)&wine_frame->jmp;
+        REGn_sig(1, context) = 1;
+        PC_sig(context)      = (DWORD)__wine_longjmp;
+    }
+    else
+    {
+        TRACE( "returning to user mode ip=%08x ret=%08x\n", frame->ret_addr, rec->ExceptionCode );
+        REGn_sig(0, context)  = rec->ExceptionCode;
+        REGn_sig(4, context)  = frame->r4;
+        REGn_sig(5, context)  = frame->r5;
+        REGn_sig(6, context)  = frame->r6;
+        REGn_sig(7, context)  = frame->r7;
+        REGn_sig(8, context)  = frame->r8;
+        REGn_sig(9, context)  = frame->r9;
+        REGn_sig(10, context) = frame->r10;
+        FP_sig(context)       = frame->r11;
+        LR_sig(context)       = frame->thunk_addr;
+        SP_sig(context)       = (DWORD)&frame->r4;
+        PC_sig(context)       = frame->thunk_addr;
+        CPSR_sig(context)     = frame->cpsr;
+        arm_thread_data()->syscall_frame = NULL;
+    }
+    return TRUE;
+}
 
 
 /**********************************************************************
@@ -693,6 +748,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
         rec.ExceptionCode = EXCEPTION_ILLEGAL_INSTRUCTION;
         break;
     }
+    if (handle_syscall_fault( context, &rec )) return;
     setup_exception( context, &rec );
 }
 
@@ -925,12 +981,12 @@ void signal_init_process(void)
 /***********************************************************************
  *           init_thread_context
  */
-static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry, void *arg, void *relay )
+static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 {
     context->R0 = (DWORD)entry;
     context->R1 = (DWORD)arg;
-    context->Sp = (DWORD)NtCurrentTeb()->Tib.StackBase;
-    context->Pc = (DWORD)relay;
+    context->Sp = (DWORD)teb->Tib.StackBase;
+    context->Pc = (DWORD)pRtlUserThreadStart;
 }
 
 
@@ -938,7 +994,7 @@ static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry,
  *           get_initial_context
  */
 PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void *arg,
-                                              BOOL suspend, void *relay )
+                                              BOOL suspend, TEB *teb )
 {
     CONTEXT *ctx;
 
@@ -946,15 +1002,15 @@ PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void
     {
         CONTEXT context = { CONTEXT_ALL };
 
-        init_thread_context( &context, entry, arg, relay );
+        init_thread_context( &context, entry, arg, teb );
         wait_suspend( &context );
         ctx = (CONTEXT *)((ULONG_PTR)context.Sp & ~15) - 1;
         *ctx = context;
     }
     else
     {
-        ctx = (CONTEXT *)NtCurrentTeb()->Tib.StackBase - 1;
-        init_thread_context( ctx, entry, arg, relay );
+        ctx = (CONTEXT *)teb->Tib.StackBase - 1;
+        init_thread_context( ctx, entry, arg, teb );
     }
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
     ctx->ContextFlags = CONTEXT_FULL;
@@ -968,16 +1024,15 @@ PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void
 __ASM_GLOBAL_FUNC( signal_start_thread,
                    ".arm\n\t"
                    "push {r4-r12,lr}\n\t"
-                   "ldr r5, [sp, #40]\n\t"    /* thunk */
+                   "mov r5, r3\n\t"           /* thunk */
                    /* store exit frame */
-                   "ldr r4, [sp, #44]\n\t"    /* teb */
-                   "str sp, [r4, #0x1d4]\n\t" /* teb->GdiTebBatch */
+                   "ldr r3, [sp, #40]\n\t"    /* teb */
+                   "str sp, [r3, #0x1d4]\n\t" /* arm_thread_data()->exit_frame */
                    /* switch to thread stack */
-                   "ldr r4, [r4, #4]\n\t"     /* teb->Tib.StackBase */
+                   "ldr r4, [r3, #4]\n\t"     /* teb->Tib.StackBase */
                    "sub sp, r4, #0x1000\n\t"
                    /* attach dlls */
                    "bl " __ASM_NAME("get_initial_context") "\n\t"
-                   "add r1, r0, #4\n\t"       /* &context->R0 */
                    "mov lr, #0\n\t"
                    "bx r5" )
 
@@ -985,7 +1040,7 @@ __ASM_GLOBAL_FUNC( signal_start_thread,
 extern void DECLSPEC_NORETURN call_thread_exit_func( int status, void (*func)(int), TEB *teb );
 __ASM_GLOBAL_FUNC( call_thread_exit_func,
                    ".arm\n\t"
-                   "ldr r3, [r2, #0x1d4]\n\t"  /* teb->GdiTebBatch */
+                   "ldr r3, [r2, #0x1d4]\n\t"  /* arm_thread_data()->exit_frame */
                    "mov ip, #0\n\t"
                    "str ip, [r2, #0x1d4]\n\t"
                    "cmp r3, ip\n\t"

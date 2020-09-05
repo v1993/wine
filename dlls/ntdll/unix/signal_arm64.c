@@ -136,9 +136,7 @@ struct syscall_frame
 {
     ULONG64 x29;
     ULONG64 thunk_addr;
-    ULONG64 x0, x1, x2, x3, x4, x5, x6, x7, x8;
-    struct syscall_frame *prev_frame;
-    ULONG64 x19, x20, x21, x22, x23, x24, x25, x26, x27, x28;
+    ULONG64 x0, x1, x2, x3, x4, x5, x6, x7, x19, x20, x21, x22, x23, x24, x25, x26, x27, x28;
     ULONG64 thunk_x29;
     ULONG64 ret_addr;
 };
@@ -521,8 +519,7 @@ NTSTATUS WINAPI NtSetContextThread( HANDLE handle, const CONTEXT *context )
     }
     if (self && ret == STATUS_SUCCESS)
     {
-        struct syscall_frame *frame = arm64_thread_data()->syscall_frame;
-        arm64_thread_data()->syscall_frame = frame->prev_frame;
+        arm64_thread_data()->syscall_frame = NULL;
         InterlockedExchangePointer( (void **)&arm64_thread_data()->context, (void *)context );
         raise( SIGUSR2 );
     }
@@ -651,30 +648,24 @@ __ASM_GLOBAL_FUNC( call_user_apc_dispatcher,
                    "mov x24, x5\n\t"             /* dispatcher */
                    "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
                    "add x25, x0, #0x2f8\n\t"     /* arm64_thread_data()->syscall_frame */
-                   "ldr x26, [x25]\n\t"
                    "cbz x19, 1f\n\t"
                    "ldr x0, [x19, #0x100]\n\t"   /* context.Sp */
-                   "sub x0, x0, #0x440\n\t"      /* sizeof(CONTEXT) + offsetof(frame,thunk_x29) */
-                   "ldr x6, [x26, #88]\n\t"      /* frame->prev_frame */
-                   "str x6, [x25]\n\t"
+                   "sub x0, x0, #0x430\n\t"      /* sizeof(CONTEXT) + offsetof(frame,thunk_x29) */
+                   "str xzr, [x25]\n\t"
                    "mov sp, x0\n\t"
                    "b 2f\n"
-                   "1:\tsub x19, x26, #0x390\n\t"
-                   "mov x0, sp\n\t"
-                   "cmp x19, x0\n\t"
-                   "csel x0, x19, x0, lo\n\t"
-                   "mov sp, x0\n\t"
+                   "1:\tldr x0, [x25]\n\t"
+                   "sub sp, x0, #0x390\n\t"
                    "mov w2, #0x400000\n\t"       /* context.ContextFlags = CONTEXT_FULL */
                    "movk w2, #7\n\t"
-                   "mov x1, x19\n\t"
-                   "str w2, [x19]\n\t"
+                   "str w2, [sp]\n\t"
+                   "mov x1, sp\n\t"
                    "mov x0, #~1\n\t"
                    "bl " __ASM_NAME("NtGetContextThread") "\n\t"
                    "mov w2, #0xc0\n\t"           /* context.X0 = STATUS_USER_APC */
-                   "str x2, [x19, #8]\n\t"
-                   "ldr x6, [x26, #88]\n\t"      /* frame->prev_frame */
-                   "str x6, [x25]\n\t"
-                   "mov x0, x19\n"               /* context */
+                   "str x2, [sp, #8]\n\t"
+                   "str xzr, [x25]\n\t"
+                   "mov x0, sp\n"                /* context */
                    "2:\tldr lr, [x0, #0xf8]\n\t" /* context.Lr */
                    "mov x1, x20\n\t"             /* ctx */
                    "mov x2, x21\n\t"             /* arg1 */
@@ -701,19 +692,93 @@ __ASM_GLOBAL_FUNC( call_user_exception_dispatcher,
                    "bl " __ASM_NAME("NtCurrentTeb") "\n\t"
                    "add x4, x0, #0x2f8\n\t"        /* arm64_thread_data()->syscall_frame */
                    "ldr x5, [x4]\n\t"
-                   "ldr x6, [x5, #88]\n\t"         /* frame->prev_frame */
-                   "str x6, [x4]\n\t"
+                   "str xzr, [x4]\n\t"
                    "mov x0, x19\n\t"
                    "mov x1, x20\n\t"
                    "mov x2, x21\n\t"
-                   "ldp x19, x20, [x5, #96]\n\t"   /* frame->x19,x20 */
-                   "ldp x21, x22, [x5, #112]\n\t"  /* frame->x21,x22 */
-                   "ldp x23, x24, [x5, #128]\n\t"  /* frame->x23,x24 */
-                   "ldp x25, x26, [x5, #144]\n\t"  /* frame->x25,x26 */
-                   "ldp x27, x28, [x5, #160]\n\t"  /* frame->x27,x28 */
-                   "ldp x29, x30, [x5, #176]\n\t"  /* frame->thunk_x29,ret_addr */
-                   "add sp, x5, #192\n\t"
+                   "ldp x19, x20, [x5, #80]\n\t"   /* frame->x19,x20 */
+                   "ldp x21, x22, [x5, #96]\n\t"   /* frame->x21,x22 */
+                   "ldp x23, x24, [x5, #112]\n\t"  /* frame->x23,x24 */
+                   "ldp x25, x26, [x5, #128]\n\t"  /* frame->x25,x26 */
+                   "ldp x27, x28, [x5, #144]\n\t"  /* frame->x27,x28 */
+                   "ldp x29, x30, [x5, #160]\n\t"  /* frame->thunk_x29,ret_addr */
+                   "add sp, x5, #176\n\t"
                    "br x2" )
+
+
+/***********************************************************************
+ *           handle_syscall_fault
+ *
+ * Handle a page fault happening during a system call.
+ */
+static BOOL handle_syscall_fault( ucontext_t *context, EXCEPTION_RECORD *rec )
+{
+    struct syscall_frame *frame = arm64_thread_data()->syscall_frame;
+    __WINE_FRAME *wine_frame = (__WINE_FRAME *)NtCurrentTeb()->Tib.ExceptionList;
+    DWORD i;
+
+    if (!frame) return FALSE;
+
+    TRACE( "code=%x flags=%x addr=%p pc=%p tid=%04x\n",
+           rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
+           (void *)PC_sig(context), GetCurrentThreadId() );
+    for (i = 0; i < rec->NumberParameters; i++)
+        TRACE( " info[%d]=%016lx\n", i, rec->ExceptionInformation[i] );
+
+    TRACE("  x0=%016lx  x1=%016lx  x2=%016lx  x3=%016lx\n",
+          (DWORD64)REGn_sig(0, context), (DWORD64)REGn_sig(1, context),
+          (DWORD64)REGn_sig(2, context), (DWORD64)REGn_sig(3, context) );
+    TRACE("  x4=%016lx  x5=%016lx  x6=%016lx  x7=%016lx\n",
+          (DWORD64)REGn_sig(4, context), (DWORD64)REGn_sig(5, context),
+          (DWORD64)REGn_sig(6, context), (DWORD64)REGn_sig(7, context) );
+    TRACE("  x8=%016lx  x9=%016lx x10=%016lx x11=%016lx\n",
+          (DWORD64)REGn_sig(8, context), (DWORD64)REGn_sig(9, context),
+          (DWORD64)REGn_sig(10, context), (DWORD64)REGn_sig(11, context) );
+    TRACE(" x12=%016lx x13=%016lx x14=%016lx x15=%016lx\n",
+          (DWORD64)REGn_sig(12, context), (DWORD64)REGn_sig(13, context),
+          (DWORD64)REGn_sig(14, context), (DWORD64)REGn_sig(15, context) );
+    TRACE(" x16=%016lx x17=%016lx x18=%016lx x19=%016lx\n",
+          (DWORD64)REGn_sig(16, context), (DWORD64)REGn_sig(17, context),
+          (DWORD64)REGn_sig(18, context), (DWORD64)REGn_sig(19, context) );
+    TRACE(" x20=%016lx x21=%016lx x22=%016lx x23=%016lx\n",
+          (DWORD64)REGn_sig(20, context), (DWORD64)REGn_sig(21, context),
+          (DWORD64)REGn_sig(22, context), (DWORD64)REGn_sig(23, context) );
+    TRACE(" x24=%016lx x25=%016lx x26=%016lx x27=%016lx\n",
+          (DWORD64)REGn_sig(24, context), (DWORD64)REGn_sig(25, context),
+          (DWORD64)REGn_sig(26, context), (DWORD64)REGn_sig(27, context) );
+    TRACE(" x28=%016lx  fp=%016lx  lr=%016lx  sp=%016lx\n",
+          (DWORD64)REGn_sig(28, context), (DWORD64)FP_sig(context),
+          (DWORD64)LR_sig(context), (DWORD64)SP_sig(context) );
+
+    if ((char *)wine_frame < (char *)frame)
+    {
+        TRACE( "returning to handler\n" );
+        REGn_sig(0, context) = (ULONG_PTR)&wine_frame->jmp;
+        REGn_sig(1, context) = 1;
+        PC_sig(context)      = (ULONG_PTR)__wine_longjmp;
+    }
+    else
+    {
+        TRACE( "returning to user mode ip=%p ret=%08x\n", (void *)frame->ret_addr, rec->ExceptionCode );
+        REGn_sig(0, context)  = rec->ExceptionCode;
+        REGn_sig(19, context) = frame->x19;
+        REGn_sig(20, context) = frame->x20;
+        REGn_sig(21, context) = frame->x21;
+        REGn_sig(22, context) = frame->x22;
+        REGn_sig(23, context) = frame->x23;
+        REGn_sig(24, context) = frame->x24;
+        REGn_sig(25, context) = frame->x25;
+        REGn_sig(26, context) = frame->x26;
+        REGn_sig(27, context) = frame->x27;
+        REGn_sig(28, context) = frame->x28;
+        FP_sig(context)       = frame->x29;
+        LR_sig(context)       = frame->ret_addr;
+        SP_sig(context)       = (ULONG64)&frame->thunk_x29;
+        PC_sig(context)       = frame->thunk_addr;
+        arm64_thread_data()->syscall_frame = NULL;
+    }
+    return TRUE;
+}
 
 
 /**********************************************************************
@@ -732,6 +797,7 @@ static void segv_handler( int signal, siginfo_t *siginfo, void *sigcontext )
     rec.ExceptionCode = virtual_handle_fault( siginfo->si_addr, rec.ExceptionInformation[0],
                                               (void *)SP_sig(context) );
     if (!rec.ExceptionCode) return;
+    if (handle_syscall_fault( context, &rec )) return;
     setup_exception( context, &rec );
 }
 
@@ -1007,13 +1073,13 @@ void signal_init_process(void)
 /***********************************************************************
  *           init_thread_context
  */
-static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry, void *arg, void *relay )
+static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry, void *arg, TEB *teb )
 {
     context->u.s.X0  = (DWORD64)entry;
     context->u.s.X1  = (DWORD64)arg;
-    context->u.s.X18 = (DWORD64)NtCurrentTeb();
-    context->Sp      = (DWORD64)NtCurrentTeb()->Tib.StackBase;
-    context->Pc      = (DWORD64)relay;
+    context->u.s.X18 = (DWORD64)teb;
+    context->Sp      = (DWORD64)teb->Tib.StackBase;
+    context->Pc      = (DWORD64)pRtlUserThreadStart;
 }
 
 
@@ -1021,7 +1087,7 @@ static void init_thread_context( CONTEXT *context, LPTHREAD_START_ROUTINE entry,
  *           get_initial_context
  */
 PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void *arg,
-                                              BOOL suspend, void *relay )
+                                              BOOL suspend, TEB *teb )
 {
     CONTEXT *ctx;
 
@@ -1029,15 +1095,15 @@ PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void
     {
         CONTEXT context = { CONTEXT_ALL };
 
-        init_thread_context( &context, entry, arg, relay );
+        init_thread_context( &context, entry, arg, teb );
         wait_suspend( &context );
         ctx = (CONTEXT *)((ULONG_PTR)context.Sp & ~15) - 1;
         *ctx = context;
     }
     else
     {
-        ctx = (CONTEXT *)NtCurrentTeb()->Tib.StackBase - 1;
-        init_thread_context( ctx, entry, arg, relay );
+        ctx = (CONTEXT *)teb->Tib.StackBase - 1;
+        init_thread_context( ctx, entry, arg, teb );
     }
     pthread_sigmask( SIG_UNBLOCK, &server_block_set, NULL );
     ctx->ContextFlags = CONTEXT_FULL;
@@ -1050,17 +1116,17 @@ PCONTEXT DECLSPEC_HIDDEN get_initial_context( LPTHREAD_START_ROUTINE entry, void
  */
 __ASM_GLOBAL_FUNC( signal_start_thread,
                    "stp x29, x30, [sp,#-16]!\n\t"
-                   "mov x19, x4\n\t"             /* thunk */
-                   "mov x18, x5\n\t"             /* teb */
+                   "mov x19, x3\n\t"             /* thunk */
+                   "mov x18, x4\n\t"             /* teb */
                    /* store exit frame */
                    "mov x29, sp\n\t"
-                   "str x29, [x5, #0x2f0]\n\t"  /* arm64_thread_data()->exit_frame */
+                   "str x29, [x4, #0x2f0]\n\t"  /* arm64_thread_data()->exit_frame */
                    /* switch to thread stack */
-                   "ldr x5, [x5, #8]\n\t"       /* teb->Tib.StackBase */
+                   "ldr x5, [x4, #8]\n\t"       /* teb->Tib.StackBase */
                    "sub sp, x5, #0x1000\n\t"
                    /* attach dlls */
+                   "mov x3, x4\n\t"
                    "bl " __ASM_NAME("get_initial_context") "\n\t"
-                   "add x1, x0, #4\n\t"        /* &context->X0 */
                    "mov lr, #0\n\t"
                    "br x19" )
 

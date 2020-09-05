@@ -1010,6 +1010,7 @@
 @ stdcall -arch=win32 -ret64 RtlConvertLongToLargeInteger(long)
 @ stdcall RtlConvertSidToUnicodeString(ptr ptr long)
 @ stdcall -arch=win32 -ret64 RtlConvertUlongToLargeInteger(long)
+@ stdcall RtlCopyExtendedContext(ptr long ptr)
 @ stdcall RtlCopyLuid(ptr ptr)
 @ stdcall RtlCopyLuidAndAttributesArray(long ptr ptr)
 @ stdcall -arch=x86_64 RtlCopyMemory(ptr ptr long)
@@ -1096,6 +1097,8 @@
 @ stub RtlGetDefaultCodePage
 @ stub RtlGetElementGenericTable
 @ stub RtlGetElementGenericTableAvl
+@ stdcall RtlGetExtendedContextLength(long ptr)
+@ stdcall RtlGetExtendedContextLength2(long ptr int64)
 @ stub RtlGetFirstRange
 @ stdcall RtlGetGroupSecurityDescriptor(ptr ptr ptr)
 @ stub RtlGetNextRange
@@ -1120,6 +1123,8 @@
 @ stdcall RtlInitUnicodeString(ptr wstr)
 @ stdcall RtlInitUnicodeStringEx(ptr wstr)
 @ stdcall RtlInitializeBitMap(ptr ptr long)
+@ stdcall RtlInitializeExtendedContext(ptr long ptr)
+@ stdcall RtlInitializeExtendedContext2(ptr long ptr int64)
 @ stdcall RtlInitializeGenericTable(ptr ptr ptr ptr ptr)
 @ stdcall RtlInitializeGenericTableAvl(ptr ptr ptr ptr ptr)
 @ stub RtlInitializeRangeList
@@ -1170,6 +1175,9 @@
 @ stdcall RtlLengthSecurityDescriptor(ptr)
 @ stdcall RtlLengthSid(ptr)
 @ stdcall RtlLocalTimeToSystemTime(ptr ptr)
+@ stdcall RtlLocateExtendedFeature(ptr long ptr)
+@ stdcall RtlLocateExtendedFeature2(ptr long ptr ptr)
+@ stdcall RtlLocateLegacyContext(ptr ptr)
 @ stub RtlLockBootStatusData
 @ stdcall RtlLookupAtomInAtomTable(ptr wstr ptr)
 @ stub RtlLookupElementGenericTable
@@ -1228,6 +1236,8 @@
 @ stdcall RtlSetBits(ptr long long)
 @ stdcall RtlSetControlSecurityDescriptor(ptr long long)
 @ stdcall RtlSetDaclSecurityDescriptor(ptr long ptr long)
+@ stdcall -ret64 RtlGetExtendedFeaturesMask(ptr)
+@ stdcall RtlSetExtendedFeaturesMask(ptr int64)
 @ stdcall RtlSetGroupSecurityDescriptor(ptr ptr long)
 @ stdcall RtlSetOwnerSecurityDescriptor(ptr ptr long)
 @ stdcall RtlSetSaclSecurityDescriptor(ptr long ptr long)

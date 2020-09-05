@@ -182,7 +182,7 @@
 @ stub BaseProcessInitPostImport
 # @ stub BaseQueryModuleData
 # @ stub BaseSetLastNTError
-# @ stub BaseThreadInitThunk
+@ stdcall -fastcall BaseThreadInitThunk(long ptr ptr)
 @ stub BaseUpdateAppcompatCache
 # @ stub BaseVerifyUnicodeString
 # @ stub Basep8BitStringToDynamicUnicodeString
@@ -256,7 +256,7 @@
 @ stdcall -import ConvertThreadToFiber(ptr)
 @ stdcall -import ConvertThreadToFiberEx(ptr long)
 @ stdcall ConvertToGlobalHandle(long)
-# @ stub CopyContext
+@ stdcall -import -arch=i386,x86_64 CopyContext(ptr long ptr)
 @ stdcall CopyFileA(str str long)
 @ stdcall CopyFileExA (str str ptr ptr ptr long)
 @ stdcall -import CopyFileExW(wstr wstr ptr ptr ptr long)
@@ -895,7 +895,8 @@
 @ stdcall -import GetWindowsDirectoryA(ptr long)
 @ stdcall -import GetWindowsDirectoryW(ptr long)
 @ stdcall -import GetWriteWatch(long ptr long ptr ptr ptr)
-# @ stub GetXStateFeaturesMask
+@ stdcall -import -arch=i386,x86_64 GetXStateFeaturesMask(ptr ptr)
+@ stdcall -import -arch=i386,x86_64 SetXStateFeaturesMask(ptr int64)
 @ stdcall GlobalAddAtomA(str)
 @ stdcall GlobalAddAtomW(wstr)
 @ stdcall -import GlobalAlloc(long long)
@@ -950,7 +951,8 @@
 @ stdcall InitOnceExecuteOnce(ptr ptr ptr ptr) kernelbase.InitOnceExecuteOnce
 @ stdcall InitOnceInitialize(ptr) ntdll.RtlRunOnceInitialize
 @ stdcall InitializeConditionVariable(ptr) ntdll.RtlInitializeConditionVariable
-# @ stub InitializeContext
+@ stdcall -import -arch=i386,x86_64 InitializeContext(ptr long ptr ptr)
+@ stdcall -import -arch=i386,x86_64 InitializeContext2(ptr long ptr ptr int64)
 @ stdcall InitializeCriticalSection(ptr) ntdll.RtlInitializeCriticalSection
 @ stdcall -import InitializeCriticalSectionAndSpinCount(ptr long)
 @ stdcall -import InitializeCriticalSectionEx(ptr long long)
@@ -1070,7 +1072,7 @@
 @ stdcall LocalSize(long)
 @ stdcall -import LocalUnlock(long)
 @ stdcall -import LocaleNameToLCID(wstr long)
-# @ stub LocateXStateFeature
+@ stdcall -import -arch=i386,x86_64 LocateXStateFeature(ptr long ptr)
 @ stdcall -import LockFile(long long long long long)
 @ stdcall -import LockFileEx(long long long long long ptr)
 @ stdcall -import LockResource(long)
@@ -1691,6 +1693,3 @@
 # Unix files
 @ cdecl wine_get_unix_file_name(wstr)
 @ cdecl wine_get_dos_file_name(str)
-
-# Init code
-@ cdecl -norelay -private __wine_start_process()
