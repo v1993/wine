@@ -20,15 +20,9 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "config.h"
-#include "wine/port.h"
-
 #include <stdarg.h>
 #include <stdio.h>
 #include <errno.h>
-#ifdef HAVE_SYS_STAT_H
-# include <sys/stat.h>
-#endif
 
 #define NONAMELESSUNION
 #define NONAMELESSSTRUCT
@@ -46,12 +40,9 @@
 #include "shlwapi.h"
 
 #include "wine/exception.h"
-#include "wine/unicode.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
-
-static const WCHAR krnl386W[] = {'k','r','n','l','3','8','6','.','e','x','e','1','6',0};
 
 /***********************************************************************
  *              create_file_OF
@@ -132,7 +123,7 @@ DWORD FILE_name_WtoA( LPCWSTR src, INT srclen, LPSTR dest, INT destlen )
 {
     DWORD ret;
 
-    if (srclen < 0) srclen = strlenW( src ) + 1;
+    if (srclen < 0) srclen = lstrlenW( src ) + 1;
     if (!destlen)
     {
         if (!AreFileApisANSI())
@@ -285,61 +276,6 @@ UINT WINAPI SetHandleCount( UINT count )
 }
 
 
-/*************************************************************************
- *           ReadFile   (KERNEL32.@)
- */
-BOOL WINAPI KERNEL32_ReadFile( HANDLE file, LPVOID buffer, DWORD count,
-                               LPDWORD result, LPOVERLAPPED overlapped )
-{
-    if (result) *result = 0;
-
-    if (is_console_handle( file ))
-    {
-        DWORD conread, mode;
-
-        if (!ReadConsoleA( file, buffer, count, &conread, NULL) || !GetConsoleMode( file, &mode ))
-            return FALSE;
-        /* ctrl-Z (26) means end of file on window (if at beginning of buffer)
-         * but Unix uses ctrl-D (4), and ctrl-Z is a bad idea on Unix :-/
-         * So map both ctrl-D ctrl-Z to EOF.
-         */
-        if ((mode & ENABLE_PROCESSED_INPUT) && conread > 0 &&
-            (((char *)buffer)[0] == 26 || ((char *)buffer)[0] == 4))
-        {
-            conread = 0;
-        }
-        if (result) *result = conread;
-        return TRUE;
-    }
-    return ReadFile( file, buffer, count, result, overlapped );
-}
-
-
-/*************************************************************************
- *           WriteFile   (KERNEL32.@)
- */
-BOOL WINAPI KERNEL32_WriteFile( HANDLE file, LPCVOID buffer, DWORD count,
-                                LPDWORD result, LPOVERLAPPED overlapped )
-{
-    if (is_console_handle( file )) return WriteConsoleA( file, buffer, count, result, NULL );
-    return WriteFile( file, buffer, count, result, overlapped );
-}
-
-
-/*************************************************************************
- *           FlushFileBuffers   (KERNEL32.@)
- */
-BOOL WINAPI KERNEL32_FlushFileBuffers( HANDLE file )
-{
-    IO_STATUS_BLOCK iosb;
-
-    /* this will fail (as expected) for an output handle */
-    if (is_console_handle( file )) return FlushConsoleInputBuffer( file );
-
-    return set_ntstatus( NtFlushBuffersFile( file, &iosb ));
-}
-
-
 /***********************************************************************
  *           DosDateTimeToFileTime   (KERNEL32.@)
  */
@@ -473,7 +409,7 @@ BOOL WINAPI DeviceIoControl(HANDLE hDevice, DWORD dwIoControlCode,
         static DeviceIoProc (*vxd_get_proc)(HANDLE);
         DeviceIoProc proc = NULL;
 
-        if (!vxd_get_proc) vxd_get_proc = (void *)GetProcAddress( GetModuleHandleW(krnl386W),
+        if (!vxd_get_proc) vxd_get_proc = (void *)GetProcAddress( GetModuleHandleW(L"krnl386.exe16"),
                                                                   "__wine_vxd_get_proc" );
         if (vxd_get_proc) proc = vxd_get_proc( hDevice );
         if (proc) return proc( dwIoControlCode, lpvInBuffer, cbInBuffer,

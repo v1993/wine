@@ -29,6 +29,7 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <errno.h>
 #ifdef HAVE_SYS_TIME_H
 # include <sys/time.h>
 #endif
@@ -41,6 +42,9 @@
 #endif
 #ifdef HAVE_MACHINE_CPU_H
 # include <machine/cpu.h>
+#endif
+#ifdef HAVE_SYS_RANDOM_H
+# include <sys/random.h>
 #endif
 #ifdef HAVE_IOKIT_IOKITLIB_H
 # include <CoreFoundation/CoreFoundation.h>
@@ -534,8 +538,8 @@ static DWORD count_bits(ULONG_PTR mask)
     DWORD count = 0;
     while (mask > 0)
     {
+        if (mask & 1) ++count;
         mask >>= 1;
-        count++;
     }
     return count;
 }
@@ -1738,12 +1742,31 @@ static BOOL match_tz_info( const RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi,
             match_tz_date(&tzi->DaylightDate, &reg_tzi->DaylightDate));
 }
 
+static BOOL match_past_tz_bias( time_t past_time, LONG past_bias )
+{
+    LONG bias;
+    struct tm *tm;
+    if (!past_time) return TRUE;
+
+    tm = gmtime( &past_time );
+    bias = (LONG)(mktime(tm) - past_time) / 60;
+    return bias == past_bias;
+}
+
 static BOOL match_tz_name( const char *tz_name, const RTL_DYNAMIC_TIME_ZONE_INFORMATION *reg_tzi )
 {
-    static const struct { WCHAR key_name[32]; const char *short_name; } mapping[] =
+    static const struct {
+        WCHAR key_name[32];
+        const char *short_name;
+        time_t past_time;
+        LONG past_bias;
+    }
+    mapping[] =
     {
+        { {'N','o','r','t','h',' ','K','o','r','e','a',' ','S','t','a','n','d','a','r','d',' ','T','i','m','e',0 },
+          "KST", 1451606400 /* 2016-01-01 00:00:00 UTC */, -510 },
         { {'K','o','r','e','a',' ','S','t','a','n','d','a','r','d',' ','T','i','m','e',0 },
-          "KST" },
+          "KST", 1451606400 /* 2016-01-01 00:00:00 UTC */, -540 },
         { {'T','o','k','y','o',' ','S','t','a','n','d','a','r','d',' ','T','i','m','e',0 },
           "JST" },
         { {'Y','a','k','u','t','s','k',' ','S','t','a','n','d','a','r','d',' ','T','i','m','e',0 },
@@ -1755,7 +1778,8 @@ static BOOL match_tz_name( const char *tz_name, const RTL_DYNAMIC_TIME_ZONE_INFO
     for (i = 0; i < ARRAY_SIZE(mapping); i++)
     {
         if (!wcscmp( mapping[i].key_name, reg_tzi->TimeZoneKeyName ))
-            return !strcmp( mapping[i].short_name, tz_name );
+            return !strcmp( mapping[i].short_name, tz_name )
+                && match_past_tz_bias( mapping[i].past_time, mapping[i].past_bias );
     }
     return TRUE;
 }
@@ -1925,7 +1949,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     time_t year_start, year_end, tmp, dlt = 0, std = 0;
     int is_dst, bias;
 
-    pthread_mutex_lock( &tz_mutex );
+    mutex_lock( &tz_mutex );
 
     year_start = time(NULL);
     tm = gmtime(&year_start);
@@ -1935,7 +1959,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
     if (current_year == tm->tm_year && current_bias == bias)
     {
         *tzi = cached_tzi;
-        pthread_mutex_unlock( &tz_mutex );
+        mutex_unlock( &tz_mutex );
         return;
     }
 
@@ -2028,7 +2052,7 @@ static void get_timezone_info( RTL_DYNAMIC_TIME_ZONE_INFORMATION *tzi )
 
     find_reg_tz_info(tzi, tz_name, current_year + 1900);
     cached_tzi = *tzi;
-    pthread_mutex_unlock( &tz_mutex );
+    mutex_unlock( &tz_mutex );
 }
 
 
@@ -2329,30 +2353,62 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
             "\\SystemRoot\\system32\\drivers\\mountmgr.sys"
         };
 
-        if (!info) ret = STATUS_ACCESS_VIOLATION;
-        else
-        {
-            ULONG i;
-            SYSTEM_MODULE_INFORMATION *smi = info;
+        ULONG i;
+        SYSTEM_MODULE_INFORMATION *smi = info;
 
-            len = offsetof( SYSTEM_MODULE_INFORMATION, Modules[ARRAY_SIZE(fake_modules)] );
-            if (len <= size)
+        len = offsetof( SYSTEM_MODULE_INFORMATION, Modules[ARRAY_SIZE(fake_modules)] );
+        if (len <= size)
+        {
+            memset( smi, 0, len );
+            for (i = 0; i < ARRAY_SIZE(fake_modules); i++)
             {
-                memset( smi, 0, len );
-                for (i = 0; i < ARRAY_SIZE(fake_modules); i++)
-                {
-                    SYSTEM_MODULE *sm = &smi->Modules[i];
-                    sm->ImageBaseAddress = (char *)0x10000000 + 0x200000 * i;
-                    sm->ImageSize = 0x200000;
-                    sm->LoadOrderIndex = i;
-                    sm->LoadCount = 1;
-                    strcpy( (char *)sm->Name, fake_modules[i] );
-                    sm->NameOffset = strrchr( fake_modules[i], '\\' ) - fake_modules[i] + 1;
-                }
-                smi->ModulesCount = i;
+                SYSTEM_MODULE *sm = &smi->Modules[i];
+                sm->ImageBaseAddress = (char *)0x10000000 + 0x200000 * i;
+                sm->ImageSize = 0x200000;
+                sm->LoadOrderIndex = i;
+                sm->LoadCount = 1;
+                strcpy( (char *)sm->Name, fake_modules[i] );
+                sm->NameOffset = strrchr( fake_modules[i], '\\' ) - fake_modules[i] + 1;
             }
-            else ret = STATUS_INFO_LENGTH_MISMATCH;
+            smi->ModulesCount = i;
         }
+        else ret = STATUS_INFO_LENGTH_MISMATCH;
+
+        break;
+    }
+
+    case SystemModuleInformationEx:
+    {
+        /* FIXME: return some fake info for now */
+        static const char *fake_modules[] =
+        {
+            "\\SystemRoot\\system32\\ntoskrnl.exe",
+            "\\SystemRoot\\system32\\hal.dll",
+            "\\SystemRoot\\system32\\drivers\\mountmgr.sys"
+        };
+
+        ULONG i;
+        RTL_PROCESS_MODULE_INFORMATION_EX *module_info = info;
+
+        len = sizeof(*module_info) * ARRAY_SIZE(fake_modules) + sizeof(module_info->NextOffset);
+        if (len <= size)
+        {
+            memset( info, 0, len );
+            for (i = 0; i < ARRAY_SIZE(fake_modules); i++)
+            {
+                SYSTEM_MODULE *sm = &module_info[i].BaseInfo;
+                sm->ImageBaseAddress = (char *)0x10000000 + 0x200000 * i;
+                sm->ImageSize = 0x200000;
+                sm->LoadOrderIndex = i;
+                sm->LoadCount = 1;
+                strcpy( (char *)sm->Name, fake_modules[i] );
+                sm->NameOffset = strrchr( fake_modules[i], '\\' ) - fake_modules[i] + 1;
+                module_info[i].NextOffset = sizeof(*module_info);
+            }
+            module_info[ARRAY_SIZE(fake_modules)].NextOffset = 0;
+        }
+        else ret = STATUS_INFO_LENGTH_MISMATCH;
+
         break;
     }
 
@@ -2422,16 +2478,36 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
 
     case SystemInterruptInformation:
     {
-        SYSTEM_INTERRUPT_INFORMATION sii = {{ 0 }};
-
-        len = sizeof(sii);
+        len = NtCurrentTeb()->Peb->NumberOfProcessors * sizeof(SYSTEM_INTERRUPT_INFORMATION);
         if (size >= len)
         {
             if (!info) ret = STATUS_ACCESS_VIOLATION;
-            else memcpy( info, &sii, len);
+            else
+            {
+#ifdef HAVE_GETRANDOM
+                int ret;
+                do
+                {
+                    ret = getrandom( info, len, 0 );
+                }
+                while (ret == -1 && errno == EINTR);
+#else
+                int fd = open( "/dev/urandom", O_RDONLY );
+                if (fd != -1)
+                {
+                    int ret;
+                    do
+                    {
+                        ret = read( fd, info, len );
+                    }
+                    while (ret == -1 && errno == EINTR);
+                    close( fd );
+                }
+                else WARN( "can't open /dev/urandom\n" );
+#endif
+            }
         }
         else ret = STATUS_INFO_LENGTH_MISMATCH;
-        FIXME("info_class SYSTEM_INTERRUPT_INFORMATION\n");
         break;
     }
 
@@ -2590,6 +2666,12 @@ NTSTATUS WINAPI NtQuerySystemInformation( SYSTEM_INFORMATION_CLASS class,
         else ret = STATUS_INFO_LENGTH_MISMATCH;
         break;
     }
+
+    case SystemExtendedProcessInformation:
+        FIXME("SystemExtendedProcessInformation, size %u, info %p, stub!\n", size, info);
+        memset( info, 0, size );
+        ret = STATUS_SUCCESS;
+        break;
 
     default:
 	FIXME( "(0x%08x,%p,0x%08x,%p) stub\n", class, info, size, ret_size );

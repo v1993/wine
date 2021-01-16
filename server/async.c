@@ -76,6 +76,7 @@ static const struct object_ops async_ops =
     no_map_access,             /* map_access */
     default_get_sd,            /* get_sd */
     default_set_sd,            /* set_sd */
+    no_get_full_name,          /* get_full_name */
     no_lookup_name,            /* lookup_name */
     no_link_name,              /* link_name */
     NULL,                      /* unlink_name */
@@ -489,6 +490,7 @@ static const struct object_ops iosb_ops =
     no_map_access,            /* map_access */
     default_get_sd,           /* get_sd */
     default_set_sd,           /* set_sd */
+    no_get_full_name,         /* get_full_name */
     no_lookup_name,           /* lookup_name */
     no_link_name,             /* link_name */
     NULL,                     /* unlink_name */
@@ -538,6 +540,11 @@ struct iosb *create_iosb( const void *in_data, data_size_t in_size, data_size_t 
 struct iosb *async_get_iosb( struct async *async )
 {
     return async->iosb ? (struct iosb *)grab_object( async->iosb ) : NULL;
+}
+
+struct thread *async_get_thread( struct async *async )
+{
+    return async->thread;
 }
 
 int async_is_blocking( struct async *async )

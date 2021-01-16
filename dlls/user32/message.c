@@ -19,9 +19,6 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "config.h"
-#include "wine/port.h"
-
 #include <assert.h>
 #include <stdarg.h>
 
@@ -39,7 +36,6 @@
 #include "dde.h"
 #include "imm.h"
 #include "ddk/imm.h"
-#include "wine/unicode.h"
 #include "wine/server.h"
 #include "user_private.h"
 #include "win.h"
@@ -284,11 +280,9 @@ static const INPUT_MESSAGE_SOURCE msg_source_unavailable = { IMDT_UNAVAILABLE, I
 
 
 /* Message class descriptor */
-static const WCHAR messageW[] = {'M','e','s','s','a','g','e',0};
-
 const struct builtin_class_descr MESSAGE_builtin_class =
 {
-    messageW,             /* name */
+    L"Message",           /* name */
     0,                    /* style */
     WINPROC_MESSAGE,      /* proc */
     0,                    /* extra */
@@ -450,7 +444,7 @@ static inline void push_data( struct packed_message *data, const void *ptr, size
 /* add a string to a packed message */
 static inline void push_string( struct packed_message *data, LPCWSTR str )
 {
-    push_data( data, str, (strlenW(str) + 1) * sizeof(WCHAR) );
+    push_data( data, str, (lstrlenW(str) + 1) * sizeof(WCHAR) );
 }
 
 /* make sure that the buffer contains a valid null-terminated Unicode string */
@@ -558,7 +552,8 @@ LRESULT WINAPI MessageWndProc( HWND hwnd, UINT message, WPARAM wParam, LPARAM lP
 static BOOL CALLBACK broadcast_message_callback( HWND hwnd, LPARAM lparam )
 {
     struct send_message_info *info = (struct send_message_info *)lparam;
-    if (!(GetWindowLongW( hwnd, GWL_STYLE ) & (WS_POPUP|WS_CAPTION))) return TRUE;
+    if ((GetWindowLongW( hwnd, GWL_STYLE ) & (WS_POPUP|WS_CHILD)) == WS_CHILD)
+        return TRUE;
     switch(info->type)
     {
     case MSG_UNICODE:
@@ -1028,7 +1023,7 @@ static size_t pack_message( HWND hwnd, UINT message, WPARAM wparam, LPARAM lpara
     case WM_DEVICECHANGE:
     {
         DEV_BROADCAST_HDR *header = (DEV_BROADCAST_HDR *)lparam;
-        push_data( data, header, header->dbch_size );
+        if ((wparam & 0x8000) && header) push_data( data, header, header->dbch_size );
         return 0;
     }
     case WM_WINE_KEYBOARD_LL_HOOK:
@@ -1129,8 +1124,8 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
         {
             if (!check_string( str, size )) return FALSE;
             cs.lpszName = str;
-            size -= (strlenW(str) + 1) * sizeof(WCHAR);
-            str += strlenW(str) + 1;
+            size -= (lstrlenW(str) + 1) * sizeof(WCHAR);
+            str += lstrlenW(str) + 1;
         }
         if (ps->cs.lpszClass >> 16)
         {
@@ -1415,8 +1410,8 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
         {
             if (!check_string( str, size )) return FALSE;
             mcs.szClass = str;
-            size -= (strlenW(str) + 1) * sizeof(WCHAR);
-            str += strlenW(str) + 1;
+            size -= (lstrlenW(str) + 1) * sizeof(WCHAR);
+            str += lstrlenW(str) + 1;
         }
         if (ps->mcs.szTitle >> 16)
         {
@@ -1431,6 +1426,7 @@ static BOOL unpack_message( HWND hwnd, UINT message, WPARAM *wparam, LPARAM *lpa
         if (!get_buffer_space( buffer, sizeof(BOOL) )) return FALSE;
         break;
     case WM_DEVICECHANGE:
+        if (!(*wparam & 0x8000)) return TRUE;
         minsize = sizeof(DEV_BROADCAST_HDR);
         break;
     case WM_WINE_KEYBOARD_LL_HOOK:
@@ -1646,7 +1642,7 @@ static void pack_reply( HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam,
         break;
     }
     case WM_ASKCBFORMATNAME:
-        push_data( data, (WCHAR *)lparam, (strlenW((WCHAR *)lparam) + 1) * sizeof(WCHAR) );
+        push_data( data, (WCHAR *)lparam, (lstrlenW((WCHAR *)lparam) + 1) * sizeof(WCHAR) );
         break;
     }
 }

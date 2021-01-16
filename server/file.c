@@ -68,7 +68,8 @@ static void file_dump( struct object *obj, int verbose );
 static struct fd *file_get_fd( struct object *obj );
 static struct security_descriptor *file_get_sd( struct object *obj );
 static int file_set_sd( struct object *obj, const struct security_descriptor *sd, unsigned int set_info );
-static struct object *file_lookup_name( struct object *obj, struct unicode_str *name, unsigned int attr );
+static struct object *file_lookup_name( struct object *obj, struct unicode_str *name,
+                                      unsigned int attr, struct object *root );
 static struct object *file_open_file( struct object *obj, unsigned int access,
                                       unsigned int sharing, unsigned int options );
 static struct list *file_get_kernel_obj_list( struct object *obj );
@@ -91,6 +92,7 @@ static const struct object_ops file_ops =
     default_fd_map_access,        /* map_access */
     file_get_sd,                  /* get_sd */
     file_set_sd,                  /* set_sd */
+    no_get_full_name,             /* get_full_name */
     file_lookup_name,             /* lookup_name */
     no_link_name,                 /* link_name */
     NULL,                         /* unlink_name */
@@ -602,7 +604,8 @@ static int file_set_sd( struct object *obj, const struct security_descriptor *sd
     return 1;
 }
 
-static struct object *file_lookup_name( struct object *obj, struct unicode_str *name, unsigned int attr )
+static struct object *file_lookup_name( struct object *obj, struct unicode_str *name,
+                                        unsigned int attr, struct object *root )
 {
     if (!name || !name->len) return NULL;  /* open the file itself */
 

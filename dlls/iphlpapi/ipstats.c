@@ -1402,7 +1402,7 @@ DWORD WINAPI AllocateAndGetIpForwardTableFromStack(PMIB_IPFORWARDTABLE *ppIpForw
         if ((fp = fopen("/proc/net/route", "r")))
         {
             char buf[512], *ptr;
-            DWORD flags;
+            DWORD rtf_flags;
 
             /* skip header line */
             ptr = fgets(buf, sizeof(buf), fp);
@@ -1417,10 +1417,10 @@ DWORD WINAPI AllocateAndGetIpForwardTableFromStack(PMIB_IPFORWARDTABLE *ppIpForw
 
                 row.dwForwardDest = strtoul(ptr, &ptr, 16);
                 row.dwForwardNextHop = strtoul(ptr + 1, &ptr, 16);
-                flags = strtoul(ptr + 1, &ptr, 16);
+                rtf_flags = strtoul(ptr + 1, &ptr, 16);
 
-                if (!(flags & RTF_UP)) row.u1.ForwardType = MIB_IPROUTE_TYPE_INVALID;
-                else if (flags & RTF_GATEWAY) row.u1.ForwardType = MIB_IPROUTE_TYPE_INDIRECT;
+                if (!(rtf_flags & RTF_UP)) row.u1.ForwardType = MIB_IPROUTE_TYPE_INVALID;
+                else if (rtf_flags & RTF_GATEWAY) row.u1.ForwardType = MIB_IPROUTE_TYPE_INDIRECT;
                 else row.u1.ForwardType = MIB_IPROUTE_TYPE_DIRECT;
 
                 strtoul(ptr + 1, &ptr, 16); /* refcount, skip */
@@ -1664,7 +1664,7 @@ DWORD WINAPI AllocateAndGetIpNetTableFromStack(PMIB_IPNETTABLE *ppIpNetTable, BO
         if ((fp = fopen("/proc/net/arp", "r")))
         {
             char buf[512], *ptr;
-            DWORD flags;
+            DWORD atf_flags;
 
             /* skip header line */
             ptr = fgets(buf, sizeof(buf), fp);
@@ -1675,14 +1675,14 @@ DWORD WINAPI AllocateAndGetIpNetTableFromStack(PMIB_IPNETTABLE *ppIpNetTable, BO
                 row.dwAddr = inet_addr(ptr);
                 while (*ptr && !isspace(*ptr)) ptr++;
                 strtoul(ptr + 1, &ptr, 16); /* hw type (skip) */
-                flags = strtoul(ptr + 1, &ptr, 16);
+                atf_flags = strtoul(ptr + 1, &ptr, 16);
 
 #ifdef ATF_COM
-                if (flags & ATF_COM) row.u.Type = MIB_IPNET_TYPE_DYNAMIC;
+                if (atf_flags & ATF_COM) row.u.Type = MIB_IPNET_TYPE_DYNAMIC;
                 else
 #endif
 #ifdef ATF_PERM
-                if (flags & ATF_PERM) row.u.Type = MIB_IPNET_TYPE_STATIC;
+                if (atf_flags & ATF_PERM) row.u.Type = MIB_IPNET_TYPE_STATIC;
                 else
 #endif
                     row.u.Type = MIB_IPNET_TYPE_OTHER;
@@ -2980,7 +2980,7 @@ DWORD build_tcp6_table( TCP_TABLE_CLASS class, void **tablep, BOOL order, HANDLE
             row.dwLocalScopeId = find_ipv6_addr_scope( (const IN6_ADDR *)&row.ucLocalAddr, addr_scopes, addr_scopes_size );
             memcpy( &row.ucRemoteAddr, &in->in6p_faddr.s6_addr, sizeof(row.ucRemoteAddr) );
             row.dwRemotePort = in->inp_fport;
-            row.dwLocalScopeId = find_ipv6_addr_scope( (const IN6_ADDR *)&row.ucRemoteAddr, addr_scopes, addr_scopes_size );
+            row.dwRemoteScopeId = find_ipv6_addr_scope( (const IN6_ADDR *)&row.ucRemoteAddr, addr_scopes, addr_scopes_size );
             row.dwState = TCPStateToMIBState( tcp->t_state );
             if (!match_class( class, row.dwState )) continue;
 

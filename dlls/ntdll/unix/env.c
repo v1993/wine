@@ -32,6 +32,7 @@
 #include <fcntl.h>
 #include <stdarg.h>
 #include <sys/types.h>
+#include <sys/ioctl.h>
 #ifdef HAVE_SYS_STAT_H
 # include <sys/stat.h>
 #endif
@@ -55,6 +56,7 @@
 #include "winternl.h"
 #include "winbase.h"
 #include "winnls.h"
+#include "wine/condrv.h"
 #include "wine/debug.h"
 #include "unix_private.h"
 
@@ -82,16 +84,49 @@ static struct
     void   *wctable;
 } unix_cp;
 
-static void *read_nls_file( const char *name )
+enum nls_section_type
+{
+    NLS_SECTION_SORTKEYS = 9,
+    NLS_SECTION_CASEMAP = 10,
+    NLS_SECTION_CODEPAGE = 11,
+    NLS_SECTION_NORMALIZE = 12
+};
+
+static char *get_nls_file_path( ULONG type, ULONG id )
 {
     const char *dir = build_dir ? build_dir : data_dir;
+    const char *name = NULL;
+    char *path, tmp[16];
+
+    switch (type)
+    {
+    case NLS_SECTION_SORTKEYS: name = "sortdefault"; break;
+    case NLS_SECTION_CASEMAP:  name = "l_intl"; break;
+    case NLS_SECTION_CODEPAGE: name = tmp; sprintf( tmp, "c_%03u", id ); break;
+    case NLS_SECTION_NORMALIZE:
+        switch (id)
+        {
+        case NormalizationC:  name = "normnfc"; break;
+        case NormalizationD:  name = "normnfd"; break;
+        case NormalizationKC: name = "normnfkc"; break;
+        case NormalizationKD: name = "normnfkd"; break;
+        case 13:              name = "normidna"; break;
+        }
+        break;
+    }
+    if (!name) return NULL;
+    if (!(path = malloc( strlen(dir) + strlen(name) + 10 ))) return NULL;
+    sprintf( path, "%s/nls/%s.nls", dir, name );
+    return path;
+}
+
+static void *read_nls_file( ULONG type, ULONG id )
+{
+    char *path = get_nls_file_path( type, id );
     struct stat st;
-    char *path;
     void *data, *ret = NULL;
     int fd;
 
-    if (!(path = malloc( strlen(dir) + 22 ))) return NULL;
-    sprintf( path, "%s/nls/%s.nls", dir, name );
     if ((fd = open( path, O_RDONLY )) != -1)
     {
         fstat( fd, &st );
@@ -107,9 +142,71 @@ static void *read_nls_file( const char *name )
         }
         close( fd );
     }
-    else ERR( "failed to load %s\n", path );
+    else ERR( "failed to load %u/%u\n", type, id );
     free( path );
     return ret;
+}
+
+static NTSTATUS open_nls_data_file( ULONG type, ULONG id, HANDLE *file )
+{
+    static const WCHAR systemdirW[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
+                                       's','y','s','t','e','m','3','2','\\',0};
+    static const WCHAR sortdirW[] = {'\\','?','?','\\','C',':','\\','w','i','n','d','o','w','s','\\',
+                                     'g','l','o','b','a','l','i','z','a','t','i','o','n','\\',
+                                     's','o','r','t','i','n','g','\\',0};
+
+    NTSTATUS status = STATUS_OBJECT_NAME_NOT_FOUND;
+    IO_STATUS_BLOCK io;
+    OBJECT_ATTRIBUTES attr = { sizeof(attr) };
+    UNICODE_STRING valueW;
+    WCHAR buffer[ARRAY_SIZE(sortdirW) + 16];
+    char *p, *path = get_nls_file_path( type, id );
+
+    if (!path) return STATUS_OBJECT_NAME_NOT_FOUND;
+
+    status = open_unix_file( file, path, GENERIC_READ, &attr, 0, FILE_SHARE_READ,
+                             FILE_OPEN, FILE_SYNCHRONOUS_IO_ALERT, NULL, 0 );
+    if (status == STATUS_NO_SUCH_FILE)
+    {
+        /* try to open file in system dir */
+        ntdll_wcscpy( buffer, type == NLS_SECTION_SORTKEYS ? sortdirW : systemdirW );
+        p = strrchr( path, '/' ) + 1;
+        ascii_to_unicode( buffer + ntdll_wcslen(buffer), p, strlen(p) + 1 );
+        valueW.Buffer = buffer;
+        valueW.Length = ntdll_wcslen( buffer ) * sizeof(WCHAR);
+        valueW.MaximumLength = sizeof( buffer );
+        InitializeObjectAttributes( &attr, &valueW, 0, 0, NULL );
+        status = NtOpenFile( file, GENERIC_READ, &attr, &io, FILE_SHARE_READ, FILE_SYNCHRONOUS_IO_ALERT );
+    }
+    free( path );
+    return status;
+}
+
+static NTSTATUS get_nls_section_name( ULONG type, ULONG id, WCHAR name[32] )
+{
+    char buffer[32];
+
+    switch (type)
+    {
+    case NLS_SECTION_SORTKEYS:
+        if (id) return STATUS_INVALID_PARAMETER_1;
+        strcpy( buffer, "\\NLS\\NlsSectionSORTDEFAULT" );
+        break;
+    case NLS_SECTION_CASEMAP:
+        if (id) return STATUS_UNSUCCESSFUL;
+        strcpy( buffer, "\\NLS\\NlsSectionLANG_INTL" );
+        break;
+    case NLS_SECTION_CODEPAGE:
+        sprintf( buffer, "\\NLS\\NlsSectionCP%03u", id);
+        break;
+    case NLS_SECTION_NORMALIZE:
+        sprintf( buffer, "\\NLS\\NlsSectionNORM%08x", id);
+        break;
+    default:
+        return STATUS_INVALID_PARAMETER_1;
+    }
+    ascii_to_unicode( name, buffer, strlen(buffer) + 1 );
+    return STATUS_SUCCESS;
 }
 
 
@@ -165,7 +262,7 @@ static struct norm_table *nfc_table;
 
 static void init_unix_codepage(void)
 {
-    nfc_table = read_nls_file( "normnfc" );
+    nfc_table = read_nls_file( NLS_SECTION_NORMALIZE, NormalizationC );
 }
 
 static void put_utf16( WCHAR *dst, unsigned int ch )
@@ -396,11 +493,8 @@ static void init_unix_codepage(void)
         {
             if (charset_names[pos].cp != CP_UTF8)
             {
-                char name[16];
-                void *data;
-
-                sprintf( name, "c_%03u", charset_names[pos].cp );
-                if ((data = read_nls_file( name ))) init_unix_cptable( data );
+                void *data = read_nls_file( NLS_SECTION_CODEPAGE, charset_names[pos].cp );
+                if (data) init_unix_cptable( data );
             }
             return;
         }
@@ -736,7 +830,7 @@ char **build_envp( const WCHAR *envW )
  *
  * Change the process name in the ps output.
  */
-static void set_process_name( int argc, char *argv[] )
+static int set_process_name( int argc, char *argv[] )
 {
     BOOL shift_strings;
     char *p, *name;
@@ -790,6 +884,7 @@ static void set_process_name( int argc, char *argv[] )
 #endif
     prctl( PR_SET_NAME, name );
 #endif  /* HAVE_PRCTL */
+    return argc - 1;
 }
 
 
@@ -954,14 +1049,14 @@ void init_environment( int argc, char *argv[], char *envp[] )
 
     init_unix_codepage();
     init_locale();
-    set_process_name( argc, argv );
 
-    if ((case_table = read_nls_file( "l_intl" )))
+    if ((case_table = read_nls_file( NLS_SECTION_CASEMAP, 0 )))
     {
         uctable = case_table + 2;
         lctable = case_table + case_table[1] + 2;
     }
-    main_argc = argc;
+
+    main_argc = set_process_name( argc, argv );
     main_argv = argv;
     main_wargv = build_wargv( argv );
     main_envp = envp;
@@ -1150,13 +1245,42 @@ NTSTATUS CDECL get_dynamic_environment( WCHAR *env, SIZE_T *size )
  *
  * Return the initial console handles.
  */
-void CDECL get_initial_console( HANDLE *handle, HANDLE *std_in, HANDLE *std_out, HANDLE *std_err )
+void CDECL get_initial_console( RTL_USER_PROCESS_PARAMETERS *params )
 {
-    *handle = *std_in = *std_out = *std_err = 0;
-    if (isatty(0) || isatty(1) || isatty(2)) *handle = (HANDLE)2; /* see kernel32/kernel_private.h */
-    if (!isatty(0)) wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, std_in );
-    if (!isatty(1)) wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, std_out );
-    if (!isatty(2)) wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, std_err );
+    int output_fd = -1;
+
+    wine_server_fd_to_handle( 0, GENERIC_READ|SYNCHRONIZE,  OBJ_INHERIT, &params->hStdInput );
+    wine_server_fd_to_handle( 1, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdOutput );
+    wine_server_fd_to_handle( 2, GENERIC_WRITE|SYNCHRONIZE, OBJ_INHERIT, &params->hStdError );
+
+    /* mark tty handles for kernelbase, see init_console */
+    if (params->hStdInput && isatty(0))
+    {
+        params->ConsoleHandle = CONSOLE_HANDLE_SHELL;
+        params->hStdInput = (HANDLE)((UINT_PTR)params->hStdInput | 1);
+    }
+    if (params->hStdError && isatty(2))
+    {
+        params->ConsoleHandle = CONSOLE_HANDLE_SHELL;
+        params->hStdError = (HANDLE)((UINT_PTR)params->hStdError | 1);
+        output_fd = 2;
+    }
+    if (params->hStdOutput && isatty(1))
+    {
+        params->ConsoleHandle = CONSOLE_HANDLE_SHELL;
+        params->hStdOutput = (HANDLE)((UINT_PTR)params->hStdOutput | 1);
+        output_fd = 1;
+    }
+
+    if (output_fd != -1)
+    {
+        struct winsize size;
+        if (!ioctl( output_fd, TIOCGWINSZ, &size ))
+        {
+            params->dwXCountChars = size.ws_col;
+            params->dwYCountChars = size.ws_row;
+        }
+    }
 }
 
 
@@ -1224,7 +1348,6 @@ void CDECL get_initial_directory( UNICODE_STRING *dir )
         MESSAGE("Warning: could not find DOS drive for current working directory '%s', "
                 "starting in the Windows directory.\n", cwd ? cwd : "" );
     free( cwd );
-    chdir( "/" ); /* avoid locking removable devices */
 }
 
 
@@ -1248,6 +1371,43 @@ void CDECL get_locales( WCHAR *sys, WCHAR *user )
 {
     ntdll_umbstowcs( system_locale, strlen(system_locale) + 1, sys, LOCALE_NAME_MAX_LENGTH );
     ntdll_umbstowcs( user_locale, strlen(user_locale) + 1, user, LOCALE_NAME_MAX_LENGTH );
+}
+
+
+/**************************************************************************
+ *      NtGetNlsSectionPtr  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtGetNlsSectionPtr( ULONG type, ULONG id, void *unknown, void **ptr, SIZE_T *size )
+{
+    UNICODE_STRING nameW;
+    OBJECT_ATTRIBUTES attr;
+    WCHAR name[32];
+    HANDLE handle, file;
+    NTSTATUS status;
+
+    if ((status = get_nls_section_name( type, id, name ))) return status;
+
+    nameW.Buffer = name;
+    nameW.Length = ntdll_wcslen(name) * sizeof(WCHAR);
+    nameW.MaximumLength = sizeof(name);
+    InitializeObjectAttributes( &attr, &nameW, 0, 0, NULL );
+    if ((status = NtOpenSection( &handle, SECTION_MAP_READ, &attr )))
+    {
+        if ((status = open_nls_data_file( type, id, &file ))) return status;
+        attr.Attributes = OBJ_OPENIF | OBJ_PERMANENT;
+        status = NtCreateSection( &handle, SECTION_MAP_READ, &attr, NULL, PAGE_READONLY, SEC_COMMIT, file );
+        NtClose( file );
+        if (status == STATUS_OBJECT_NAME_EXISTS) status = STATUS_SUCCESS;
+    }
+    if (!status)
+    {
+        *ptr = NULL;
+        *size = 0;
+        status = NtMapViewOfSection( handle, GetCurrentProcess(), ptr, 0, 0, NULL, size,
+                                     ViewShare, 0, PAGE_READONLY );
+    }
+    NtClose( handle );
+    return status;
 }
 
 

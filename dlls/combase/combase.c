@@ -1527,61 +1527,25 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoCreateInstance(REFCLSID rclsid, IUnknown *out
 }
 
 /***********************************************************************
- *           CoCreateInstanceEx    (combase.@)
+ *           CoCreateInstanceFromApp    (combase.@)
  */
-HRESULT WINAPI DECLSPEC_HOTPATCH CoCreateInstanceEx(REFCLSID rclsid, IUnknown *outer, DWORD cls_context,
-        COSERVERINFO *server_info, ULONG count, MULTI_QI *results)
+HRESULT WINAPI CoCreateInstanceFromApp(REFCLSID rclsid, IUnknown *outer, DWORD cls_context,
+        void *server_info, ULONG count, MULTI_QI *results)
 {
-    IClassFactory *factory;
-    IUnknown *unk = NULL;
-    CLSID clsid;
-    HRESULT hr;
+    TRACE("%s, %p, %#x, %p, %u, %p\n", debugstr_guid(rclsid), outer, cls_context, server_info,
+            count, results);
 
-    TRACE("%s, %p, %#x, %p, %u, %p\n", debugstr_guid(rclsid), outer, cls_context, server_info, count, results);
-
-    if (!count || !results)
-        return E_INVALIDARG;
-
-    if (server_info)
-        FIXME("Server info is not supported.\n");
-
-    init_multi_qi(count, results, E_NOINTERFACE);
-
-    hr = CoGetTreatAsClass(rclsid, &clsid);
-    if (FAILED(hr))
-        clsid = *rclsid;
-
-    hr = CoGetClassObject(&clsid, cls_context, NULL, &IID_IClassFactory, (void **)&factory);
-    if (FAILED(hr))
-        return hr;
-
-    hr = IClassFactory_CreateInstance(factory, outer, results[0].pIID, (void **)&unk);
-    IClassFactory_Release(factory);
-    if (FAILED(hr))
-    {
-        if (hr == CLASS_E_NOAGGREGATION && outer)
-            FIXME("Class %s does not support aggregation\n", debugstr_guid(&clsid));
-        else
-            FIXME("no instance created for interface %s of class %s, hr %#x.\n",
-                    debugstr_guid(results[0].pIID), debugstr_guid(&clsid), hr);
-        return hr;
-    }
-
-    return return_multi_qi(unk, count, results, TRUE);
+    return CoCreateInstanceEx(rclsid, outer, cls_context | CLSCTX_APPCONTAINER, server_info,
+            count, results);
 }
 
-/***********************************************************************
- *           CoGetClassObject    (combase.@)
- */
-HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscontext,
+static HRESULT com_get_class_object(REFCLSID rclsid, DWORD clscontext,
         COSERVERINFO *server_info, REFIID riid, void **obj)
 {
     struct class_reg_data clsreg = { 0 };
     HRESULT hr = E_UNEXPECTED;
     IUnknown *registered_obj;
     struct apartment *apt;
-
-    TRACE("%s, %s\n", debugstr_guid(rclsid), debugstr_guid(riid));
 
     if (!obj)
         return E_INVALIDARG;
@@ -1601,7 +1565,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscont
     {
         if (IsEqualCLSID(rclsid, &CLSID_InProcFreeMarshaler) ||
                 IsEqualCLSID(rclsid, &CLSID_GlobalOptions) ||
-                IsEqualCLSID(rclsid, &CLSID_ManualResetEvent) ||
+                (!(clscontext & CLSCTX_APPCONTAINER) && IsEqualCLSID(rclsid, &CLSID_ManualResetEvent)) ||
                 IsEqualCLSID(rclsid, &CLSID_StdGlobalInterfaceTable))
         {
             apartment_release(apt);
@@ -1625,8 +1589,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscont
             clsreg.u.actctx.threading_model = comclass->model;
             clsreg.origin = CLASS_REG_ACTCTX;
 
-            hr = apartment_get_inproc_class_object(apt, &clsreg, &comclass->clsid, riid,
-                    !(clscontext & WINE_CLSCTX_DONT_HOST), obj);
+            hr = apartment_get_inproc_class_object(apt, &clsreg, &comclass->clsid, riid, clscontext, obj);
             ReleaseActCtx(data.hActCtx);
             apartment_release(apt);
             return hr;
@@ -1637,7 +1600,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscont
      * First, try and see if we can't match the class ID with one of the
      * registered classes.
      */
-    if ((registered_obj = com_get_registered_class_object(apt, rclsid, clscontext)))
+    if (!(clscontext & CLSCTX_APPCONTAINER) && (registered_obj = com_get_registered_class_object(apt, rclsid, clscontext)))
     {
         hr = IUnknown_QueryInterface(registered_obj, riid, obj);
         IUnknown_Release(registered_obj);
@@ -1667,7 +1630,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscont
             clsreg.u.hkey = hkey;
             clsreg.origin = CLASS_REG_REGISTRY;
 
-            hr = apartment_get_inproc_class_object(apt, &clsreg, rclsid, riid, !(clscontext & WINE_CLSCTX_DONT_HOST), obj);
+            hr = apartment_get_inproc_class_object(apt, &clsreg, rclsid, riid, clscontext, obj);
             RegCloseKey(hkey);
         }
 
@@ -1702,7 +1665,7 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscont
             clsreg.u.hkey = hkey;
             clsreg.origin = CLASS_REG_REGISTRY;
 
-            hr = apartment_get_inproc_class_object(apt, &clsreg, rclsid, riid, !(clscontext & WINE_CLSCTX_DONT_HOST), obj);
+            hr = apartment_get_inproc_class_object(apt, &clsreg, rclsid, riid, clscontext, obj);
             RegCloseKey(hkey);
         }
 
@@ -1735,6 +1698,60 @@ HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscont
         ERR("no class object %s could be created for context %#x\n", debugstr_guid(rclsid), clscontext);
 
     return hr;
+}
+
+/***********************************************************************
+ *           CoCreateInstanceEx    (combase.@)
+ */
+HRESULT WINAPI DECLSPEC_HOTPATCH CoCreateInstanceEx(REFCLSID rclsid, IUnknown *outer, DWORD cls_context,
+        COSERVERINFO *server_info, ULONG count, MULTI_QI *results)
+{
+    IClassFactory *factory;
+    IUnknown *unk = NULL;
+    CLSID clsid;
+    HRESULT hr;
+
+    TRACE("%s, %p, %#x, %p, %u, %p\n", debugstr_guid(rclsid), outer, cls_context, server_info, count, results);
+
+    if (!count || !results)
+        return E_INVALIDARG;
+
+    if (server_info)
+        FIXME("Server info is not supported.\n");
+
+    init_multi_qi(count, results, E_NOINTERFACE);
+
+    clsid = *rclsid;
+    if (!(cls_context & CLSCTX_APPCONTAINER))
+        CoGetTreatAsClass(rclsid, &clsid);
+
+    if (FAILED(hr = com_get_class_object(&clsid, cls_context, NULL, &IID_IClassFactory, (void **)&factory)))
+        return hr;
+
+    hr = IClassFactory_CreateInstance(factory, outer, results[0].pIID, (void **)&unk);
+    IClassFactory_Release(factory);
+    if (FAILED(hr))
+    {
+        if (hr == CLASS_E_NOAGGREGATION && outer)
+            FIXME("Class %s does not support aggregation\n", debugstr_guid(&clsid));
+        else
+            FIXME("no instance created for interface %s of class %s, hr %#x.\n",
+                    debugstr_guid(results[0].pIID), debugstr_guid(&clsid), hr);
+        return hr;
+    }
+
+    return return_multi_qi(unk, count, results, TRUE);
+}
+
+/***********************************************************************
+ *           CoGetClassObject    (combase.@)
+ */
+HRESULT WINAPI DECLSPEC_HOTPATCH CoGetClassObject(REFCLSID rclsid, DWORD clscontext,
+        COSERVERINFO *server_info, REFIID riid, void **obj)
+{
+    TRACE("%s, %#x, %s\n", debugstr_guid(rclsid), clscontext, debugstr_guid(riid));
+
+    return com_get_class_object(rclsid, clscontext, server_info, riid, obj);
 }
 
 /***********************************************************************
@@ -2530,7 +2547,10 @@ HRESULT WINAPI CoGetCurrentLogicalThreadId(GUID *id)
         return hr;
 
     if (IsEqualGUID(&tlsdata->causality_id, &GUID_NULL))
+    {
         CoCreateGuid(&tlsdata->causality_id);
+        tlsdata->flags |= OLETLS_UUIDINITIALIZED;
+    }
 
     *id = tlsdata->causality_id;
 
@@ -3087,9 +3107,20 @@ HRESULT WINAPI CoRegisterChannelHook(REFGUID guidExtension, IChannelHook *channe
  */
 HRESULT WINAPI CoDisableCallCancellation(void *reserved)
 {
-    FIXME("%p stub\n", reserved);
+    struct tlsdata *tlsdata;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p\n", reserved);
+
+    if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+        return hr;
+
+    if (!tlsdata->cancelcount)
+        return CO_E_CANCEL_DISABLED;
+
+    tlsdata->cancelcount--;
+
+    return S_OK;
 }
 
 /***********************************************************************
@@ -3097,9 +3128,17 @@ HRESULT WINAPI CoDisableCallCancellation(void *reserved)
  */
 HRESULT WINAPI CoEnableCallCancellation(void *reserved)
 {
-    FIXME("%p stub\n", reserved);
+    struct tlsdata *tlsdata;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("%p\n", reserved);
+
+    if (FAILED(hr = com_get_tlsdata(&tlsdata)))
+        return hr;
+
+    tlsdata->cancelcount++;
+
+    return S_OK;
 }
 
 /***********************************************************************

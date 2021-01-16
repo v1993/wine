@@ -21,9 +21,6 @@
  *
  */
 
-#include "config.h"
-#include "wine/port.h"
-
 #include <errno.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -33,15 +30,17 @@
 #define WIN32_NO_STATUS
 #include "windef.h"
 #include "winbase.h"
+#include "winnls.h"
 #include "winternl.h"
 
 #include "kernel_private.h"
-#include "wine/unicode.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(file);
 
 #define MAX_PATHNAME_LEN        1024
+
+static const WCHAR system_dir[] = L"C:\\windows\\system32";
 
 /***********************************************************************
  *           copy_filename_WtoA
@@ -235,10 +234,10 @@ BOOL WINAPI CreateDirectoryExA( LPCSTR template, LPCSTR path, LPSECURITY_ATTRIBU
  */
 UINT WINAPI GetSystemDirectoryW( LPWSTR path, UINT count )
 {
-    UINT len = strlenW( DIR_System ) + 1;
+    UINT len = ARRAY_SIZE(system_dir);
     if (path && count >= len)
     {
-        strcpyW( path, DIR_System );
+        lstrcpyW( path, system_dir );
         len--;
     }
     return len;
@@ -252,7 +251,7 @@ UINT WINAPI GetSystemDirectoryW( LPWSTR path, UINT count )
  */
 UINT WINAPI GetSystemDirectoryA( LPSTR path, UINT count )
 {
-    return copy_filename_WtoA( DIR_System, path, count );
+    return copy_filename_WtoA( system_dir, path, count );
 }
 
 

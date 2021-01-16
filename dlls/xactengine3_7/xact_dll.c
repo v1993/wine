@@ -73,13 +73,15 @@ static HRESULT WINAPI IXACT3CueImpl_GetState(IXACT3Cue *iface, DWORD *pdwState)
 static HRESULT WINAPI IXACT3CueImpl_Destroy(IXACT3Cue *iface)
 {
     XACT3CueImpl *This = impl_from_IXACT3Cue(iface);
-    HRESULT hr;
+    UINT ret;
 
     TRACE("(%p)\n", iface);
 
-    hr = FACTCue_Destroy(This->fact_cue);
+    ret = FACTCue_Destroy(This->fact_cue);
+    if (ret != 0)
+        WARN("FACTCue_Destroy returned %d\n", ret);
     HeapFree(GetProcessHeap(), 0, This);
-    return hr;
+    return S_OK;
 }
 
 static HRESULT WINAPI IXACT3CueImpl_SetMatrixCoefficients(IXACT3Cue *iface,
@@ -257,7 +259,7 @@ static HRESULT WINAPI IXACT3SoundBankImpl_Prepare(IXACT3SoundBank *iface,
 
     cue->IXACT3Cue_iface.lpVtbl = &XACT3Cue_Vtbl;
     cue->fact_cue = fcue;
-    *ppCue = (IXACT3Cue*)&cue->IXACT3Cue_iface;
+    *ppCue = &cue->IXACT3Cue_iface;
 
     TRACE("Created Cue: %p\n", cue);
 
@@ -299,7 +301,7 @@ static HRESULT WINAPI IXACT3SoundBankImpl_Play(IXACT3SoundBank *iface,
 
         cue->IXACT3Cue_iface.lpVtbl = &XACT3Cue_Vtbl;
         cue->fact_cue = fcue;
-        *ppCue = (IXACT3Cue*)&cue->IXACT3Cue_iface;
+        *ppCue = &cue->IXACT3Cue_iface;
     }
 
     return hr;
@@ -774,7 +776,16 @@ static HRESULT WINAPI IXACT3EngineImpl_Initialize(IXACT3Engine *iface,
 
     TRACE("(%p)->(%p)\n", This, pParams);
 
-    memcpy(&params, pParams, sizeof(FACTRuntimeParameters));
+    memset(&params, 0, sizeof(FACTRuntimeParameters));
+    /* Explicitly copy to the FAudio structure as the packing is wrong under 64 bits */
+    params.lookAheadTime = pParams->lookAheadTime;
+    params.pGlobalSettingsBuffer = pParams->pGlobalSettingsBuffer;
+    params.globalSettingsBufferSize = pParams->globalSettingsBufferSize;
+    params.globalSettingsFlags = pParams->globalSettingsFlags;
+    params.globalSettingsAllocAttributes = pParams->globalSettingsAllocAttributes;
+    params.pRendererID = (int16_t*)pParams->pRendererID;
+    params.pXAudio2 = NULL;
+    params.pMasteringVoice = NULL;
 
     /* FIXME: pXAudio2 and pMasteringVoice are pointers to
      * IXAudio2/IXAudio2MasteringVoice objects. FACT wants pointers to
@@ -787,12 +798,10 @@ static HRESULT WINAPI IXACT3EngineImpl_Initialize(IXACT3Engine *iface,
      * -flibit
      */
     if (pParams->pXAudio2 != NULL){
-        FIXME("pXAudio2 parameter not supported! Falling back to NULL\n");
-        params.pXAudio2 = NULL;
+        FIXME("pXAudio2 parameter not supported!\n");
 
         if (pParams->pMasteringVoice != NULL){
-            FIXME("pXAudio2 parameter not supported! Falling back to NULL\n");
-            params.pMasteringVoice = NULL;
+            FIXME("pMasteringVoice parameter not supported!\n");
         }
     }
 

@@ -80,7 +80,7 @@ struct process
     struct list          asyncs;          /* list of async object owned by the process */
     struct list          locks;           /* list of file locks owned by the process */
     struct list          classes;         /* window classes owned by the process */
-    struct console_input*console;         /* console input */
+    struct console      *console;         /* console input */
     enum startup_state   startup_state;   /* startup state */
     struct startup_info *startup_info;    /* startup info while init is in progress */
     struct event        *idle_event;      /* event for input idle */
@@ -108,8 +108,9 @@ struct process
 extern unsigned int alloc_ptid( void *ptr );
 extern void free_ptid( unsigned int id );
 extern void *get_ptid_entry( unsigned int id );
-extern struct process *create_process( int fd, struct process *parent, int inherit_all,
-                                       const struct security_descriptor *sd );
+extern struct process *create_process( int fd, struct process *parent, int inherit_all, const startup_info_t *info,
+                                       const struct security_descriptor *sd, const obj_handle_t *handles,
+                                       unsigned int handle_count, struct token *token );
 extern data_size_t init_process( struct thread *thread );
 extern struct thread *get_process_first_thread( struct process *process );
 extern struct process *get_process_from_id( process_id_t id );
@@ -131,10 +132,7 @@ extern void detach_debugged_processes( struct thread *debugger );
 extern void enum_processes( int (*cb)(struct process*, void*), void *user);
 
 /* console functions */
-extern obj_handle_t inherit_console( struct thread *parent_thread, obj_handle_t handle,
-                                     struct process *process, obj_handle_t hconin );
-extern int free_console( struct process *process );
-extern struct thread *console_get_renderer( struct console_input *console );
+extern struct thread *console_get_renderer( struct console *console );
 
 /* process tracing mechanism to use */
 #ifdef __APPLE__

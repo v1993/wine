@@ -37,6 +37,8 @@ static void *code_mem;
 
 static NTSTATUS  (WINAPI *pNtGetContextThread)(HANDLE,CONTEXT*);
 static NTSTATUS  (WINAPI *pNtSetContextThread)(HANDLE,CONTEXT*);
+static NTSTATUS  (WINAPI *pNtQueueApcThread)(HANDLE handle, PNTAPCFUNC func,
+        ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3);
 static NTSTATUS  (WINAPI *pRtlRaiseException)(EXCEPTION_RECORD *rec);
 static PVOID     (WINAPI *pRtlUnwind)(PVOID, PVOID, PEXCEPTION_RECORD, PVOID);
 static VOID      (WINAPI *pRtlCaptureContext)(CONTEXT*);
@@ -56,6 +58,7 @@ static void *    (WINAPI *pRtlLocateExtendedFeature)(CONTEXT_EX *context_ex, ULO
 static void *    (WINAPI *pRtlLocateLegacyContext)(CONTEXT_EX *context_ex, ULONG *length);
 static void      (WINAPI *pRtlSetExtendedFeaturesMask)(CONTEXT_EX *context_ex, ULONG64 feature_mask);
 static ULONG64   (WINAPI *pRtlGetExtendedFeaturesMask)(CONTEXT_EX *context_ex);
+static NTSTATUS  (WINAPI *pNtRaiseException)(EXCEPTION_RECORD *rec, CONTEXT *context, BOOL first_chance);
 static NTSTATUS  (WINAPI *pNtReadVirtualMemory)(HANDLE, const void*, void*, SIZE_T, SIZE_T*);
 static NTSTATUS  (WINAPI *pNtTerminateProcess)(HANDLE handle, LONG exit_code);
 static NTSTATUS  (WINAPI *pNtQueryInformationProcess)(HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
@@ -188,6 +191,67 @@ static char**   my_argv;
 static BOOL     is_wow64;
 static BOOL have_vectored_api;
 static int test_stage;
+
+#if defined(__i386__) || defined(__x86_64__)
+static void test_debugger_xstate(HANDLE thread, CONTEXT *ctx, int stage)
+{
+    char context_buffer[sizeof(CONTEXT) + sizeof(CONTEXT_EX) + sizeof(XSTATE) + 63];
+    CONTEXT_EX *c_ex;
+    NTSTATUS status;
+    YMMCONTEXT *ymm;
+    CONTEXT *xctx;
+    DWORD length;
+    XSTATE *xs;
+    M128A *xmm;
+    BOOL bret;
+
+    if (!pRtlGetEnabledExtendedFeatures || !pRtlGetEnabledExtendedFeatures(1 << XSTATE_AVX))
+        return;
+
+    if (stage == 14)
+        return;
+
+    length = sizeof(context_buffer);
+    bret = pInitializeContext(context_buffer, ctx->ContextFlags | CONTEXT_XSTATE, &xctx, &length);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+
+    ymm = pLocateXStateFeature(xctx, XSTATE_AVX, &length);
+    ok(!!ymm, "Got zero ymm.\n");
+    memset(ymm, 0xcc, sizeof(*ymm));
+
+    xmm = pLocateXStateFeature(xctx, XSTATE_LEGACY_SSE, &length);
+    ok(length == sizeof(*xmm) * (sizeof(void *) == 8 ? 16 : 8), "Got unexpected length %#x.\n", length);
+    ok(!!xmm, "Got zero xmm.\n");
+    memset(xmm, 0xcc, length);
+
+    status = pNtGetContextThread(thread, xctx);
+    ok(!status, "NtSetContextThread failed with 0x%x\n", status);
+
+    c_ex = (CONTEXT_EX *)(xctx + 1);
+    xs = (XSTATE *)((char *)c_ex + c_ex->XState.Offset);
+    ok((xs->Mask & 7) == 4 || broken(!xs->Mask) /* Win7 */,
+            "Got unexpected xs->Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+
+    ok(xmm[0].Low == 0x200000001, "Got unexpected data %s.\n", wine_dbgstr_longlong(xmm[0].Low));
+    ok(xmm[0].High == 0x400000003, "Got unexpected data %s.\n", wine_dbgstr_longlong(xmm[0].High));
+
+    ok(ymm->Ymm0.Low == 0x600000005 || broken(!xs->Mask && ymm->Ymm0.Low == 0xcccccccccccccccc) /* Win7 */,
+            "Got unexpected data %s.\n", wine_dbgstr_longlong(ymm->Ymm0.Low));
+    ok(ymm->Ymm0.High == 0x800000007 || broken(!xs->Mask && ymm->Ymm0.High == 0xcccccccccccccccc) /* Win7 */,
+            "Got unexpected data %s.\n", wine_dbgstr_longlong(ymm->Ymm0.High));
+
+    xmm = pLocateXStateFeature(ctx, XSTATE_LEGACY_SSE, &length);
+    ok(!!xmm, "Got zero xmm.\n");
+
+    xmm[0].Low = 0x2828282828282828;
+    xmm[0].High = xmm[0].Low;
+    ymm->Ymm0.Low = 0x4848484848484848;
+    ymm->Ymm0.High = ymm->Ymm0.Low;
+
+    status = pNtSetContextThread(thread, xctx);
+    ok(!status, "NtSetContextThread failed with 0x%x\n", status);
+}
+#endif
 
 #ifdef __i386__
 
@@ -786,16 +850,13 @@ static const BYTE align_check_code[] = {
     0x55,                  	/* push   %ebp */
     0x89,0xe5,             	/* mov    %esp,%ebp */
     0x9c,                  	/* pushf   */
+    0x9c,                  	/* pushf   */
     0x58,                  	/* pop    %eax */
     0x0d,0,0,4,0,       	/* or     $0x40000,%eax */
     0x50,                  	/* push   %eax */
     0x9d,                  	/* popf    */
     0x89,0xe0,                  /* mov %esp, %eax */
     0x8b,0x40,0x1,              /* mov 0x1(%eax), %eax - cause exception */
-    0x9c,                  	/* pushf   */
-    0x58,                  	/* pop    %eax */
-    0x35,0,0,4,0,       	/* xor    $0x40000,%eax */
-    0x50,                  	/* push   %eax */
     0x9d,                  	/* popf    */
     0x5d,                  	/* pop    %ebp */
     0xc3,                  	/* ret     */
@@ -992,7 +1053,7 @@ static void test_exceptions(void)
     ok( res == STATUS_SUCCESS, "NtSetContextThread failed with %x\n", res );
 }
 
-static void test_debugger(void)
+static void test_debugger(DWORD cont_status)
 {
     char cmdline[MAX_PATH];
     PROCESS_INFORMATION pi;
@@ -1020,7 +1081,7 @@ static void test_debugger(void)
 
     do
     {
-        continuestatus = DBG_CONTINUE;
+        continuestatus = cont_status;
         ok(WaitForDebugEvent(&de, INFINITE), "reading debug event\n");
 
         ret = ContinueDebugEvent(de.dwProcessId, de.dwThreadId, 0xdeadbeef);
@@ -1030,7 +1091,7 @@ static void test_debugger(void)
         if (de.dwThreadId != pi.dwThreadId)
         {
             trace("event %d not coming from main thread, ignoring\n", de.dwDebugEventCode);
-            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, cont_status);
             continue;
         }
 
@@ -1055,7 +1116,7 @@ static void test_debugger(void)
                                           sizeof(stage), &size_read);
             ok(!status,"NtReadVirtualMemory failed with 0x%x\n", status);
 
-            ctx.ContextFlags = CONTEXT_FULL;
+            ctx.ContextFlags = CONTEXT_FULL | CONTEXT_EXTENDED_REGISTERS;
             status = pNtGetContextThread(pi.hThread, &ctx);
             ok(!status, "NtGetContextThread failed with 0x%x\n", status);
 
@@ -1155,6 +1216,10 @@ static void test_debugger(void)
                        "unexpected number of parameters %d, expected 0\n", de.u.Exception.ExceptionRecord.NumberParameters);
 
                     if (stage == 12|| stage == 13) continuestatus = DBG_EXCEPTION_NOT_HANDLED;
+                }
+                else if (stage == 14 || stage == 15)
+                {
+                    test_debugger_xstate(pi.hThread, &ctx, stage);
                 }
                 else
                     ok(FALSE, "unexpected stage %x\n", stage);
@@ -1763,7 +1828,7 @@ static LONG WINAPI dbg_except_continue_vectored_handler(struct _EXCEPTION_POINTE
 }
 
 /* Use CDECL to leave arguments on stack. */
-void CDECL hook_KiUserExceptionDispatcher(EXCEPTION_RECORD *rec, CONTEXT *context)
+static void CDECL hook_KiUserExceptionDispatcher(EXCEPTION_RECORD *rec, CONTEXT *context)
 {
     trace("rec %p, context %p.\n", rec, context);
     trace("context->Eip %#x, context->Esp %#x, ContextFlags %#x.\n",
@@ -1933,6 +1998,53 @@ static void test_kiuserexceptiondispatcher(void)
     ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
 }
 
+static BOOL test_apc_called;
+
+static void CALLBACK test_apc(ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3)
+{
+    test_apc_called = TRUE;
+}
+
+static void test_user_apc(void)
+{
+    NTSTATUS status;
+    CONTEXT context;
+    int pass;
+
+    if (!pNtQueueApcThread)
+    {
+        win_skip("NtQueueApcThread is not available.\n");
+        return;
+    }
+
+    pass = 0;
+    InterlockedIncrement(&pass);
+    RtlCaptureContext(&context);
+    InterlockedIncrement(&pass);
+
+    if (pass == 2)
+    {
+        /* Try to make sure context data is far enough below context.Esp. */
+        CONTEXT c[4];
+
+        c[0] = context;
+
+        test_apc_called = FALSE;
+        status = pNtQueueApcThread(GetCurrentThread(), test_apc, 0, 0, 0);
+        ok(!status, "Got unexpected status %#x.\n", status);
+        SleepEx(0, TRUE);
+        ok(test_apc_called, "Test user APC was not called.\n");
+        test_apc_called = FALSE;
+        status = pNtQueueApcThread(GetCurrentThread(), test_apc, 0, 0, 0);
+        ok(!status, "Got unexpected status %#x.\n", status);
+        status = NtContinue(&c[0], TRUE );
+
+        /* Broken before Win7, in that case NtContinue returns here instead of restoring context after calling APC. */
+        ok(0, "Should not get here, status %#x.\n", status);
+    }
+    ok(pass == 3, "Got unexpected pass %d.\n", pass);
+    ok(test_apc_called, "Test user APC was not called.\n");
+}
 #elif defined(__x86_64__)
 
 #define UNW_FLAG_NHANDLER  0
@@ -3176,7 +3288,7 @@ static void test_rtlraiseexception(void)
     run_rtlraiseexception_test(EXCEPTION_INVALID_HANDLE);
 }
 
-static void test_debugger(void)
+static void test_debugger(DWORD cont_status)
 {
     char cmdline[MAX_PATH];
     PROCESS_INFORMATION pi;
@@ -3204,7 +3316,7 @@ static void test_debugger(void)
 
     do
     {
-        continuestatus = DBG_CONTINUE;
+        continuestatus = cont_status;
         ok(WaitForDebugEvent(&de, INFINITE), "reading debug event\n");
 
         ret = ContinueDebugEvent(de.dwProcessId, de.dwThreadId, 0xdeadbeef);
@@ -3214,7 +3326,7 @@ static void test_debugger(void)
         if (de.dwThreadId != pi.dwThreadId)
         {
             trace("event %d not coming from main thread, ignoring\n", de.dwDebugEventCode);
-            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, cont_status);
             continue;
         }
 
@@ -3330,6 +3442,10 @@ static void test_debugger(void)
                        "unexpected number of parameters %d, expected 0\n", de.u.Exception.ExceptionRecord.NumberParameters);
 
                     if (stage == 12|| stage == 13) continuestatus = DBG_EXCEPTION_NOT_HANDLED;
+                }
+                else if (stage == 14 || stage == 15)
+                {
+                    test_debugger_xstate(pi.hThread, &ctx, stage);
                 }
                 else
                     ok(FALSE, "unexpected stage %x\n", stage);
@@ -3647,6 +3763,8 @@ static struct
 }
 test_kiuserexceptiondispatcher_regs;
 
+static ULONG64 test_kiuserexceptiondispatcher_saved_r12;
+
 static DWORD dbg_except_continue_handler(EXCEPTION_RECORD *rec, EXCEPTION_REGISTRATION_RECORD *frame,
         CONTEXT *context, EXCEPTION_REGISTRATION_RECORD **dispatcher)
 {
@@ -3669,6 +3787,13 @@ static LONG WINAPI dbg_except_continue_vectored_handler(struct _EXCEPTION_POINTE
 
     trace("dbg_except_continue_vectored_handler, code %#x, Rip %#lx.\n", rec->ExceptionCode, context->Rip);
 
+    if (rec->ExceptionCode == 0xceadbeef)
+    {
+        ok(context->P1Home == (ULONG64)0xdeadbeeffeedcafe, "Got unexpected context->P1Home %#lx.\n", context->P1Home);
+        context->R12 = test_kiuserexceptiondispatcher_saved_r12;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
     ok(rec->ExceptionCode == 0x80000003, "Got unexpected exception code %#x.\n", rec->ExceptionCode);
 
     got_exception = 1;
@@ -3683,7 +3808,7 @@ static LONG WINAPI dbg_except_continue_vectored_handler(struct _EXCEPTION_POINTE
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
-void WINAPI hook_KiUserExceptionDispatcher(EXCEPTION_RECORD *rec, CONTEXT *context)
+static void WINAPI hook_KiUserExceptionDispatcher(EXCEPTION_RECORD *rec, CONTEXT *context)
 {
     trace("rec %p, context %p.\n", rec, context);
     trace("context->Rip %#lx, context->Rsp %#lx, ContextFlags %#lx.\n",
@@ -3691,7 +3816,7 @@ void WINAPI hook_KiUserExceptionDispatcher(EXCEPTION_RECORD *rec, CONTEXT *conte
 
     hook_called = TRUE;
     /* Broken on Win2008, probably rec offset in stack is different. */
-    ok(rec->ExceptionCode == 0x80000003 || broken(!rec->ExceptionCode),
+    ok(rec->ExceptionCode == 0x80000003 || rec->ExceptionCode == 0xceadbeef || broken(!rec->ExceptionCode),
             "Got unexpected ExceptionCode %#x.\n", rec->ExceptionCode);
 
     hook_KiUserExceptionDispatcher_rip = (void *)context->Rip;
@@ -3741,15 +3866,15 @@ static void test_kiuserexceptiondispatcher(void)
         0x48, 0x89, 0xe2,           /* mov %rsp,%rdx */
         0x48, 0x8d, 0x8c, 0x24, 0xf0, 0x04, 0x00, 0x00,
                                     /* lea 0x4f0(%rsp),%rcx */
-
+        0x4c, 0x89, 0x22,           /* mov %r12,(%rdx) */
         0xff, 0x14, 0x25,
-        /* offset: 14 bytes */
+        /* offset: 17 bytes */
         0x00, 0x00, 0x00, 0x00,     /* callq *addr */ /* call hook implementation. */
         0x48, 0x31, 0xc9,           /* xor %rcx, %rcx */
         0x48, 0x31, 0xd2,           /* xor %rdx, %rdx */
 
         0xff, 0x24, 0x25,
-        /* offset: 27 bytes */
+        /* offset: 30 bytes */
         0x00, 0x00, 0x00, 0x00,     /* jmpq *addr */ /* jump to original function. */
     };
 
@@ -3758,6 +3883,8 @@ static void test_kiuserexceptiondispatcher(void)
     DWORD old_protect1, old_protect2;
     EXCEPTION_RECORD record;
     void *bpt_address;
+    CONTEXT ctx;
+    LONG pass;
     BYTE *ptr;
     BOOL ret;
 
@@ -3776,8 +3903,8 @@ static void test_kiuserexceptiondispatcher(void)
     ok(((ULONG64)&pKiUserExceptionDispatcher & 0xffffffff) == ((ULONG64)&pKiUserExceptionDispatcher),
             "Address is too long.\n");
 
-    *(unsigned int *)(hook_trampoline + 14) = (unsigned int)(ULONG_PTR)&phook_KiUserExceptionDispatcher;
-    *(unsigned int *)(hook_trampoline + 27) = (unsigned int)(ULONG_PTR)&pKiUserExceptionDispatcher;
+    *(unsigned int *)(hook_trampoline + 17) = (unsigned int)(ULONG_PTR)&phook_KiUserExceptionDispatcher;
+    *(unsigned int *)(hook_trampoline + 30) = (unsigned int)(ULONG_PTR)&pKiUserExceptionDispatcher;
 
     ret = VirtualProtect(hook_trampoline, ARRAY_SIZE(hook_trampoline), PAGE_EXECUTE_READWRITE, &old_protect1);
     ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
@@ -3885,6 +4012,35 @@ static void test_kiuserexceptiondispatcher(void)
 
     NtCurrentTeb()->Peb->BeingDebugged = 0;
 
+    vectored_handler = AddVectoredExceptionHandler(TRUE, dbg_except_continue_vectored_handler);
+    pass = 0;
+    InterlockedIncrement(&pass);
+    pRtlCaptureContext(&ctx);
+    if (InterlockedIncrement(&pass) == 2) /* interlocked to prevent compiler from moving before capture */
+    {
+        memcpy(pKiUserExceptionDispatcher, patched_KiUserExceptionDispatcher_bytes,
+                sizeof(patched_KiUserExceptionDispatcher_bytes));
+        got_exception = 0;
+        hook_called = FALSE;
+
+        record.ExceptionCode = 0xceadbeef;
+        test_kiuserexceptiondispatcher_saved_r12 = ctx.R12;
+        ctx.R12 = (ULONG64)0xdeadbeeffeedcafe;
+
+#ifdef __GNUC__
+        /* Spoil r12 value to make sure it doesn't come from the current userspace registers. */
+        __asm__ volatile("movq $0xdeadcafe, %%r12" : : : "%r12");
+#endif
+        pNtRaiseException(&record, &ctx, TRUE);
+        ok(0, "Shouldn't be reached.\n");
+    }
+    else
+    {
+        ok(pass == 3, "Got unexpected pass %d.\n", pass);
+    }
+    ok(hook_called, "Hook was not called.\n");
+    RemoveVectoredExceptionHandler(vectored_handler);
+
     ret = VirtualProtect(pKiUserExceptionDispatcher, sizeof(saved_KiUserExceptionDispatcher_bytes),
             old_protect2, &old_protect2);
     ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
@@ -3951,6 +4107,55 @@ static void test_nested_exception(void)
     ok(got_prev_frame_exception, "Did not get nested exception in the previous frame.\n");
 }
 
+static CONTEXT test_unwind_apc_context;
+static BOOL test_unwind_apc_called;
+
+static void CALLBACK test_unwind_apc(ULONG_PTR arg1, ULONG_PTR arg2, ULONG_PTR arg3)
+{
+    EXCEPTION_RECORD rec;
+
+    test_unwind_apc_called = TRUE;
+    memset(&rec, 0, sizeof(rec));
+    pRtlUnwind((void *)test_unwind_apc_context.Rsp, (void *)test_unwind_apc_context.Rip, &rec, (void *)0xdeadbeef);
+    ok(0, "Should not get here.\n");
+}
+
+static void test_unwind_from_apc(void)
+{
+    NTSTATUS status;
+    int pass;
+
+    if (!pNtQueueApcThread)
+    {
+        win_skip("NtQueueApcThread is not available.\n");
+        return;
+    }
+
+    pass = 0;
+    InterlockedIncrement(&pass);
+    RtlCaptureContext(&test_unwind_apc_context);
+    InterlockedIncrement(&pass);
+
+    if (pass == 2)
+    {
+        test_unwind_apc_called = FALSE;
+        status = pNtQueueApcThread(GetCurrentThread(), test_unwind_apc, 0, 0, 0);
+        ok(!status, "Got unexpected status %#x.\n", status);
+        SleepEx(0, TRUE);
+        ok(0, "Should not get here.\n");
+    }
+    if (pass == 3)
+    {
+        ok(test_unwind_apc_called, "Test user APC was not called.\n");
+        test_unwind_apc_called = FALSE;
+        status = pNtQueueApcThread(GetCurrentThread(), test_unwind_apc, 0, 0, 0);
+        ok(!status, "Got unexpected status %#x.\n", status);
+        NtContinue(&test_unwind_apc_context, TRUE );
+        ok(0, "Should not get here.\n");
+    }
+    ok(pass == 4, "Got unexpected pass %d.\n", pass);
+    ok(test_unwind_apc_called, "Test user APC was not called.\n");
+}
 #elif defined(__arm__)
 
 static void test_thread_context(void)
@@ -4047,7 +4252,7 @@ static void test_thread_context(void)
 #undef COMPARE
 }
 
-static void test_debugger(void)
+static void test_debugger(DWORD cont_status)
 {
     char cmdline[MAX_PATH];
     PROCESS_INFORMATION pi;
@@ -4075,7 +4280,7 @@ static void test_debugger(void)
 
     do
     {
-        continuestatus = DBG_CONTINUE;
+        continuestatus = cont_status;
         ok(WaitForDebugEvent(&de, INFINITE), "reading debug event\n");
 
         ret = ContinueDebugEvent(de.dwProcessId, de.dwThreadId, 0xdeadbeef);
@@ -4085,7 +4290,7 @@ static void test_debugger(void)
         if (de.dwThreadId != pi.dwThreadId)
         {
             trace("event %d not coming from main thread, ignoring\n", de.dwDebugEventCode);
-            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, cont_status);
             continue;
         }
 
@@ -4572,23 +4777,17 @@ static void test_virtual_unwind(void)
 
     static const BYTE unwind_info_1[] = { DW(unwind_info_1_packed) };
 
-    /* The prologue/epilogue locations are commented out below, as we don't
-     * handle those cases at the moment. */
     static const struct results results_1[] =
     {
       /* offset  fp    handler  pc      frame offset  registers */
-#if 0
         { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
         { 0x04,  0x00,  0,     ORIG_LR, 0x020, TRUE, { {x19,0x00}, {x20,0x08}, {-1,-1} }},
         { 0x08,  0x00,  0,     0x10,    0x020, TRUE, { {x19,0x00}, {x20,0x08}, {lr,0x10}, {-1,-1} }},
-#endif
         { 0x0c,  0x00,  0,     0x20,    0x030, TRUE, { {x19,0x10}, {x20,0x18}, {lr,0x20}, {-1,-1} }},
         { 0x10,  0x00,  0,     0x20,    0x030, TRUE, { {x19,0x10}, {x20,0x18}, {lr,0x20}, {-1,-1} }},
-#if 0
         { 0x14,  0x00,  0,     0x10,    0x020, TRUE, { {x19,0x00}, {x20,0x08}, {lr,0x10}, {-1,-1} }},
         { 0x18,  0x00,  0,     ORIG_LR, 0x020, TRUE, { {x19,0x00}, {x20,0x08}, {-1,-1} }},
         { 0x1c,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
-#endif
     };
 
     static const BYTE function_2[] =
@@ -4808,6 +5007,314 @@ static void test_virtual_unwind(void)
 #endif
     };
 
+    static const BYTE function_6[] =
+    {
+        0xf3, 0x53, 0xbd, 0xa9,   /* 00: stp x19, x20, [sp, #-48]! */
+        0xf5, 0x0b, 0x00, 0xf9,   /* 04: str x21,      [sp, #16] */
+        0xe8, 0xa7, 0x01, 0x6d,   /* 08: stp d8,  d9,  [sp, #24] */
+        0xea, 0x17, 0x00, 0xfd,   /* 0c: str d10,      [sp, #40] */
+        0xff, 0x03, 0x00, 0xd1,   /* 10: sub sp,  sp,  #0 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 14: nop */
+        0xff, 0x03, 0x00, 0x91,   /* 18: add sp,  sp,  #0 */
+        0xea, 0x17, 0x40, 0xfd,   /* 1c: ldr d10,      [sp, #40] */
+        0xe8, 0xa7, 0x41, 0x6d,   /* 20: ldp d8,  d9,  [sp, #24] */
+        0xf5, 0x0b, 0x40, 0xf9,   /* 24: ldr x21,      [sp, #16] */
+        0xf3, 0x53, 0xc3, 0xa8,   /* 28: ldp x19, x20, [sp], #48 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 2c: ret */
+    };
+
+    static const DWORD unwind_info_6_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_6)/4 << 2) | /* FunctionLength */
+        (2 << 13) | /* RegF */
+        (3 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (0 << 21) | /* CR */
+        (3 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_6[] = { DW(unwind_info_6_packed) };
+
+    static const struct results results_6[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {-1,-1} }},
+        { 0x08,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {-1,-1} }},
+        { 0x0c,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {d8, 0x18}, {d9, 0x20}, {-1,-1} }},
+        { 0x10,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {d8, 0x18}, {d9, 0x20}, {d10, 0x28}, {-1,-1} }},
+        { 0x14,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {d8, 0x18}, {d9, 0x20}, {d10, 0x28}, {-1,-1} }},
+        { 0x18,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {d8, 0x18}, {d9, 0x20}, {d10, 0x28}, {-1,-1} }},
+        { 0x1c,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {d8, 0x18}, {d9, 0x20}, {d10, 0x28}, {-1,-1} }},
+        { 0x20,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {d8, 0x18}, {d9, 0x20}, {-1,-1} }},
+        { 0x24,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {x21, 0x10}, {-1,-1} }},
+        { 0x28,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19,0x00}, {x20,0x08}, {-1,-1} }},
+        { 0x2c,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_7[] =
+    {
+        0xf3, 0x0f, 0x1d, 0xf8,   /* 00: str x19,      [sp, #-48]! */
+        0xe8, 0xa7, 0x00, 0x6d,   /* 04: stp d8,  d9,  [sp, #8] */
+        0xea, 0xaf, 0x01, 0x6d,   /* 08: stp d10, d11, [sp, #24] */
+        0xff, 0x03, 0x00, 0xd1,   /* 0c: sub sp,  sp,  #0 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 10: nop */
+        0xff, 0x03, 0x00, 0x91,   /* 14: add sp,  sp,  #0 */
+        0xea, 0xaf, 0x41, 0x6d,   /* 18: ldp d10, d11, [sp, #24] */
+        0xe8, 0xa7, 0x40, 0x6d,   /* 1c: ldp d8,  d9,  [sp, #8] */
+        0xf3, 0x07, 0x43, 0xf8,   /* 20: ldr x19,      [sp], #48 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 24: ret */
+    };
+
+    static const DWORD unwind_info_7_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_7)/4 << 2) | /* FunctionLength */
+        (3 << 13) | /* RegF */
+        (1 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (0 << 21) | /* CR */
+        (3 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_7[] = { DW(unwind_info_7_packed) };
+
+    static const struct results results_7[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x08,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {d8, 0x08}, {d9, 0x10}, {-1,-1} }},
+        { 0x0c,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {d8, 0x08}, {d9, 0x10}, {d10, 0x18}, {d11, 0x20}, {-1,-1} }},
+        { 0x10,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {d8, 0x08}, {d9, 0x10}, {d10, 0x18}, {d11, 0x20}, {-1,-1} }},
+        { 0x14,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {d8, 0x08}, {d9, 0x10}, {d10, 0x18}, {d11, 0x20}, {-1,-1} }},
+        { 0x18,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {d8, 0x08}, {d9, 0x10}, {d10, 0x18}, {d11, 0x20}, {-1,-1} }},
+        { 0x1c,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {d8, 0x08}, {d9, 0x10}, {-1,-1} }},
+        { 0x20,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x24,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_8[] =
+    {
+        0xe8, 0x27, 0xbf, 0x6d,   /* 00: stp d8,  d9,  [sp, #-16]! */
+        0xff, 0x83, 0x00, 0xd1,   /* 04: sub sp,  sp,  #32 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 08: nop */
+        0xff, 0x83, 0x00, 0x91,   /* 0c: add sp,  sp,  #32 */
+        0xe8, 0x27, 0xc1, 0x6c,   /* 10: ldp d8,  d9,  [sp], #16 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 14: ret */
+    };
+
+    static const DWORD unwind_info_8_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_8)/4 << 2) | /* FunctionLength */
+        (1 << 13) | /* RegF */
+        (0 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (0 << 21) | /* CR */
+        (3 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_8[] = { DW(unwind_info_8_packed) };
+
+    static const struct results results_8[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x00,  0,     ORIG_LR, 0x010, TRUE, { {d8, 0x00}, {d9, 0x08}, {-1,-1} }},
+        { 0x08,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {d8, 0x20}, {d9, 0x28}, {-1,-1} }},
+        { 0x0c,  0x00,  0,     ORIG_LR, 0x030, TRUE, { {d8, 0x20}, {d9, 0x28}, {-1,-1} }},
+        { 0x10,  0x00,  0,     ORIG_LR, 0x010, TRUE, { {d8, 0x00}, {d9, 0x08}, {-1,-1} }},
+        { 0x14,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_9[] =
+    {
+        0xf3, 0x0f, 0x1b, 0xf8,   /* 00: str x19,      [sp, #-80]! */
+        0xe0, 0x87, 0x00, 0xa9,   /* 04: stp x0,  x1,  [sp, #8] */
+        0xe2, 0x8f, 0x01, 0xa9,   /* 08: stp x2,  x3,  [sp, #24] */
+        0xe4, 0x97, 0x02, 0xa9,   /* 0c: stp x4,  x5,  [sp, #40] */
+        0xe6, 0x9f, 0x03, 0xa9,   /* 10: stp x6,  x7,  [sp, #56] */
+        0xff, 0x83, 0x00, 0xd1,   /* 14: sub sp,  sp,  #32 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 18: nop */
+        0xff, 0x83, 0x00, 0x91,   /* 1c: add sp,  sp,  #32 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 20: nop */
+        0x1f, 0x20, 0x03, 0xd5,   /* 24: nop */
+        0x1f, 0x20, 0x03, 0xd5,   /* 28: nop */
+        0x1f, 0x20, 0x03, 0xd5,   /* 2c: nop */
+        0xf3, 0x0f, 0x1b, 0xf8,   /* 30: ldr x19,      [sp], #80 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 34: ret */
+    };
+
+    static const DWORD unwind_info_9_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_9)/4 << 2) | /* FunctionLength */
+        (0 << 13) | /* RegF */
+        (1 << 16) | /* RegI */
+        (1 << 20) | /* H */
+        (0 << 21) | /* CR */
+        (7 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_9[] = { DW(unwind_info_9_packed) };
+
+    static const struct results results_9[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x08,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x0c,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x10,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x14,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x18,  0x00,  0,     ORIG_LR, 0x070, TRUE, { {x19, 0x20}, {-1,-1} }},
+        { 0x1c,  0x00,  0,     ORIG_LR, 0x070, TRUE, { {x19, 0x20}, {-1,-1} }},
+        { 0x20,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x24,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x28,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x2c,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x30,  0x00,  0,     ORIG_LR, 0x050, TRUE, { {x19, 0x00}, {-1,-1} }},
+        { 0x34,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_10[] =
+    {
+        0xfe, 0x0f, 0x1f, 0xf8,   /* 00: str lr,       [sp, #-16]! */
+        0xff, 0x43, 0x00, 0xd1,   /* 04: sub sp,  sp,  #16 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 08: nop */
+        0xff, 0x43, 0x00, 0x91,   /* 0c: add sp,  sp,  #16 */
+        0xfe, 0x07, 0x41, 0xf8,   /* 10: ldr lr,       [sp], #16 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 14: ret */
+    };
+
+    static const DWORD unwind_info_10_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_10)/4 << 2) | /* FunctionLength */
+        (0 << 13) | /* RegF */
+        (0 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (1 << 21) | /* CR */
+        (2 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_10[] = { DW(unwind_info_10_packed) };
+
+    static const struct results results_10[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x00,  0,     0x00,    0x010, TRUE, { {lr, 0x00}, {-1,-1} }},
+        { 0x08,  0x00,  0,     0x10,    0x020, TRUE, { {lr, 0x10}, {-1,-1} }},
+        { 0x0c,  0x00,  0,     0x10,    0x020, TRUE, { {lr, 0x10}, {-1,-1} }},
+        { 0x10,  0x00,  0,     0x00,    0x010, TRUE, { {lr, 0x00}, {-1,-1} }},
+        { 0x14,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_11[] =
+    {
+        0xf3, 0x53, 0xbe, 0xa9,   /* 00: stp x19, x20, [sp, #-32]! */
+        0xf5, 0x7b, 0x01, 0xa9,   /* 04: stp x21, lr,  [sp, #16] */
+        0xff, 0x43, 0x00, 0xd1,   /* 08: sub sp,  sp,  #16 */
+        0x1f, 0x20, 0x03, 0xd5,   /* 0c: nop */
+        0xff, 0x43, 0x00, 0x91,   /* 10: add sp,  sp,  #16 */
+        0xf5, 0x7b, 0x41, 0xa9,   /* 14: ldp x21, lr,  [sp, #16] */
+        0xf3, 0x53, 0xc2, 0xa8,   /* 18: ldp x19, x20, [sp], #32 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 1c: ret */
+    };
+
+    static const DWORD unwind_info_11_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_11)/4 << 2) | /* FunctionLength */
+        (0 << 13) | /* RegF */
+        (3 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (1 << 21) | /* CR */
+        (3 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_11[] = { DW(unwind_info_11_packed) };
+
+    static const struct results results_11[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x00,  0,     ORIG_LR, 0x020, TRUE, { {x19, 0x00}, {x20, 0x08}, {-1,-1} }},
+        { 0x08,  0x00,  0,     0x18,    0x020, TRUE, { {x19, 0x00}, {x20, 0x08}, {x21, 0x10}, {lr, 0x18}, {-1,-1} }},
+        { 0x0c,  0x00,  0,     0x28,    0x030, TRUE, { {x19, 0x10}, {x20, 0x18}, {x21, 0x20}, {lr, 0x28}, {-1,-1} }},
+        { 0x10,  0x00,  0,     0x28,    0x030, TRUE, { {x19, 0x10}, {x20, 0x18}, {x21, 0x20}, {lr, 0x28}, {-1,-1} }},
+        { 0x14,  0x00,  0,     0x18,    0x020, TRUE, { {x19, 0x00}, {x20, 0x08}, {x21, 0x10}, {lr, 0x18}, {-1,-1} }},
+        { 0x18,  0x00,  0,     ORIG_LR, 0x020, TRUE, { {x19, 0x00}, {x20, 0x08}, {-1,-1} }},
+        { 0x1c,  0x00,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_12[] =
+    {
+        0xf3, 0x53, 0xbf, 0xa9,   /* 00: stp x19, x20, [sp, #-16]! */
+        0xfd, 0x7b, 0xbe, 0xa9,   /* 04: stp x29, lr,  [sp, #-32]! */
+        0xfd, 0x03, 0x00, 0x91,   /* 08: mov x29, sp */
+        0x1f, 0x20, 0x03, 0xd5,   /* 0c: nop */
+        0xbf, 0x03, 0x00, 0x91,   /* 10: mov sp,  x29 */
+        0xfd, 0x7b, 0xc2, 0xa8,   /* 14: ldp x29, lr,  [sp], #32 */
+        0xf3, 0x53, 0xc1, 0xa8,   /* 18: ldp x19, x20, [sp], #16 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 1c: ret */
+    };
+
+    static const DWORD unwind_info_12_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_12)/4 << 2) | /* FunctionLength */
+        (0 << 13) | /* RegF */
+        (2 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (3 << 21) | /* CR */
+        (3 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_12[] = { DW(unwind_info_12_packed) };
+
+    static const struct results results_12[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x10,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x10,  0,     ORIG_LR, 0x010, TRUE, { {x19, 0x00}, {x20, 0x08}, {-1,-1} }},
+        { 0x08,  0x10,  0,     0x08,    0x030, TRUE, { {x19, 0x20}, {x20, 0x28}, {x29, 0x00}, {lr, 0x08}, {-1,-1} }},
+        { 0x0c,  0x10,  0,     0x18,    0x040, TRUE, { {x19, 0x30}, {x20, 0x38}, {x29, 0x10}, {lr, 0x18}, {-1,-1} }},
+        { 0x10,  0x10,  0,     0x18,    0x040, TRUE, { {x19, 0x30}, {x20, 0x38}, {x29, 0x10}, {lr, 0x18}, {-1,-1} }},
+        { 0x14,  0x10,  0,     0x08,    0x030, TRUE, { {x19, 0x20}, {x20, 0x28}, {x29, 0x00}, {lr, 0x08}, {-1,-1} }},
+        { 0x18,  0x10,  0,     ORIG_LR, 0x010, TRUE, { {x19, 0x00}, {x20, 0x08}, {-1,-1} }},
+        { 0x1c,  0x10,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
+    static const BYTE function_13[] =
+    {
+        0xf3, 0x53, 0xbf, 0xa9,   /* 00: stp x19, x20, [sp, #-16]! */
+        0xff, 0x43, 0x08, 0xd1,   /* 04: sub sp,  sp,  #528 */
+        0xfd, 0x7b, 0x00, 0xd1,   /* 08: stp x29, lr,  [sp] */
+        0xfd, 0x03, 0x00, 0x91,   /* 0c: mov x29, sp */
+        0x1f, 0x20, 0x03, 0xd5,   /* 10: nop */
+        0xbf, 0x03, 0x00, 0x91,   /* 14: mov sp,  x29 */
+        0xfd, 0x7b, 0x40, 0xa9,   /* 18: ldp x29, lr,  [sp] */
+        0xff, 0x43, 0x08, 0x91,   /* 1c: add sp,  sp,  #528 */
+        0xf3, 0x53, 0xc1, 0xa8,   /* 20: ldp x19, x20, [sp], #16 */
+        0xc0, 0x03, 0x5f, 0xd6,   /* 24: ret */
+    };
+
+    static const DWORD unwind_info_13_packed =
+        (1 << 0)  | /* Flag */
+        (sizeof(function_13)/4 << 2) | /* FunctionLength */
+        (0 << 13) | /* RegF */
+        (2 << 16) | /* RegI */
+        (0 << 20) | /* H */
+        (3 << 21) | /* CR */
+        (34 << 23);  /* FrameSize */
+
+    static const BYTE unwind_info_13[] = { DW(unwind_info_13_packed) };
+
+    static const struct results results_13[] =
+    {
+      /* offset  fp    handler  pc      frame offset  registers */
+        { 0x00,  0x10,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+        { 0x04,  0x10,  0,     ORIG_LR, 0x010, TRUE, { {x19, 0x00}, {x20, 0x08}, {-1,-1} }},
+        { 0x08,  0x10,  0,     ORIG_LR, 0x220, TRUE, { {x19, 0x210}, {x20, 0x218}, {-1,-1} }},
+        { 0x0c,  0x10,  0,     0x08,    0x220, TRUE, { {x19, 0x210}, {x20, 0x218}, {x29, 0x00}, {lr, 0x08}, {-1,-1} }},
+        { 0x10,  0x10,  0,     0x18,    0x230, TRUE, { {x19, 0x220}, {x20, 0x228}, {x29, 0x10}, {lr, 0x18}, {-1,-1} }},
+        { 0x14,  0x10,  0,     0x18,    0x230, TRUE, { {x19, 0x220}, {x20, 0x228}, {x29, 0x10}, {lr, 0x18}, {-1,-1} }},
+        { 0x18,  0x10,  0,     0x08,    0x220, TRUE, { {x19, 0x210}, {x20, 0x218}, {x29, 0x00}, {lr, 0x08}, {-1,-1} }},
+        { 0x1c,  0x10,  0,     ORIG_LR, 0x220, TRUE, { {x19, 0x210}, {x20, 0x218}, {-1,-1} }},
+        { 0x20,  0x10,  0,     ORIG_LR, 0x010, TRUE, { {x19, 0x00}, {x20, 0x08}, {-1,-1} }},
+        { 0x24,  0x10,  0,     ORIG_LR, 0x000, TRUE, { {-1,-1} }},
+    };
+
     static const struct unwind_test tests[] =
     {
 #define TEST(func, unwind, unwind_packed, results) \
@@ -4818,6 +5325,14 @@ static void test_virtual_unwind(void)
         TEST(function_3, unwind_info_3, 0, results_3),
         TEST(function_4, unwind_info_4, 0, results_4),
         TEST(function_5, unwind_info_5, 0, results_5),
+        TEST(function_6, unwind_info_6, 1, results_6),
+        TEST(function_7, unwind_info_7, 1, results_7),
+        TEST(function_8, unwind_info_8, 1, results_8),
+        TEST(function_9, unwind_info_9, 1, results_9),
+        TEST(function_10, unwind_info_10, 1, results_10),
+        TEST(function_11, unwind_info_11, 1, results_11),
+        TEST(function_12, unwind_info_12, 1, results_12),
+        TEST(function_13, unwind_info_13, 1, results_13),
 #undef TEST
     };
     unsigned int i;
@@ -4981,11 +5496,11 @@ static void test_thread_context(void)
     /* Pc is somewhere close to the NtGetContextThread implementation */
     ok( (char *)context.Pc >= (char *)pNtGetContextThread - 0x40000 &&
         (char *)context.Pc <= (char *)pNtGetContextThread + 0x40000,
-        "wrong Pc %08x/%08x\n", context.Pc, (DWORD)pNtGetContextThread );
+        "wrong Pc %p/%p\n", (void *)context.Pc, pNtGetContextThread );
 #undef COMPARE
 }
 
-static void test_debugger(void)
+static void test_debugger(DWORD cont_status)
 {
     char cmdline[MAX_PATH];
     PROCESS_INFORMATION pi;
@@ -5013,7 +5528,7 @@ static void test_debugger(void)
 
     do
     {
-        continuestatus = DBG_CONTINUE;
+        continuestatus = cont_status;
         ok(WaitForDebugEvent(&de, INFINITE), "reading debug event\n");
 
         ret = ContinueDebugEvent(de.dwProcessId, de.dwThreadId, 0xdeadbeef);
@@ -5023,7 +5538,7 @@ static void test_debugger(void)
         if (de.dwThreadId != pi.dwThreadId)
         {
             trace("event %d not coming from main thread, ignoring\n", de.dwDebugEventCode);
-            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, DBG_CONTINUE);
+            ContinueDebugEvent(de.dwProcessId, de.dwThreadId, cont_status);
             continue;
         }
 
@@ -5647,6 +6162,57 @@ static void test_breakpoint(DWORD numexc)
     pRtlRemoveVectoredExceptionHandler(vectored_handler);
 }
 
+#if defined(__i386__) || defined(__x86_64__)
+static BYTE except_code_set_ymm0[] =
+{
+#ifdef __x86_64__
+    0x48,
+#endif
+    0xb8,                         /* mov imm,%ax */
+    0x00, 0x00, 0x00, 0x00,
+#ifdef __x86_64__
+    0x00, 0x00, 0x00, 0x00,
+#endif
+
+    0xc5, 0xfc, 0x10, 0x00,       /* vmovups (%ax),%ymm0 */
+    0xcc,                         /* int3 */
+    0xc5, 0xfc, 0x11, 0x00,       /* vmovups %ymm0,(%ax) */
+    0xc3,                         /* ret  */
+};
+
+static void test_debuggee_xstate(void)
+{
+    void (CDECL *func)(void) = code_mem;
+    unsigned int address_offset, i;
+    unsigned int data[8];
+
+    if (!pRtlGetEnabledExtendedFeatures || !pRtlGetEnabledExtendedFeatures(1 << XSTATE_AVX))
+    {
+        memcpy(code_mem, breakpoint_code, sizeof(breakpoint_code));
+        func();
+        return;
+    }
+
+    memcpy(code_mem, except_code_set_ymm0, sizeof(except_code_set_ymm0));
+    address_offset = sizeof(void *) == 8 ? 2 : 1;
+    *(void **)((BYTE *)code_mem + address_offset) = data;
+
+    for (i = 0; i < ARRAY_SIZE(data); ++i)
+        data[i] = i + 1;
+
+    func();
+
+    for (i = 0; i < 4; ++i)
+        ok(data[i] == (test_stage == 14 ? i + 1 : 0x28282828),
+                "Got unexpected data %#x, test_stage %u, i %u.\n", data[i], test_stage, i);
+
+    for (     ; i < ARRAY_SIZE(data); ++i)
+        ok(data[i] == (test_stage == 14 ? i + 1 : 0x48484848)
+                || broken(test_stage == 15 && data[i] == i + 1) /* Win7 */,
+                "Got unexpected data %#x, test_stage %u, i %u.\n", data[i], test_stage, i);
+}
+#endif
+
 static DWORD invalid_handle_exceptions;
 
 static LONG CALLBACK invalid_handle_vectored_handler(EXCEPTION_POINTERS *ExceptionInfo)
@@ -6113,26 +6679,176 @@ done:
     return ExceptionContinueExecution;
 }
 
+struct call_func_offsets
+{
+    unsigned int func_addr;
+    unsigned int func_param1;
+    unsigned int func_param2;
+    unsigned int ymm0_save;
+};
+#ifdef __x86_64__
+static BYTE call_func_code_set_ymm0[] =
+{
+    0x55,                         /* pushq %rbp */
+    0x48, 0xb8,                   /* mov imm,%rax */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0x48, 0xb9,                   /* mov imm,%rcx */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0x48, 0xba,                   /* mov imm,%rdx */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0x48, 0xbd,                   /* mov imm,%rbp */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0xc5, 0xfc, 0x10, 0x45, 0x00, /* vmovups (%rbp),%ymm0 */
+    0x48, 0x83, 0xec, 0x20,       /* sub $0x20,%rsp */
+    0xff, 0xd0,                   /* call *rax */
+    0x48, 0x83, 0xc4, 0x20,       /* add $0x20,%rsp */
+    0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%rbp) */
+    0x5d,                         /* popq %rbp */
+    0xc3,                         /* ret  */
+};
+static BYTE call_func_code_reset_ymm_state[] =
+{
+    0x55,                         /* pushq %rbp */
+    0x48, 0xb8,                   /* mov imm,%rax */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0x48, 0xb9,                   /* mov imm,%rcx */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0x48, 0xba,                   /* mov imm,%rdx */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0x48, 0xbd,                   /* mov imm,%rbp */
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+
+    0xc5, 0xf8, 0x77,             /* vzeroupper */
+    0x0f, 0x57, 0xc0,             /* xorps  %xmm0,%xmm0 */
+    0x48, 0x83, 0xec, 0x20,       /* sub $0x20,%rsp */
+    0xff, 0xd0,                   /* call *rax */
+    0x48, 0x83, 0xc4, 0x20,       /* add $0x20,%rsp */
+    0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%rbp) */
+    0x5d,                         /* popq %rbp */
+    0xc3,                         /* ret  */
+};
+static const struct call_func_offsets call_func_offsets = {3, 13, 23, 33};
+#else
+static BYTE call_func_code_set_ymm0[] =
+{
+    0x55,                         /* pushl %ebp */
+    0xb8,                         /* mov imm,%eax */
+    0x00, 0x00, 0x00, 0x00,
+
+    0xb9,                         /* mov imm,%ecx */
+    0x00, 0x00, 0x00, 0x00,
+
+    0xba,                         /* mov imm,%edx */
+    0x00, 0x00, 0x00, 0x00,
+
+    0xbd,                         /* mov imm,%ebp */
+    0x00, 0x00, 0x00, 0x00,
+
+    0x81, 0xfa, 0xef, 0xbe, 0xad, 0xde,
+                                  /* cmpl $0xdeadbeef, %edx */
+    0x74, 0x01,                   /* je 1f */
+    0x52,                         /* pushl %edx */
+    0x51,                         /* 1: pushl %ecx */
+    0xc5, 0xfc, 0x10, 0x45, 0x00, /* vmovups (%ebp),%ymm0 */
+    0xff, 0xd0,                   /* call *eax */
+    0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%ebp) */
+    0x5d,                         /* popl %ebp */
+    0xc3,                         /* ret  */
+};
+static BYTE call_func_code_reset_ymm_state[] =
+{
+    0x55,                         /* pushl %ebp */
+    0xb8,                         /* mov imm,%eax */
+    0x00, 0x00, 0x00, 0x00,
+
+    0xb9,                         /* mov imm,%ecx */
+    0x00, 0x00, 0x00, 0x00,
+
+    0xba,                         /* mov imm,%edx */
+    0x00, 0x00, 0x00, 0x00,
+
+    0xbd,                         /* mov imm,%ebp */
+    0x00, 0x00, 0x00, 0x00,
+
+    0x81, 0xfa, 0xef, 0xbe, 0xad, 0xde,
+                                  /* cmpl $0xdeadbeef, %edx */
+    0x74, 0x01,                   /* je 1f */
+    0x52,                         /* pushl %edx */
+    0x51,                         /* 1: pushl %ecx */
+    0xc5, 0xf8, 0x77,             /* vzeroupper */
+    0x0f, 0x57, 0xc0,             /* xorps  %xmm0,%xmm0 */
+    0xff, 0xd0,                   /* call *eax */
+    0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%ebp) */
+    0x5d,                         /* popl %ebp */
+    0xc3,                         /* ret  */
+};
+static const struct call_func_offsets call_func_offsets = {2, 7, 12, 17};
+#endif
+
+static DWORD WINAPI test_extended_context_thread(void *arg)
+{
+    ULONG (WINAPI* func)(void) = code_mem;
+    static unsigned int data[8];
+    unsigned int i;
+
+    memcpy(code_mem, call_func_code_reset_ymm_state, sizeof(call_func_code_reset_ymm_state));
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_addr) = SuspendThread;
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_param1) = (void *)GetCurrentThread();
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_param2) = (void *)0xdeadbeef;
+    *(void **)((BYTE *)code_mem + call_func_offsets.ymm0_save) = data;
+    func();
+
+    for (i = 0; i < 4; ++i)
+        ok(!data[i], "Got unexpected data %#x, i %u.\n", data[i], i);
+    for (; i < 8; ++i)
+        ok(data[i] == 0x48484848, "Got unexpected data %#x, i %u.\n", data[i], i);
+    memset(data, 0x68, sizeof(data));
+
+    memcpy(code_mem, call_func_code_set_ymm0, sizeof(call_func_code_set_ymm0));
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_addr) = SuspendThread;
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_param1) = (void *)GetCurrentThread();
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_param2) = (void *)0xdeadbeef;
+    *(void **)((BYTE *)code_mem + call_func_offsets.ymm0_save) = data;
+    func();
+
+    memcpy(code_mem, call_func_code_reset_ymm_state, sizeof(call_func_code_reset_ymm_state));
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_addr) = SuspendThread;
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_param1) = (void *)GetCurrentThread();
+    *(void **)((BYTE *)code_mem + call_func_offsets.func_param2) = (void *)0xdeadbeef;
+    *(void **)((BYTE *)code_mem + call_func_offsets.ymm0_save) = data;
+    func();
+    return 0;
+}
+
+static void wait_for_thread_next_suspend(HANDLE thread)
+{
+    DWORD result;
+
+    result = ResumeThread(thread);
+    ok(result == 1, "Got unexpexted suspend count %u.\n", result);
+
+    /* NtQueryInformationThread(ThreadSuspendCount, ...) is not supported on older Windows. */
+    while (!(result = SuspendThread(thread)))
+    {
+        ResumeThread(thread);
+        Sleep(1);
+    }
+    ok(result == 1, "Got unexpexted suspend count %u.\n", result);
+    result = ResumeThread(thread);
+    ok(result == 2, "Got unexpexted suspend count %u.\n", result);
+}
+
 #define CONTEXT_NATIVE (CONTEXT_XSTATE & CONTEXT_CONTROL)
 
 static void test_extended_context(void)
 {
-    static BYTE except_code_set_ymm0[] =
-    {
-#ifdef __x86_64__
-        0x48,
-#endif
-        0xb8,                         /* mov imm,%ax */
-        0x00, 0x00, 0x00, 0x00,
-#ifdef __x86_64__
-        0x00, 0x00, 0x00, 0x00,
-#endif
-
-        0xc5, 0xfc, 0x10, 0x00,       /* vmovups (%ax),%ymm0 */
-        0xcc,                         /* int3 */
-        0xc5, 0xfc, 0x11, 0x00,       /* vmovups %ymm0,(%ax) */
-        0xc3,                         /* ret  */
-    };
     static BYTE except_code_reset_ymm_state[] =
     {
 #ifdef __x86_64__
@@ -6151,115 +6867,6 @@ static void test_extended_context(void)
         0xc5, 0xfc, 0x11, 0x00,       /* vmovups %ymm0,(%ax) */
         0xc3,                         /* ret  */
     };
-
-    struct call_func_offsets
-    {
-        unsigned int func_addr;
-        unsigned int func_param1;
-        unsigned int func_param2;
-        unsigned int ymm0_save;
-    };
-#ifdef __x86_64__
-    static BYTE call_func_code_set_ymm0[] =
-    {
-        0x55,                         /* pushq %rbp */
-        0x48, 0xb8,                   /* mov imm,%rax */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0x48, 0xb9,                   /* mov imm,%rcx */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0x48, 0xba,                   /* mov imm,%rdx */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0x48, 0xbd,                   /* mov imm,%rbp */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0xc5, 0xfc, 0x10, 0x45, 0x00, /* vmovups (%rbp),%ymm0 */
-        0xff, 0xd0,                   /* call *rax */
-        0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%rbp) */
-        0x5d,                         /* popq %rbp */
-        0xc3,                         /* ret  */
-    };
-    static BYTE call_func_code_reset_ymm_state[] =
-    {
-        0x55,                         /* pushq %rbp */
-        0x48, 0xb8,                   /* mov imm,%rax */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0x48, 0xb9,                   /* mov imm,%rcx */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0x48, 0xba,                   /* mov imm,%rdx */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0x48, 0xbd,                   /* mov imm,%rbp */
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-
-        0xc5, 0xf8, 0x77,             /* vzeroupper */
-        0x0f, 0x57, 0xc0,             /* xorps  %xmm0,%xmm0 */
-        0xff, 0xd0,                   /* call *rax */
-        0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%rbp) */
-        0x5d,                         /* popq %rbp */
-        0xc3,                         /* ret  */
-    };
-    static const struct call_func_offsets call_func_offsets = {3, 13, 23, 33};
-#else
-    static BYTE call_func_code_set_ymm0[] =
-    {
-        0x55,                         /* pushl %ebp */
-        0xb8,                         /* mov imm,%eax */
-        0x00, 0x00, 0x00, 0x00,
-
-        0xb9,                         /* mov imm,%ecx */
-        0x00, 0x00, 0x00, 0x00,
-
-        0xba,                         /* mov imm,%edx */
-        0x00, 0x00, 0x00, 0x00,
-
-        0xbd,                         /* mov imm,%ebp */
-        0x00, 0x00, 0x00, 0x00,
-
-        0x81, 0xfa, 0xef, 0xbe, 0xad, 0xde,
-                                      /* cmpl $0xdeadbeef, %edx */
-        0x74, 0x01,                   /* je 1f */
-        0x52,                         /* pushl %edx */
-        0x51,                         /* 1: pushl %ecx */
-        0xc5, 0xfc, 0x10, 0x45, 0x00, /* vmovups (%ebp),%ymm0 */
-        0xff, 0xd0,                   /* call *eax */
-        0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%ebp) */
-        0x5d,                         /* popl %ebp */
-        0xc3,                         /* ret  */
-    };
-    static BYTE call_func_code_reset_ymm_state[] =
-    {
-        0x55,                         /* pushl %ebp */
-        0xb8,                         /* mov imm,%eax */
-        0x00, 0x00, 0x00, 0x00,
-
-        0xb9,                         /* mov imm,%ecx */
-        0x00, 0x00, 0x00, 0x00,
-
-        0xba,                         /* mov imm,%edx */
-        0x00, 0x00, 0x00, 0x00,
-
-        0xbd,                         /* mov imm,%ebp */
-        0x00, 0x00, 0x00, 0x00,
-
-        0x81, 0xfa, 0xef, 0xbe, 0xad, 0xde,
-                                      /* cmpl $0xdeadbeef, %edx */
-        0x74, 0x01,                   /* je 1f */
-        0x52,                         /* pushl %edx */
-        0x51,                         /* 1: pushl %ecx */
-        0xc5, 0xf8, 0x77,             /* vzeroupper */
-        0x0f, 0x57, 0xc0,             /* xorps  %xmm0,%xmm0 */
-        0xff, 0xd0,                   /* call *eax */
-        0xc5, 0xfc, 0x11, 0x45, 0x00, /* vmovups %ymm0,(%ebp) */
-        0x5d,                         /* popl %ebp */
-        0xc3,                         /* ret  */
-    };
-    static const struct call_func_offsets call_func_offsets = {2, 7, 12, 17};
-#endif
 
     static const struct
     {
@@ -6312,6 +6919,7 @@ static void test_extended_context(void)
     CONTEXT_EX *context_ex;
     CONTEXT *context;
     unsigned data[8];
+    HANDLE thread;
     ULONG64 mask;
     XSTATE *xs;
     BOOL bret;
@@ -6652,12 +7260,14 @@ static void test_extended_context(void)
 
             length = 0xdeadbeef;
             ret = pRtlGetExtendedContextLength2(flags, &length, 0);
-            ok(!ret && length == expected_length_xstate - sizeof(YMMCONTEXT),
+            ok((!ret && length == expected_length_xstate - sizeof(YMMCONTEXT))
+                    || broken(!ret && length == expected_length_xstate) /* win10pro */,
                     "Got unexpected result ret %#x, length %#x, test %u.\n", ret, length, test);
 
             length = 0xdeadbeef;
             ret = pRtlGetExtendedContextLength2(flags, &length, 3);
-            ok(!ret && length == expected_length_xstate - sizeof(YMMCONTEXT),
+            ok((!ret && length == expected_length_xstate - sizeof(YMMCONTEXT))
+                    || broken(!ret && length == expected_length_xstate) /* win10pro */,
                     "Got unexpected result ret %#x, length %#x, test %u.\n", ret, length, test);
 
             length = 0xdeadbeef;
@@ -6839,7 +7449,9 @@ static void test_extended_context(void)
 
             length2 = 0xdeadbeef;
             p = pRtlLocateExtendedFeature(context_ex, 2, &length2);
-            ok(!p && length2 == sizeof(YMMCONTEXT), "Got unexpected p %p, length %#x, flags %#x.\n", p, length2, flags);
+            ok((!p && length2 == sizeof(YMMCONTEXT))
+                    || broken(p && length2 == sizeof(YMMCONTEXT)) /* win10pro */,
+                    "Got unexpected p %p, length %#x, flags %#x.\n", p, length2, flags);
 
             length2 = 0xdeadbeef;
             p = pLocateXStateFeature(context, 2, &length2);
@@ -6861,7 +7473,8 @@ static void test_extended_context(void)
                     - context_arch[test].context_length;
             ok(context_ex->XState.Offset == expected_offset,
                     "Got unexpected Offset %d, flags %#x.\n", context_ex->XState.Offset, flags);
-            ok(context_ex->XState.Length == sizeof(XSTATE) - sizeof(YMMCONTEXT),
+            ok(context_ex->XState.Length == sizeof(XSTATE) - sizeof(YMMCONTEXT)
+                    || broken(context_ex->XState.Length == sizeof(XSTATE)) /* win10pro */,
                     "Got unexpected Length %#x, flags %#x.\n", context_ex->XState.Length, flags);
 
             ok(context_ex->All.Offset == -(int)context_arch[test].context_length,
@@ -6957,7 +7570,8 @@ static void test_extended_context(void)
             context->ContextFlags);
     expected_compaction = compaction_enabled ? (ULONG64)1 << 63 : 0;
 
-    ok(!xs->Mask, "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+    ok(!xs->Mask || broken(xs->Mask == 4) /* win10pro */,
+            "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
     ok(xs->CompactionMask == expected_compaction, "Got unexpected CompactionMask %s.\n",
             wine_dbgstr_longlong(xs->CompactionMask));
 
@@ -6965,7 +7579,7 @@ static void test_extended_context(void)
         ok(data[i] == test_extended_context_data[i], "Got unexpected data %#x, i %u.\n", data[i], i);
 
     for (i = 0; i < 4; ++i)
-        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc,
+        ok(((ULONG *)&xs->YmmContext)[i] == (xs->Mask == 4 ? test_extended_context_data[i + 4] : 0xcccccccc),
                 "Got unexpected data %#x, i %u.\n", ((ULONG *)&xs->YmmContext)[i], i);
 
     expected_compaction = compaction_enabled ? ((ULONG64)1 << 63) | 4 : 0;
@@ -6982,7 +7596,8 @@ static void test_extended_context(void)
     ok(xs->CompactionMask == 4, "Got unexpected CompactionMask %s.\n",
             wine_dbgstr_longlong(xs->CompactionMask));
     for (i = 0; i < 4; ++i)
-        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc,
+        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc
+                || broken(((ULONG *)&xs->YmmContext)[i] == test_extended_context_data[i + 4]) /* win10pro */,
                 "Got unexpected data %#x, i %u.\n", ((ULONG *)&xs->YmmContext)[i], i);
 
     xs->CompactionMask = 4;
@@ -6997,7 +7612,8 @@ static void test_extended_context(void)
     ok(xs->CompactionMask == expected_compaction, "Got unexpected CompactionMask %s.\n",
             wine_dbgstr_longlong(xs->CompactionMask));
     for (i = 0; i < 4; ++i)
-        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc,
+        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc
+                || broken(((ULONG *)&xs->YmmContext)[i] == test_extended_context_data[i + 4]) /* win10pro */,
                 "Got unexpected data %#x, i %u.\n", ((ULONG *)&xs->YmmContext)[i], i);
 
     context_ex->XState.Length = sizeof(XSTATE);
@@ -7078,6 +7694,93 @@ static void test_extended_context(void)
 
     for (i = 0; i < 8; ++i)
         ok(data[i] == test_extended_context_data[i], "Got unexpected data %#x, i %u.\n", data[i], i);
+
+    /* Test GetThreadContext for the other thread. */
+    thread = CreateThread(NULL, 0, test_extended_context_thread, 0, CREATE_SUSPENDED, NULL);
+    ok(!!thread, "Failed to create thread.\n");
+
+    bret = pInitializeContext(context_buffer, CONTEXT_FULL | CONTEXT_XSTATE | CONTEXT_FLOATING_POINT,
+            &context, &length);
+    ok(bret, "Got unexpected bret %#x.\n", bret);
+    memset(&xs->YmmContext, 0xcc, sizeof(xs->YmmContext));
+    context_ex = (CONTEXT_EX *)(context + 1);
+    xs = (XSTATE *)((BYTE *)context_ex + context_ex->XState.Offset);
+    pSetXStateFeaturesMask(context, 4);
+
+    bret = GetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    ok(!xs->Mask, "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+    ok(xs->CompactionMask == expected_compaction, "Got unexpected CompactionMask %s.\n",
+            wine_dbgstr_longlong(xs->CompactionMask));
+    for (i = 0; i < 16 * 4; ++i)
+        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc, "Got unexpected value %#x, i %u.\n",
+                ((ULONG *)&xs->YmmContext)[i], i);
+
+    pSetXStateFeaturesMask(context, 4);
+    memset(&xs->YmmContext, 0, sizeof(xs->YmmContext));
+    bret = SetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+
+    memset(&xs->YmmContext, 0xcc, sizeof(xs->YmmContext));
+    bret = GetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    ok(!xs->Mask || broken(xs->Mask == 4), "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+    ok(xs->CompactionMask == expected_compaction, "Got unexpected CompactionMask %s.\n",
+            wine_dbgstr_longlong(xs->CompactionMask));
+    for (i = 0; i < 16 * 4; ++i)
+        ok(((ULONG *)&xs->YmmContext)[i] == 0xcccccccc || broken(xs->Mask == 4 && !((ULONG *)&xs->YmmContext)[i]),
+                "Got unexpected value %#x, i %u.\n", ((ULONG *)&xs->YmmContext)[i], i);
+
+    pSetXStateFeaturesMask(context, 4);
+    memset(&xs->YmmContext, 0x28, sizeof(xs->YmmContext));
+    bret = SetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    memset(&xs->YmmContext, 0xcc, sizeof(xs->YmmContext));
+    bret = GetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    ok(xs->Mask == 4, "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+    ok(xs->CompactionMask == expected_compaction, "Got unexpected CompactionMask %s.\n",
+            wine_dbgstr_longlong(xs->CompactionMask));
+    for (i = 0; i < 16 * 4; ++i)
+        ok(((ULONG *)&xs->YmmContext)[i] == 0x28282828, "Got unexpected value %#x, i %u.\n",
+                ((ULONG *)&xs->YmmContext)[i], i);
+
+    wait_for_thread_next_suspend(thread);
+
+    bret = GetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    pSetXStateFeaturesMask(context, 4);
+    memset(&xs->YmmContext, 0x48, sizeof(xs->YmmContext));
+    bret = SetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+
+    wait_for_thread_next_suspend(thread);
+
+    memset(&xs->YmmContext, 0xcc, sizeof(xs->YmmContext));
+    bret = GetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    ok(xs->Mask == 4, "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+
+    for (i = 0; i < 4; ++i)
+        ok(((ULONG *)&xs->YmmContext)[i] == 0x68686868, "Got unexpected value %#x, i %u.\n",
+                ((ULONG *)&xs->YmmContext)[i], i);
+
+    wait_for_thread_next_suspend(thread);
+
+    memset(&xs->YmmContext, 0xcc, sizeof(xs->YmmContext));
+    bret = GetThreadContext(thread, context);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+    ok(xs->Mask == (sizeof(void *) == 4 ? 4 : 0) || broken(sizeof(void *) == 4 && !xs->Mask) /* Win7u */,
+            "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
+    for (i = 0; i < 16 * 4; ++i)
+        ok(((ULONG *)&xs->YmmContext)[i] == (xs->Mask ? (i < 8 * 4 ? 0 : 0x48484848) : 0xcccccccc),
+                "Got unexpected value %#x, i %u.\n", ((ULONG *)&xs->YmmContext)[i], i);
+
+    bret = ResumeThread(thread);
+    ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
+
+    WaitForSingleObject(thread, INFINITE);
+    CloseHandle(thread);
 }
 
 struct modified_range
@@ -7119,12 +7822,12 @@ static void check_changes_in_range_(const char *file, unsigned int line, const B
 
         if (flag & flags && p[i] != 0xcc)
         {
-            ok_(file, line)(0, "Got unexected byte %#x at %#x, flags %#x.\n", p[i], i, flags);
+            ok_(file, line)(0, "Got unexpected byte %#x at %#x, flags %#x.\n", p[i], i, flags);
             return;
         }
         else if (!(flag & flags) && p[i] != 0xdd)
         {
-            ok_(file, line)(0, "Got unexected byte %#x at %#x, flags %#x.\n", p[i], i, flags);
+            ok_(file, line)(0, "Got unexpected byte %#x at %#x, flags %#x.\n", p[i], i, flags);
             return;
         }
     }
@@ -7465,6 +8168,7 @@ START_TEST(exception)
 #define X(f) p##f = (void*)GetProcAddress(hntdll, #f)
     X(NtGetContextThread);
     X(NtSetContextThread);
+    X(NtQueueApcThread);
     X(NtReadVirtualMemory);
     X(NtClose);
     X(RtlUnwind);
@@ -7480,6 +8184,7 @@ START_TEST(exception)
     X(NtQueryInformationThread);
     X(NtSetInformationProcess);
     X(NtSuspendProcess);
+    X(NtRaiseException);
     X(NtResumeProcess);
     X(RtlGetUnloadEventTrace);
     X(RtlGetUnloadEventTraceEx);
@@ -7567,6 +8272,12 @@ START_TEST(exception)
         test_closehandle(1, (HANDLE)0xdeadbeef);
         test_stage = 13;
         test_closehandle(0, 0); /* Special case. */
+#if defined(__i386__) || defined(__x86_64__)
+        test_stage = 14;
+        test_debuggee_xstate();
+        test_stage = 15;
+        test_debuggee_xstate();
+#endif
 
         /* rest of tests only run in parent */
         return;
@@ -7586,6 +8297,7 @@ START_TEST(exception)
     test_kiuserexceptiondispatcher();
     test_extended_context();
     test_copy_context();
+    test_user_apc();
 
 #elif defined(__x86_64__)
 
@@ -7626,6 +8338,7 @@ START_TEST(exception)
       skip( "Dynamic unwind functions not found\n" );
     test_extended_context();
     test_copy_context();
+    test_unwind_from_apc();
 
 #elif defined(__aarch64__)
 
@@ -7633,7 +8346,8 @@ START_TEST(exception)
 
 #endif
 
-    test_debugger();
+    test_debugger(DBG_EXCEPTION_HANDLED);
+    test_debugger(DBG_CONTINUE);
     test_thread_context();
     test_outputdebugstring(1, FALSE);
     test_ripevent(1);

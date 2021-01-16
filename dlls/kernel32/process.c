@@ -18,9 +18,6 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "config.h"
-#include "wine/port.h"
-
 #include <assert.h>
 #include <ctype.h>
 #include <errno.h>
@@ -28,33 +25,17 @@
 #include <stdarg.h>
 #include <stdio.h>
 #include <time.h>
-#ifdef HAVE_SYS_TIME_H
-# include <sys/time.h>
-#endif
-#ifdef HAVE_SYS_IOCTL_H
-#include <sys/ioctl.h>
-#endif
-#ifdef HAVE_SYS_SOCKET_H
-#include <sys/socket.h>
-#endif
-#include <sys/types.h>
-#ifdef HAVE_SYS_WAIT_H
-# include <sys/wait.h>
-#endif
-#ifdef HAVE_UNISTD_H
-# include <unistd.h>
-#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "winternl.h"
 #include "winbase.h"
+#include "winnls.h"
 #include "wincon.h"
 #include "kernel_private.h"
 #include "psapi.h"
 #include "wine/exception.h"
 #include "wine/server.h"
-#include "wine/unicode.h"
 #include "wine/asm.h"
 #include "wine/debug.h"
 
@@ -68,12 +49,7 @@ typedef struct
     DWORD dwReserved;
 } LOADPARMS32;
 
-HMODULE kernel32_handle = 0;
 SYSTEM_BASIC_INFORMATION system_info = { 0 };
-
-const WCHAR DIR_Windows[] = {'C',':','\\','w','i','n','d','o','w','s',0};
-const WCHAR DIR_System[] = {'C',':','\\','w','i','n','d','o','w','s',
-                            '\\','s','y','s','t','e','m','3','2',0};
 
 /* Process flags */
 #define PDB32_DEBUGGED      0x0001  /* Process is being debugged */

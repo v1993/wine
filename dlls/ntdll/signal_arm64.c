@@ -39,6 +39,19 @@
 
 WINE_DEFAULT_DEBUG_CHANNEL(seh);
 
+typedef struct _SCOPE_TABLE
+{
+    ULONG Count;
+    struct
+    {
+        ULONG BeginAddress;
+        ULONG EndAddress;
+        ULONG HandlerAddress;
+        ULONG JumpTarget;
+    } ScopeRecord[1];
+} SCOPE_TABLE, *PSCOPE_TABLE;
+
+
 /* layering violation: the setjmp buffer is defined in msvcrt, but used by RtlUnwindEx */
 struct MSVCRT_JUMP_BUFFER
 {
@@ -63,6 +76,19 @@ struct MSVCRT_JUMP_BUFFER
 };
 
 
+static void dump_scope_table( ULONG64 base, const SCOPE_TABLE *table )
+{
+    unsigned int i;
+
+    TRACE( "scope table at %p\n", table );
+    for (i = 0; i < table->Count; i++)
+        TRACE( "  %u: %lx-%lx handler %lx target %lx\n", i,
+               base + table->ScopeRecord[i].BeginAddress,
+               base + table->ScopeRecord[i].EndAddress,
+               base + table->ScopeRecord[i].HandlerAddress,
+               base + table->ScopeRecord[i].JumpTarget );
+}
+
 /*******************************************************************
  *         is_valid_frame
  */
@@ -72,6 +98,14 @@ static inline BOOL is_valid_frame( ULONG_PTR frame )
     return ((void *)frame >= NtCurrentTeb()->Tib.StackLimit &&
             (void **)frame < (void **)NtCurrentTeb()->Tib.StackBase - 1);
 }
+
+
+/**************************************************************************
+ *		__chkstk (NTDLL.@)
+ *
+ * Supposed to touch all the stack pages, but we shouldn't need that.
+ */
+__ASM_GLOBAL_FUNC( __chkstk, "ret")
 
 
 /***********************************************************************
@@ -171,8 +205,16 @@ static NTSTATUS virtual_unwind( ULONG type, DISPATCHER_CONTEXT *dispatch, CONTEX
     }
     else
     {
-        WARN( "exception data not found in %s\n", debugstr_w(module->BaseDllName.Buffer) );
-        return STATUS_INVALID_DISPOSITION;
+        status = context->Pc != context->u.s.Lr ?
+                 STATUS_SUCCESS : STATUS_INVALID_DISPOSITION;
+        WARN( "exception data not found in %s for %p, LR %p, status %x\n",
+               debugstr_w(module->BaseDllName.Buffer), (void*) context->Pc,
+               (void*) context->u.s.Lr, status );
+        dispatch->EstablisherFrame = context->Sp;
+        dispatch->LanguageHandler = NULL;
+        context->Pc = context->u.s.Lr;
+        context->ContextFlags |= CONTEXT_UNWOUND_TO_CALL;
+        return status;
     }
 
     dispatch->EstablisherFrame = context->u.s.Fp;
@@ -281,10 +323,10 @@ static DWORD call_teb_unwind_handler( EXCEPTION_RECORD *rec, DISPATCHER_CONTEXT 
 static DWORD __cdecl nested_exception_handler( EXCEPTION_RECORD *rec, EXCEPTION_REGISTRATION_RECORD *frame,
                                                CONTEXT *context, EXCEPTION_REGISTRATION_RECORD **dispatcher )
 {
-    if (rec->ExceptionFlags & (EH_UNWINDING | EH_EXIT_UNWIND)) return ExceptionContinueSearch;
+    if (!(rec->ExceptionFlags & (EH_UNWINDING | EH_EXIT_UNWIND)))
+        rec->ExceptionFlags |= EH_NESTED_CALL;
 
-    /* FIXME */
-    return ExceptionNestedException;
+    return ExceptionContinueSearch;
 }
 
 
@@ -307,6 +349,7 @@ static DWORD call_handler( EXCEPTION_RECORD *rec, CONTEXT *context, DISPATCHER_C
     res = dispatch->LanguageHandler( rec, (void *)dispatch->EstablisherFrame, context, dispatch );
     TRACE( "handler at %p returned %u\n", dispatch->LanguageHandler, res );
 
+    rec->ExceptionFlags &= EH_NONCONTINUABLE;
     __wine_pop_frame( &frame );
     return res;
 }
@@ -487,6 +530,18 @@ NTSTATUS WINAPI KiUserExceptionDispatcher( EXCEPTION_RECORD *rec, CONTEXT *conte
     if (status != STATUS_UNHANDLED_EXCEPTION) RtlRaiseStatus( status );
     return NtRaiseException( rec, context, FALSE );
 }
+
+
+/*******************************************************************
+ *		KiUserApcDispatcher (NTDLL.@)
+ */
+void WINAPI KiUserApcDispatcher( CONTEXT *context, ULONG_PTR ctx, ULONG_PTR arg1, ULONG_PTR arg2,
+                                 PNTAPCFUNC func )
+{
+    func( ctx, arg1, arg2 );
+    NtContinue( context, TRUE );
+}
+
 
 /***********************************************************************
  * Definitions for Win32 unwind tables
@@ -708,6 +763,7 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, RUNTIME_FUNCTION 
             switch (func->u.s.CR)
             {
             case 3:
+                len++; /* mov x29,sp */
                 len++; /* stp x29,lr,[sp,0] */
                 if (local_size <= 512) break;
                 /* fall through */
@@ -717,9 +773,10 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, RUNTIME_FUNCTION 
                 if (local_size > 4088) len++;  /* sub sp,sp,#4088 */
                 break;
             }
-            if (offset < len + 4 * func->u.s.H)  /* prolog */
+            len += 4 * func->u.s.H;
+            if (offset < len)  /* prolog */
             {
-                skip = len + 4 * func->u.s.H - offset;
+                skip = len - offset;
             }
             else if (offset >= func->u.s.FunctionLength - (len + 1))  /* epilog */
             {
@@ -733,6 +790,7 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, RUNTIME_FUNCTION 
         if (func->u.s.CR == 3)
         {
             DWORD64 *fp = (DWORD64 *) context->u.s.Fp; /* u.X[29] */
+            context->Sp = context->u.s.Fp;
             context->u.X[29] = fp[0];
             context->u.X[30] = fp[1];
         }
@@ -748,34 +806,36 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, RUNTIME_FUNCTION 
         switch (func->u.s.CR)
         {
         case 3:
+            /* mov x29,sp */
+            if (pos++ >= skip) context->Sp = context->u.s.Fp;
             if (local_size <= 512)
             {
                 /* stp x29,lr,[sp,-#local_size]! */
-                if (pos++ > skip) restore_regs( 29, 2, -local_size_regs, context, ptrs );
+                if (pos++ >= skip) restore_regs( 29, 2, -local_size_regs, context, ptrs );
                 break;
             }
             /* stp x29,lr,[sp,0] */
-            if (pos++ > skip) restore_regs( 29, 2, 0, context, ptrs );
+            if (pos++ >= skip) restore_regs( 29, 2, 0, context, ptrs );
             /* fall through */
         case 0:
         case 1:
             if (!local_size) break;
             /* sub sp,sp,#local_size */
-            if (pos++ > skip) context->Sp += (local_size - 1) % 4088 + 1;
-            if (local_size > 4088 && pos++ > skip) context->Sp += 4088;
+            if (pos++ >= skip) context->Sp += (local_size - 1) % 4088 + 1;
+            if (local_size > 4088 && pos++ >= skip) context->Sp += 4088;
             break;
         }
 
-        if (func->u.s.H && offset < len + 4) pos += 4;
+        if (func->u.s.H) pos += 4;
 
         if (fp_size)
         {
-            if (func->u.s.RegF % 2 == 0 && pos++ > skip)
+            if (func->u.s.RegF % 2 == 0 && pos++ >= skip)
                 /* str d%u,[sp,#fp_size] */
                 restore_fpregs( 8 + func->u.s.RegF, 1, int_regs + fp_regs - 1, context, ptrs );
-            for (i = func->u.s.RegF / 2 - 1; i >= 0; i--)
+            for (i = (func->u.s.RegF + 1) / 2 - 1; i >= 0; i--)
             {
-                if (pos++ <= skip) continue;
+                if (pos++ < skip) continue;
                 if (!i && !int_size)
                      /* stp d8,d9,[sp,-#regsave]! */
                     restore_fpregs( 8, 2, -saved_regs, context, ptrs );
@@ -785,9 +845,9 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, RUNTIME_FUNCTION 
             }
         }
 
-        if (pos++ > skip)
+        if (func->u.s.RegI % 2)
         {
-            if (func->u.s.RegI % 2)
+            if (pos++ >= skip)
             {
                 /* stp xn,lr,[sp,#offset] */
                 if (func->u.s.CR == 1) restore_regs( 30, 1, int_regs - 1, context, ptrs );
@@ -796,14 +856,16 @@ static void *unwind_packed_data( ULONG_PTR base, ULONG_PTR pc, RUNTIME_FUNCTION 
                               (func->u.s.RegI > 1) ? func->u.s.RegI - 1 : -saved_regs,
                               context, ptrs );
             }
-            else if (func->u.s.CR == 1)
-                /* str lr,[sp,#offset] */
-                restore_regs( 30, 1, func->u.s.RegI ? int_regs - 1 : -saved_regs, context, ptrs );
+        }
+        else if (func->u.s.CR == 1)
+        {
+            /* str lr,[sp,#offset] */
+            if (pos++ >= skip) restore_regs( 30, 1, func->u.s.RegI ? int_regs - 1 : -saved_regs, context, ptrs );
         }
 
-        for (i = func->u.s.RegI / 2 - 1; i >= 0; i--)
+        for (i = func->u.s.RegI/ 2 - 1; i >= 0; i--)
         {
-            if (pos++ <= skip) continue;
+            if (pos++ < skip) continue;
             if (i)
                 /* stp xn,xn+1,[sp,#offset] */
                 restore_regs( 19 + 2 * i, 2, 2 * i, context, ptrs );
@@ -1197,6 +1259,154 @@ void WINAPI RtlUnwind( void *frame, void *target_ip, EXCEPTION_RECORD *rec, void
 {
     CONTEXT context;
     RtlUnwindEx( frame, target_ip, rec, retval, &context, NULL );
+}
+
+/*******************************************************************
+ *		_local_unwind (NTDLL.@)
+ */
+void WINAPI _local_unwind( void *frame, void *target_ip )
+{
+    CONTEXT context;
+    RtlUnwindEx( frame, target_ip, NULL, NULL, &context, NULL );
+}
+
+extern LONG __C_ExecuteExceptionFilter(PEXCEPTION_POINTERS ptrs, PVOID frame,
+                                       PEXCEPTION_FILTER filter,
+                                       PUCHAR nonvolatile);
+__ASM_GLOBAL_FUNC( __C_ExecuteExceptionFilter,
+                   "stp x29, x30, [sp, #-96]!\n\t"
+                   __ASM_SEH(".seh_save_fplr_x 96\n\t")
+                   "stp x19, x20, [sp, #16]\n\t"
+                   __ASM_SEH(".seh_save_regp x19, 16\n\t")
+                   "stp x21, x22, [sp, #32]\n\t"
+                   __ASM_SEH(".seh_save_regp x21, 32\n\t")
+                   "stp x23, x24, [sp, #48]\n\t"
+                   __ASM_SEH(".seh_save_regp x23, 48\n\t")
+                   "stp x25, x26, [sp, #64]\n\t"
+                   __ASM_SEH(".seh_save_regp x25, 64\n\t")
+                   "stp x27, x28, [sp, #80]\n\t"
+                   __ASM_SEH(".seh_save_regp x27, 80\n\t")
+                   "mov x29, sp\n\t"
+                   __ASM_SEH(".seh_set_fp\n\t")
+                   __ASM_SEH(".seh_endprologue\n\t")
+
+                   __ASM_CFI(".cfi_def_cfa x29, 96\n\t")
+                   __ASM_CFI(".cfi_offset x29, -96\n\t")
+                   __ASM_CFI(".cfi_offset x30, -88\n\t")
+                   __ASM_CFI(".cfi_offset x19, -80\n\t")
+                   __ASM_CFI(".cfi_offset x20, -72\n\t")
+                   __ASM_CFI(".cfi_offset x21, -64\n\t")
+                   __ASM_CFI(".cfi_offset x22, -56\n\t")
+                   __ASM_CFI(".cfi_offset x23, -48\n\t")
+                   __ASM_CFI(".cfi_offset x24, -40\n\t")
+                   __ASM_CFI(".cfi_offset x25, -32\n\t")
+                   __ASM_CFI(".cfi_offset x26, -24\n\t")
+                   __ASM_CFI(".cfi_offset x27, -16\n\t")
+                   __ASM_CFI(".cfi_offset x28, -8\n\t")
+
+                   "ldp x19, x20, [x3, #0]\n\t"
+                   "ldp x21, x22, [x3, #16]\n\t"
+                   "ldp x23, x24, [x3, #32]\n\t"
+                   "ldp x25, x26, [x3, #48]\n\t"
+                   "ldp x27, x28, [x3, #64]\n\t"
+                   /* Overwrite the frame parameter with Fp from the
+                    * nonvolatile regs */
+                   "ldr x1, [x3, #80]\n\t"
+                   "blr x2\n\t"
+                   "ldp x19, x20, [sp, #16]\n\t"
+                   "ldp x21, x22, [sp, #32]\n\t"
+                   "ldp x23, x24, [sp, #48]\n\t"
+                   "ldp x25, x26, [sp, #64]\n\t"
+                   "ldp x27, x28, [sp, #80]\n\t"
+                   "ldp x29, x30, [sp], #96\n\t"
+                   "ret")
+
+extern void __C_ExecuteTerminationHandler(BOOL abnormal, PVOID frame,
+                                          PTERMINATION_HANDLER handler,
+                                          PUCHAR nonvolatile);
+/* This is, implementation wise, identical to __C_ExecuteExceptionFilter. */
+__ASM_GLOBAL_FUNC( __C_ExecuteTerminationHandler,
+                   "b " __ASM_NAME("__C_ExecuteExceptionFilter") "\n\t");
+
+/*******************************************************************
+ *		__C_specific_handler (NTDLL.@)
+ */
+EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec,
+                                                   void *frame,
+                                                   CONTEXT *context,
+                                                   struct _DISPATCHER_CONTEXT *dispatch )
+{
+    SCOPE_TABLE *table = dispatch->HandlerData;
+    ULONG i;
+    DWORD64 ControlPc = dispatch->ControlPc;
+
+    TRACE( "%p %p %p %p\n", rec, frame, context, dispatch );
+    if (TRACE_ON(seh)) dump_scope_table( dispatch->ImageBase, table );
+
+    if (dispatch->ControlPcIsUnwound)
+        ControlPc -= 4;
+
+    if (rec->ExceptionFlags & (EH_UNWINDING | EH_EXIT_UNWIND))
+    {
+        for (i = dispatch->ScopeIndex; i < table->Count; i++)
+        {
+            if (ControlPc >= dispatch->ImageBase + table->ScopeRecord[i].BeginAddress &&
+                ControlPc < dispatch->ImageBase + table->ScopeRecord[i].EndAddress)
+            {
+                PTERMINATION_HANDLER handler;
+
+                if (table->ScopeRecord[i].JumpTarget) continue;
+
+                if (rec->ExceptionFlags & EH_TARGET_UNWIND &&
+                    dispatch->TargetPc >= dispatch->ImageBase + table->ScopeRecord[i].BeginAddress &&
+                    dispatch->TargetPc < dispatch->ImageBase + table->ScopeRecord[i].EndAddress)
+                {
+                    break;
+                }
+
+                handler = (PTERMINATION_HANDLER)(dispatch->ImageBase + table->ScopeRecord[i].HandlerAddress);
+                dispatch->ScopeIndex = i+1;
+
+                TRACE( "calling __finally %p frame %p\n", handler, frame );
+                __C_ExecuteTerminationHandler( TRUE, frame, handler,
+                                               dispatch->NonVolatileRegisters );
+            }
+        }
+        return ExceptionContinueSearch;
+    }
+
+    for (i = dispatch->ScopeIndex; i < table->Count; i++)
+    {
+        if (ControlPc >= dispatch->ImageBase + table->ScopeRecord[i].BeginAddress &&
+            ControlPc < dispatch->ImageBase + table->ScopeRecord[i].EndAddress)
+        {
+            if (!table->ScopeRecord[i].JumpTarget) continue;
+            if (table->ScopeRecord[i].HandlerAddress != EXCEPTION_EXECUTE_HANDLER)
+            {
+                EXCEPTION_POINTERS ptrs;
+                PEXCEPTION_FILTER filter;
+
+                filter = (PEXCEPTION_FILTER)(dispatch->ImageBase + table->ScopeRecord[i].HandlerAddress);
+                ptrs.ExceptionRecord = rec;
+                ptrs.ContextRecord = context;
+                TRACE( "calling filter %p ptrs %p frame %p\n", filter, &ptrs, frame );
+                switch (__C_ExecuteExceptionFilter( &ptrs, frame, filter,
+                                                    dispatch->NonVolatileRegisters ))
+                {
+                case EXCEPTION_EXECUTE_HANDLER:
+                    break;
+                case EXCEPTION_CONTINUE_SEARCH:
+                    continue;
+                case EXCEPTION_CONTINUE_EXECUTION:
+                    return ExceptionContinueExecution;
+                }
+            }
+            TRACE( "unwinding to target %lx\n", dispatch->ImageBase + table->ScopeRecord[i].JumpTarget );
+            RtlUnwindEx( frame, (char *)dispatch->ImageBase + table->ScopeRecord[i].JumpTarget,
+                         rec, 0, dispatch->ContextRecord, dispatch->HistoryTable );
+        }
+    }
+    return ExceptionContinueSearch;
 }
 
 

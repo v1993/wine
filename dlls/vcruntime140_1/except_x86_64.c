@@ -103,6 +103,7 @@ typedef struct
     BOOL rethrow;
     INT search_state;
     INT unwind_state;
+    EXCEPTION_RECORD *prev_rec;
 } cxx_catch_ctx;
 
 typedef struct
@@ -473,7 +474,7 @@ static LONG CALLBACK cxx_rethrow_filter(PEXCEPTION_POINTERS eptrs, void *c)
     FlsSetValue(fls_index, (void*)(DWORD_PTR)ctx->search_state);
     if (rec->ExceptionCode != CXX_EXCEPTION)
         return EXCEPTION_CONTINUE_SEARCH;
-    if (rec->ExceptionInformation[1] == ((EXCEPTION_RECORD*)*__current_exception())->ExceptionInformation[1])
+    if (rec->ExceptionInformation[1] == ctx->prev_rec->ExceptionInformation[1])
         ctx->rethrow = TRUE;
     return EXCEPTION_CONTINUE_SEARCH;
 }
@@ -503,6 +504,7 @@ static void* WINAPI call_catch_block4(EXCEPTION_RECORD *rec)
     __CxxRegisterExceptionObject(&ep, &ctx.frame_info);
     ctx.search_state = rec->ExceptionInformation[2];
     ctx.unwind_state = rec->ExceptionInformation[3];
+    ctx.prev_rec = prev_rec;
     (*__processing_throw())--;
     __TRY
     {
@@ -655,6 +657,17 @@ static inline _se_translator_function get_se_translator(void)
     return __current_exception()[-2];
 }
 
+static void check_noexcept( PEXCEPTION_RECORD rec, const cxx_function_descr *descr )
+{
+    if (!(descr->header & FUNC_DESCR_IS_CATCH) &&
+            rec->ExceptionCode == CXX_EXCEPTION &&
+            (descr->header & FUNC_DESCR_NO_EXCEPT))
+    {
+        ERR("noexcept function propagating exception\n");
+        terminate();
+    }
+}
+
 static DWORD cxx_frame_handler4(EXCEPTION_RECORD *rec, ULONG64 frame,
         CONTEXT *context, DISPATCHER_CONTEXT *dispatch,
         const cxx_function_descr *descr, int trylevel)
@@ -681,10 +694,20 @@ static DWORD cxx_frame_handler4(EXCEPTION_RECORD *rec, ULONG64 frame,
         cxx_local_unwind4(orig_frame, dispatch, descr, trylevel, last_level);
         return ExceptionContinueSearch;
     }
-    if (!descr->tryblock_map) return ExceptionContinueSearch;
+    if (!descr->tryblock_map)
+    {
+        check_noexcept(rec, descr);
+        return ExceptionContinueSearch;
+    }
 
     if (rec->ExceptionCode == CXX_EXCEPTION)
     {
+        if (!rec->ExceptionInformation[1] && !rec->ExceptionInformation[2])
+        {
+            TRACE("rethrow detected.\n");
+            *rec = *(EXCEPTION_RECORD*)*__current_exception();
+        }
+
         exc_type = (cxx_exception_type *)rec->ExceptionInformation[2];
 
         if (TRACE_ON(seh))
@@ -725,6 +748,7 @@ static DWORD cxx_frame_handler4(EXCEPTION_RECORD *rec, ULONG64 frame,
     }
 
     find_catch_block4(rec, context, NULL, frame, dispatch, descr, exc_type, orig_frame, trylevel);
+    check_noexcept(rec, descr);
     return ExceptionContinueSearch;
 }
 
@@ -751,7 +775,7 @@ EXCEPTION_DISPOSITION __cdecl __CxxFrameHandler4(EXCEPTION_RECORD *rec,
         return ExceptionContinueSearch;  /* handle only c++ exceptions */
 
     if (descr.header & ~(FUNC_DESCR_IS_CATCH | FUNC_DESCR_UNWIND_MAP |
-                FUNC_DESCR_TRYBLOCK_MAP | FUNC_DESCR_EHS))
+                FUNC_DESCR_TRYBLOCK_MAP | FUNC_DESCR_EHS | FUNC_DESCR_NO_EXCEPT))
     {
         FIXME("unsupported flags: %x\n", descr.header);
         return ExceptionContinueSearch;

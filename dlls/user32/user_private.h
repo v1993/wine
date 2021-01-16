@@ -29,7 +29,6 @@
 #include "winreg.h"
 #include "winternl.h"
 #include "wine/heap.h"
-#include "wine/unicode.h"
 
 #define GET_WORD(ptr)  (*(const WORD *)(ptr))
 #define GET_DWORD(ptr) (*(const DWORD *)(ptr))
@@ -370,6 +369,12 @@ typedef struct
 extern int bitmap_info_size( const BITMAPINFO * info, WORD coloruse ) DECLSPEC_HIDDEN;
 extern BOOL get_icon_size( HICON handle, SIZE *size ) DECLSPEC_HIDDEN;
 
+struct png_funcs
+{
+    BOOL (CDECL *get_png_info)(const void *png_data, DWORD size, int *width, int *height, int *bpp);
+    BITMAPINFO * (CDECL *load_png)(const char *png_data, DWORD *size);
+};
+
 /* Mingw's assert() imports MessageBoxA and gets confused by user32 exporting it */
 #ifdef __MINGW32__
 #undef assert
@@ -381,7 +386,7 @@ static inline WCHAR *heap_strdupW(const WCHAR *src)
     WCHAR *dst;
     unsigned len;
     if (!src) return NULL;
-    len = (strlenW(src) + 1) * sizeof(WCHAR);
+    len = (lstrlenW(src) + 1) * sizeof(WCHAR);
     if ((dst = heap_alloc(len))) memcpy(dst, src, len);
     return dst;
 }

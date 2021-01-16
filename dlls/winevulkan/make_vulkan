@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 # Wine Vulkan generator
 #
 # Copyright 2017-2018 Roderick Colenbrander
@@ -64,7 +64,7 @@ from enum import Enum
 LOGGER = logging.Logger("vulkan")
 LOGGER.addHandler(logging.StreamHandler())
 
-VK_XML_VERSION = "1.2.149"
+VK_XML_VERSION = "1.2.166"
 WINE_VK_VERSION = (1, 2)
 
 # Filenames to create.
@@ -86,21 +86,11 @@ EXT_BLOCK_SIZE = 1000
 
 UNSUPPORTED_EXTENSIONS = [
     # Instance extensions
-    "VK_EXT_debug_report",
-    # Handling of VK_EXT_debug_report requires some consideration. The win32
-    # loader already provides it for us and it is somewhat usable. If we add
-    # plumbing down to the native layer, we will get each message twice as we
-    # use 2 loaders (win32+native), but we may get output from the driver.
-    # In any case callback conversion is required.
-    "VK_EXT_debug_utils",
-    "VK_EXT_validation_features",
-    "VK_EXT_validation_flags",
     "VK_KHR_display", # Needs WSI work.
     "VK_KHR_surface_protected_capabilities",
 
     # Device extensions
     "VK_AMD_display_native_hdr",
-    "VK_EXT_display_control", # Requires VK_EXT_display_surface_counter
     "VK_EXT_full_screen_exclusive",
     "VK_EXT_hdr_metadata", # Needs WSI work.
     "VK_EXT_pipeline_creation_feedback",
@@ -118,6 +108,9 @@ UNSUPPORTED_EXTENSIONS = [
     "VK_KHR_external_fence_fd",
     "VK_KHR_external_memory_fd",
     "VK_KHR_external_semaphore_fd",
+
+    # Extensions which require callback handling
+    "VK_EXT_device_memory_report",
 
     # Deprecated extensions
     "VK_NV_external_memory_capabilities",
@@ -225,6 +218,22 @@ FUNCTION_OVERRIDES = {
     # VK_EXT_calibrated_timestamps
     "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT" : {"dispatch" : True, "driver" : False, "thunk" : False},
     "vkGetCalibratedTimestampsEXT" : {"dispatch" : True, "driver" : False, "thunk" : False},
+
+    # VK_EXT_debug_utils
+    "vkCreateDebugUtilsMessengerEXT" : {"dispatch": True, "driver" : False, "thunk" : False},
+    "vkDestroyDebugUtilsMessengerEXT" : {"dispatch": True, "driver" : False, "thunk" : False},
+    "vkSubmitDebugUtilsMessageEXT" : {"dispatch": True, "driver" : False, "thunk" : True, "private_thunk" : True},
+    "vkSetDebugUtilsObjectTagEXT" : {"dispatch": True, "driver" : False, "thunk" : True, "private_thunk" : True},
+    "vkSetDebugUtilsObjectNameEXT" : {"dispatch": True, "driver" : False, "thunk" : True, "private_thunk" : True},
+
+    # VK_EXT_debug_report
+    "vkCreateDebugReportCallbackEXT" : {"dispatch": True, "driver" : False, "thunk" : False},
+    "vkDestroyDebugReportCallbackEXT" : {"dispatch": True, "driver" : False, "thunk" : False},
+    "vkDebugReportMessageEXT" : {"dispatch": True, "driver" : False, "thunk" : False},
+
+    # VK_EXT_debug_marker
+    "vkDebugMarkerSetObjectNameEXT" : {"dispatch": True, "driver" : False, "thunk" : True, "private_thunk" : True},
+    "vkDebugMarkerSetObjectTagEXT" : {"dispatch": True, "driver" : False, "thunk" : True, "private_thunk" : True},
 }
 
 STRUCT_CHAIN_CONVERSIONS = [
@@ -805,11 +814,12 @@ class VkFunction(object):
 
 
 class VkFunctionPointer(object):
-    def __init__(self, _type, name, members):
+    def __init__(self, _type, name, members, forward_decls):
         self.name = name
         self.members = members
         self.type = _type
         self.required = False
+        self.forward_decls = forward_decls
 
     @staticmethod
     def from_xml(funcpointer):
@@ -846,10 +856,19 @@ class VkFunctionPointer(object):
 
         _type = funcpointer.text
         name = funcpointer.find("name").text
-        return VkFunctionPointer(_type, name, members)
+        if "requires" in funcpointer.attrib:
+            forward_decls = funcpointer.attrib.get("requires").split(",")
+        else:
+            forward_decls = []
+        return VkFunctionPointer(_type, name, members, forward_decls)
 
     def definition(self):
-        text = "{0} {1})(\n".format(self.type, self.name)
+        text = ""
+        # forward declare required structs
+        for decl in self.forward_decls:
+            text += "typedef struct {0} {0};\n".format(decl)
+
+        text += "{0} {1})(\n".format(self.type, self.name)
 
         first = True
         if len(self.members) > 0:
@@ -865,6 +884,8 @@ class VkFunctionPointer(object):
         text += ");\n"
         return text
 
+    def is_alias(self):
+        return False
 
 class VkHandle(object):
     def __init__(self, name, _type, parent, alias=None):
@@ -873,6 +894,7 @@ class VkHandle(object):
         self.parent = parent
         self.alias = alias
         self.required = False
+        self.object_type = None
 
     @staticmethod
     def from_alias(handle, alias):
@@ -927,11 +949,12 @@ class VkHandle(object):
     def native_handle(self, name):
         """ Provide access to the native handle of a wrapped object. """
 
-        # Remember to add any new native handle whose parent is VkDevice
-        # to unwrap_object_handle() in vulkan.c
-
         if self.name == "VkCommandPool":
             return "wine_cmd_pool_from_handle({0})->command_pool".format(name)
+        if self.name == "VkDebugUtilsMessengerEXT":
+            return "wine_debug_utils_messenger_from_handle({0})->debug_messenger".format(name)
+        if self.name == "VkDebugReportCallbackEXT":
+            return "wine_debug_report_callback_from_handle({0})->debug_callback".format(name)
 
         native_handle_name = None
 
@@ -952,6 +975,9 @@ class VkHandle(object):
         if self.is_dispatchable():
             LOGGER.error("Unhandled native handle for: {0}".format(self.name))
         return None
+
+    def is_wrapped(self):
+        return self.native_handle("test") is not None
 
 
 class VkMember(object):
@@ -1360,7 +1386,7 @@ class VkParam(object):
                 self.format_conv = "wine_dbgstr_longlong({0})"
             elif self.type in ["uint16_t", "uint32_t", "VkBool32"]:
                 self.format_str = "%u"
-            elif self.type in ["uint64_t", "VkDeviceSize"]:
+            elif self.type in ["uint64_t", "VkDeviceAddress", "VkDeviceSize"]:
                 self.format_str = "0x%s"
                 self.format_conv = "wine_dbgstr_longlong({0})"
             elif self.type == "HANDLE":
@@ -2264,6 +2290,36 @@ class VkGenerator(object):
         f.write("            return TRUE;\n")
         f.write("    }\n")
         f.write("    return FALSE;\n")
+        f.write("}\n\n")
+
+        f.write("BOOL wine_vk_is_type_wrapped(VkObjectType type)\n")
+        f.write("{\n")
+        f.write("    return FALSE")
+        for handle in self.registry.handles:
+            if not handle.is_required() or not handle.is_wrapped() or handle.is_alias():
+                continue
+            f.write(" ||\n        type == {}".format(handle.object_type))
+        f.write(";\n")
+        f.write("}\n\n")
+
+        f.write("uint64_t wine_vk_unwrap_handle(VkObjectType type, uint64_t handle)\n")
+        f.write("{\n")
+        f.write("    switch(type)\n")
+        f.write("    {\n")
+        for handle in self.registry.handles:
+            if not handle.is_required() or not handle.is_wrapped() or handle.is_alias():
+                continue
+            f.write("    case {}:\n".format(handle.object_type))
+            if handle.is_dispatchable():
+                f.write("        return (uint64_t) (uintptr_t) ")
+                f.write(handle.native_handle("(({}) (uintptr_t) handle)".format(handle.name)))
+            else:
+                f.write("        return (uint64_t) ")
+                f.write(handle.native_handle("handle"))
+            f.write(";\n");
+        f.write("    default:\n")
+        f.write("       return handle;\n")
+        f.write("    }\n")
         f.write("}\n")
 
     def generate_thunks_h(self, f, prefix):
@@ -2607,6 +2663,8 @@ class VkRegistry(object):
         self._parse_features(root)
         self._parse_extensions(root)
 
+        self._match_object_types()
+
         self.copyright = root.find('./comment').text
 
     def _is_feature_supported(self, feature):
@@ -2676,6 +2734,21 @@ class VkRegistry(object):
                 mark_struct_dependencies(struct, self.types)
             elif type_info["category"] == "bitmask":
                 mark_bitmask_dependencies(type_info["data"], self.types)
+
+    def _match_object_types(self):
+        """ Matches each handle with the correct object type. """
+        # Use upper case comparison for simplicity.
+        object_types = {}
+        for value in self.enums["VkObjectType"].values:
+            object_name = "VK" + value.name[len("VK_OBJECT_TYPE"):].replace("_", "")
+            object_types[object_name] = value.name
+
+        for handle in self.handles:
+            if not handle.is_required():
+                continue
+            handle.object_type = object_types.get(handle.name.upper())
+            if not handle.object_type:
+                LOGGER.warning("No object type found for {}".format(handle.name))
 
     def _parse_commands(self, root):
         """ Parse command section containing the Vulkan function calls. """
@@ -2819,6 +2892,7 @@ class VkRegistry(object):
         extensions = []
         exts = root.findall("./extensions/extension")
         deferred_exts = []
+        skipped_exts = UNSUPPORTED_EXTENSIONS.copy()
 
         def process_ext(ext, deferred=False):
             ext_name = ext.attrib["name"]
@@ -2833,6 +2907,7 @@ class VkRegistry(object):
             # Some extensions are not ready or have numbers reserved as a place holder.
             if ext.attrib["supported"] == "disabled":
                 LOGGER.debug("Skipping disabled extension: {0}".format(ext_name))
+                skipped_exts.append(ext_name)
                 return
 
             # Defer extensions with 'sortorder' as they are order-dependent for spec-parsing.
@@ -2845,6 +2920,7 @@ class VkRegistry(object):
             # or NV.
             if "KHX" in ext_name or "NVX" in ext_name:
                 LOGGER.debug("Skipping experimental extension: {0}".format(ext_name))
+                skipped_exts.append(ext_name)
                 return
 
             # Extensions can define VkEnumValues which alias to provisional extensions. Pre-process
@@ -2857,15 +2933,18 @@ class VkRegistry(object):
             platform = ext.attrib.get("platform")
             if platform and platform != "win32":
                 LOGGER.debug("Skipping extensions {0} for platform {1}".format(ext_name, platform))
+                skipped_exts.append(ext_name)
                 return
 
             if not self._is_extension_supported(ext_name):
                 LOGGER.debug("Skipping unsupported extension: {0}".format(ext_name))
+                skipped_exts.append(ext_name)
                 return
             elif "requires" in ext.attrib:
                 # Check if this extension builds on top of another unsupported extension.
                 requires = ext.attrib["requires"].split(",")
-                if len(set(requires).intersection(UNSUPPORTED_EXTENSIONS)) > 0:
+                if len(set(requires).intersection(skipped_exts)) > 0:
+                    skipped_exts.append(ext_name)
                     return
 
             LOGGER.debug("Loading extension: {0}".format(ext_name))
@@ -3125,6 +3204,7 @@ def download_vk_xml(filename):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-v", "--verbose", action="count", default=0, help="increase output verbosity")
+    parser.add_argument("-x", "--xml", default=None, type=str, help="path to specification XML file")
 
     args = parser.parse_args()
     if args.verbose == 0:
@@ -3136,8 +3216,12 @@ def main():
 
     set_working_directory()
 
-    vk_xml = "vk-{0}.xml".format(VK_XML_VERSION)
-    download_vk_xml(vk_xml)
+    if args.xml:
+        vk_xml = args.xml
+    else:
+        vk_xml = "vk-{0}.xml".format(VK_XML_VERSION)
+        download_vk_xml(vk_xml)
+
     registry = VkRegistry(vk_xml)
     generator = VkGenerator(registry)
 

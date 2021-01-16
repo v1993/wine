@@ -215,8 +215,7 @@ static inline ORDDEF *find_export( const char *name, ORDDEF **table, int size )
 {
     ORDDEF func, *odp, **res = NULL;
 
-    func.name = xstrdup(name);
-    func.ordinal = -1;
+    func.name = func.export_name = xstrdup(name);
     odp = &func;
     if (table) res = bsearch( &odp, table, size, sizeof(*table), func_cmp );
     free( func.name );
@@ -959,6 +958,7 @@ static void output_delayed_imports( const DLLSPEC *spec )
         {
             struct import_func *func = &import->imports[j];
             const char *name = func->name ? func->name : func->export_name;
+            output( "__imp_%s:\n", asm_name( name ));
             output( "\t%s .L__wine_delay_imp_%s_%s\n",
                     get_asm_ptr_keyword(), import->c_name, name );
         }
@@ -1604,12 +1604,26 @@ void output_syscalls( DLLSPEC *spec )
             output( "\tcmp x8, %u\n", count );
             output( "\tbcs 3f\n" );
             output( "\tstp x29, x30, [sp,#-160]!\n" );
+            output_cfi( "\t.cfi_def_cfa_offset 160\n" );
+            output_cfi( "\t.cfi_offset 29, -160\n" );
+            output_cfi( "\t.cfi_offset 30, -152\n" );
             output( "\tmov x29, sp\n" );
+            output_cfi( "\t.cfi_def_cfa_register 29\n" );
             output( "\tstp x27, x28, [sp, #144]\n" );
+            output_cfi( "\t.cfi_offset 27, -16\n" );
+            output_cfi( "\t.cfi_offset 28, -8\n" );
             output( "\tstp x25, x26, [sp, #128]\n" );
+            output_cfi( "\t.cfi_offset 25, -32\n" );
+            output_cfi( "\t.cfi_offset 26, -24\n" );
             output( "\tstp x23, x24, [sp, #112]\n" );
+            output_cfi( "\t.cfi_offset 23, -48\n" );
+            output_cfi( "\t.cfi_offset 24, -40\n" );
             output( "\tstp x21, x22, [sp, #96]\n" );
+            output_cfi( "\t.cfi_offset 21, -64\n" );
+            output_cfi( "\t.cfi_offset 22, -56\n" );
             output( "\tstp x19, x20, [sp, #80]\n" );
+            output_cfi( "\t.cfi_offset 19, -80\n" );
+            output_cfi( "\t.cfi_offset 20, -72\n" );
             output( "\tstp x6, x7, [sp, #64]\n" );
             output( "\tstp x4, x5, [sp, #48]\n" );
             output( "\tstp x2, x3, [sp, #32]\n" );
@@ -1712,8 +1726,8 @@ void output_syscalls( DLLSPEC *spec )
             output( "\t.byte 0xc3\n" );           /* ret */
             if (target_platform == PLATFORM_WINDOWS)
             {
-                output( "1:\t.byte 0xff,0x14,0x25\n" ); /* 1: callq *(__wine_syscall_dispatcher) */
-                output( "\t.long __wine_syscall_dispatcher\n" );
+                output( "1:\t.byte 0xff,0x14,0x25\n" ); /* 1: callq *(0x7ffe1000) */
+                output( "\t.long 0x7ffe1000\n" );
             }
             else
             {
@@ -1735,6 +1749,9 @@ void output_syscalls( DLLSPEC *spec )
             break;
         case CPU_ARM64:
             output( "\tstp x29, x30, [sp,#-16]!\n" );
+            output_cfi( "\t.cfi_def_cfa_offset 16\n" );
+            output_cfi( "\t.cfi_offset 29, -16\n" );
+            output_cfi( "\t.cfi_offset 30, -8\n" );
             output( "\tmov x8, #%u\n", i );
             output( "\tadrp x16, %s\n", arm64_page( asm_name("__wine_syscall_dispatcher") ) );
             output( "\tldr x16, [x16, #%s]\n", arm64_pageoff( asm_name("__wine_syscall_dispatcher") ) );
@@ -1838,6 +1855,14 @@ static void build_windows_import_lib( DLLSPEC *spec )
         case CPU_x86_64:
             m_flag = "i386:x86-64";
             as_flags = "--as-flags=--64";
+            break;
+        case CPU_ARM:
+            m_flag = "arm";
+            as_flags = NULL;
+            break;
+        case CPU_ARM64:
+            m_flag = "arm64";
+            as_flags = NULL;
             break;
         default:
             m_flag = NULL;

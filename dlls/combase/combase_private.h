@@ -61,20 +61,27 @@ HRESULT open_appidkey_from_clsid(REFCLSID clsid, REGSAM access, HKEY *subkey) DE
 #define DM_EXECUTERPC   (WM_USER + 0) /* WPARAM = 0, LPARAM = (struct dispatch_params *) */
 #define DM_HOSTOBJECT   (WM_USER + 1) /* WPARAM = 0, LPARAM = (struct host_object_params *) */
 
-#define WINE_CLSCTX_DONT_HOST   0x80000000
 #define CHARS_IN_GUID 39
+
+enum tlsdata_flags
+{
+    OLETLS_UUIDINITIALIZED = 0x2,
+    OLETLS_DISABLE_OLE1DDE = 0x40,
+    OLETLS_APARTMENTTHREADED = 0x80,
+    OLETLS_MULTITHREADED = 0x100,
+};
 
 /* this is what is stored in TEB->ReservedForOle */
 struct tlsdata
 {
     struct apartment *apt;
     IErrorInfo       *errorinfo;
-    DWORD             thread_seqid;/* returned with CoGetCurrentProcess */
-    DWORD             apt_mask;    /* apartment mask (+0Ch on x86) */
+    DWORD             thread_seqid;  /* returned with CoGetCurrentProcess */
+    DWORD             flags;         /* tlsdata_flags (+0Ch on x86) */
     void             *unknown0;
-    DWORD             inits;        /* number of times CoInitializeEx called */
-    DWORD             ole_inits;    /* number of times OleInitialize called */
-    GUID              causality_id; /* unique identifier for each COM call */
+    DWORD             inits;         /* number of times CoInitializeEx called */
+    DWORD             ole_inits;     /* number of times OleInitialize called */
+    GUID              causality_id;  /* unique identifier for each COM call */
     LONG              pending_call_count_client; /* number of client calls pending */
     LONG              pending_call_count_server; /* number of server calls pending */
     DWORD             unknown;
@@ -85,6 +92,7 @@ struct tlsdata
     IUnknown         *state;         /* see CoSetState */
     struct list       spies;         /* Spies installed with CoRegisterInitializeSpy */
     DWORD             spies_lock;
+    DWORD             cancelcount;
 };
 
 extern HRESULT WINAPI InternalTlsAllocData(struct tlsdata **data);
@@ -156,7 +164,7 @@ HRESULT apartment_increment_mta_usage(CO_MTA_USAGE_COOKIE *cookie) DECLSPEC_HIDD
 void apartment_decrement_mta_usage(CO_MTA_USAGE_COOKIE cookie) DECLSPEC_HIDDEN;
 struct apartment * apartment_get_mta(void) DECLSPEC_HIDDEN;
 HRESULT apartment_get_inproc_class_object(struct apartment *apt, const struct class_reg_data *regdata,
-        REFCLSID rclsid, REFIID riid, BOOL hostifnecessary, void **ppv) DECLSPEC_HIDDEN;
+        REFCLSID rclsid, REFIID riid, DWORD class_context, void **ppv) DECLSPEC_HIDDEN;
 HRESULT apartment_get_local_server_stream(struct apartment *apt, IStream **ret) DECLSPEC_HIDDEN;
 IUnknown *com_get_registered_class_object(const struct apartment *apartment, REFCLSID rclsid,
         DWORD clscontext) DECLSPEC_HIDDEN;

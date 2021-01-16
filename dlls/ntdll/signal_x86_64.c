@@ -241,11 +241,11 @@ static void dump_scope_table( ULONG64 base, const SCOPE_TABLE *table )
 
     TRACE( "scope table at %p\n", table );
     for (i = 0; i < table->Count; i++)
-        TRACE( "  %u: %lx-%lx handler %lx target %lx\n", i,
-               base + table->ScopeRecord[i].BeginAddress,
-               base + table->ScopeRecord[i].EndAddress,
-               base + table->ScopeRecord[i].HandlerAddress,
-               base + table->ScopeRecord[i].JumpTarget );
+        TRACE( "  %u: %p-%p handler %p target %p\n", i,
+               (char *)base + table->ScopeRecord[i].BeginAddress,
+               (char *)base + table->ScopeRecord[i].EndAddress,
+               (char *)base + table->ScopeRecord[i].HandlerAddress,
+               (char *)base + table->ScopeRecord[i].JumpTarget );
 }
 
 
@@ -384,8 +384,8 @@ static DWORD call_handler( EXCEPTION_RECORD *rec, CONTEXT *context, DISPATCHER_C
     frame.Handler = nested_exception_handler;
     __wine_push_frame( &frame );
 
-    TRACE( "calling handler %p (rec=%p, frame=0x%lx context=%p, dispatch=%p)\n",
-           dispatch->LanguageHandler, rec, dispatch->EstablisherFrame, dispatch->ContextRecord, dispatch );
+    TRACE( "calling handler %p (rec=%p, frame=%p context=%p, dispatch=%p)\n",
+           dispatch->LanguageHandler, rec, (void *)dispatch->EstablisherFrame, dispatch->ContextRecord, dispatch );
     res = dispatch->LanguageHandler( rec, (void *)dispatch->EstablisherFrame, context, dispatch );
     TRACE( "handler at %p returned %u\n", dispatch->LanguageHandler, res );
 
@@ -445,7 +445,7 @@ static NTSTATUS call_stack_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_contex
             dispatch.EstablisherFrame < (ULONG64)NtCurrentTeb()->Tib.StackLimit ||
             dispatch.EstablisherFrame > (ULONG64)NtCurrentTeb()->Tib.StackBase)
         {
-            ERR( "invalid frame %lx (%p-%p)\n", dispatch.EstablisherFrame,
+            ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
                  NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
             rec->ExceptionFlags |= EH_STACK_INVALID;
             break;
@@ -480,8 +480,8 @@ static NTSTATUS call_stack_handlers( EXCEPTION_RECORD *rec, CONTEXT *orig_contex
         /* hack: call wine handlers registered in the tib list */
         else while ((ULONG64)teb_frame < context.Rsp)
         {
-            TRACE( "found wine frame %p rsp %lx handler %p\n",
-                    teb_frame, context.Rsp, teb_frame->Handler );
+            TRACE( "found wine frame %p rsp %p handler %p\n",
+                   teb_frame, (void *)context.Rsp, teb_frame->Handler );
             dispatch.EstablisherFrame = (ULONG64)teb_frame;
             switch (call_teb_handler( rec, orig_context, &dispatch, teb_frame ))
             {
@@ -521,9 +521,9 @@ NTSTATUS WINAPI dispatch_exception( EXCEPTION_RECORD *rec, CONTEXT *context )
     NTSTATUS status;
     DWORD c;
 
-    TRACE( "code=%x flags=%x addr=%p ip=%lx tid=%04x\n",
+    TRACE( "code=%x flags=%x addr=%p ip=%p tid=%04x\n",
            rec->ExceptionCode, rec->ExceptionFlags, rec->ExceptionAddress,
-           context->Rip, GetCurrentThreadId() );
+           (void *)context->Rip, GetCurrentThreadId() );
     for (c = 0; c < min( EXCEPTION_MAXIMUM_PARAMETERS, rec->NumberParameters ); c++)
         TRACE( " info[%d]=%016lx\n", c, rec->ExceptionInformation[c] );
 
@@ -589,6 +589,36 @@ __ASM_GLOBAL_FUNC( KiUserExceptionDispatcher,
                   __ASM_CFI(".cfi_rel_offset %rsi,0\n\t")
                    "call " __ASM_NAME("dispatch_exception") "\n\t"
                   "int3")
+
+
+/*******************************************************************
+ *		KiUserApcDispatcher (NTDLL.@)
+ */
+void WINAPI dispatch_apc( CONTEXT *context, ULONG_PTR ctx, ULONG_PTR arg1, ULONG_PTR arg2,
+                          PNTAPCFUNC func )
+{
+    func( ctx, arg1, arg2 );
+    NtContinue( context, TRUE );
+}
+
+__ASM_GLOBAL_FUNC( KiUserApcDispatcher,
+                  "addq $0x8,%rsp\n\t"
+                  "mov 0x98(%rcx),%r10\n\t" /* context->Rsp */
+                  "mov 0xf8(%rcx),%r11\n\t" /* context->Rip */
+                  "mov %r11,-0x8(%r10)\n\t"
+                  "mov %rbp,-0x10(%r10)\n\t"
+                  "lea -0x10(%r10),%rbp\n\t"
+                  __ASM_SEH(".seh_pushreg %rbp\n\t")
+                  __ASM_SEH(".seh_setframe %rbp,0\n\t")
+                  __ASM_SEH(".seh_endprologue\n\t")
+                  __ASM_CFI(".cfi_signal_frame\n\t")
+                  __ASM_CFI(".cfi_adjust_cfa_offset 0x10\n\t")
+                  __ASM_CFI(".cfi_def_cfa %rbp,0x10\n\t")
+                  __ASM_CFI(".cfi_rel_offset %rip,0x8\n\t")
+                  __ASM_CFI(".cfi_rel_offset %rbp,0\n\t")
+                   "call " __ASM_NAME("dispatch_apc") "\n\t"
+                   "int3")
+
 
 static ULONG64 get_int_reg( CONTEXT *context, int reg )
 {
@@ -780,7 +810,7 @@ PVOID WINAPI RtlVirtualUnwind( ULONG type, ULONG64 base, ULONG64 pc,
     unsigned int i, prolog_offset;
     BOOL mach_frame = FALSE;
 
-    TRACE( "type %x rip %lx rsp %lx\n", type, pc, context->Rsp );
+    TRACE( "type %x rip %p rsp %p\n", type, (void *)pc, (void *)context->Rsp );
     if (TRACE_ON(seh)) dump_unwind_info( base, function );
 
     frame = *frame_ret = context->Rsp;
@@ -944,8 +974,8 @@ static DWORD call_unwind_handler( EXCEPTION_RECORD *rec, DISPATCHER_CONTEXT *dis
     frame.dispatch = dispatch;
     __wine_push_frame( &frame.frame );
 
-    TRACE( "calling handler %p (rec=%p, frame=0x%lx context=%p, dispatch=%p)\n",
-         dispatch->LanguageHandler, rec, dispatch->EstablisherFrame, dispatch->ContextRecord, dispatch );
+    TRACE( "calling handler %p (rec=%p, frame=%p context=%p, dispatch=%p)\n",
+           dispatch->LanguageHandler, rec, (void *)dispatch->EstablisherFrame, dispatch->ContextRecord, dispatch );
     res = dispatch->LanguageHandler( rec, (void *)dispatch->EstablisherFrame, dispatch->ContextRecord, dispatch );
     TRACE( "handler %p returned %x\n", dispatch->LanguageHandler, res );
 
@@ -1086,7 +1116,7 @@ __ASM_GLOBAL_FUNC( call_consolidate_callback,
                    "pushq %rsi\n\t"
                    "pushq %rdi\n\t"
                    "leaq 0x200(%rcx),%rsi\n\t"
-                   "leaq 0x60(%rsp),%rdi\n\t"
+                   "leaq 0x70(%rsp),%rdi\n\t"
                    "movq $0x14,%rcx\n\t"
                    "cld\n\t"
                    "rep; movsq\n\t"
@@ -1162,7 +1192,7 @@ void CDECL RtlRestoreContext( CONTEXT *context, EXCEPTION_RECORD *rec )
         teb_frame = __wine_pop_frame( teb_frame );
     }
 
-    TRACE( "returning to %lx stack %lx\n", context->Rip, context->Rsp );
+    TRACE( "returning to %p stack %p\n", (void *)context->Rip, (void *)context->Rsp );
     NtSetContextThread( GetCurrentThread(), context );
 }
 
@@ -1226,7 +1256,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
             dispatch.EstablisherFrame < (ULONG64)NtCurrentTeb()->Tib.StackLimit ||
             dispatch.EstablisherFrame > (ULONG64)NtCurrentTeb()->Tib.StackBase)
         {
-            ERR( "invalid frame %lx (%p-%p)\n", dispatch.EstablisherFrame,
+            ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
                  NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
             rec->ExceptionFlags |= EH_STACK_INVALID;
             break;
@@ -1236,7 +1266,7 @@ void WINAPI RtlUnwindEx( PVOID end_frame, PVOID target_ip, EXCEPTION_RECORD *rec
         {
             if (end_frame && (dispatch.EstablisherFrame > (ULONG64)end_frame))
             {
-                ERR( "invalid end frame %lx/%p\n", dispatch.EstablisherFrame, end_frame );
+                ERR( "invalid end frame %p/%p\n", (void *)dispatch.EstablisherFrame, end_frame );
                 raise_status( STATUS_INVALID_UNWIND_TARGET, rec );
             }
             if (dispatch.EstablisherFrame == (ULONG64)end_frame) rec->ExceptionFlags |= EH_TARGET_UNWIND;
@@ -1381,7 +1411,7 @@ EXCEPTION_DISPOSITION WINAPI __C_specific_handler( EXCEPTION_RECORD *rec,
                     return ExceptionContinueExecution;
                 }
             }
-            TRACE( "unwinding to target %lx\n", dispatch->ImageBase + table->ScopeRecord[i].JumpTarget );
+            TRACE( "unwinding to target %p\n", (char *)dispatch->ImageBase + table->ScopeRecord[i].JumpTarget );
             RtlUnwindEx( frame, (char *)dispatch->ImageBase + table->ScopeRecord[i].JumpTarget,
                          rec, 0, dispatch->ContextRecord, dispatch->HistoryTable );
         }
@@ -1471,7 +1501,7 @@ USHORT WINAPI RtlCaptureStackBackTrace( ULONG skip, ULONG count, PVOID *buffer, 
             dispatch.EstablisherFrame < (ULONG64)NtCurrentTeb()->Tib.StackLimit ||
             dispatch.EstablisherFrame > (ULONG64)NtCurrentTeb()->Tib.StackBase)
         {
-            ERR( "invalid frame %lx (%p-%p)\n", dispatch.EstablisherFrame,
+            ERR( "invalid frame %p (%p-%p)\n", (void *)dispatch.EstablisherFrame,
                  NtCurrentTeb()->Tib.StackLimit, NtCurrentTeb()->Tib.StackBase );
             break;
         }

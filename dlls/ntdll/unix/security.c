@@ -605,6 +605,69 @@ NTSTATUS WINAPI NtAdjustPrivilegesToken( HANDLE token, BOOLEAN disable, TOKEN_PR
 
 
 /***********************************************************************
+ *             NtFilterToken  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtFilterToken( HANDLE token, ULONG flags, TOKEN_GROUPS *disable_sids,
+                               TOKEN_PRIVILEGES *privileges, TOKEN_GROUPS *restrict_sids, HANDLE *new_token )
+{
+    data_size_t privileges_len = 0;
+    data_size_t sids_len = 0;
+    SID *sids = NULL;
+    NTSTATUS status;
+
+    TRACE( "%p %#x %p %p %p %p\n", token, flags, disable_sids, privileges,
+           restrict_sids, new_token );
+
+    if (flags)
+        FIXME( "flags %#x unsupported\n", flags );
+
+    if (restrict_sids)
+        FIXME( "support for restricting sids not yet implemented\n" );
+
+    if (privileges)
+        privileges_len = privileges->PrivilegeCount * sizeof(LUID_AND_ATTRIBUTES);
+
+    if (disable_sids)
+    {
+        DWORD len, i;
+        BYTE *tmp;
+
+        for (i = 0; i < disable_sids->GroupCount; i++)
+        {
+            SID *sid = disable_sids->Groups[i].Sid;
+            sids_len += offsetof( SID, SubAuthority[sid->SubAuthorityCount] );
+        }
+
+        sids = malloc( sids_len );
+        if (!sids) return STATUS_NO_MEMORY;
+
+        for (i = 0, tmp = (BYTE *)sids; i < disable_sids->GroupCount; i++, tmp += len)
+        {
+            SID *sid = disable_sids->Groups[i].Sid;
+            len = offsetof( SID, SubAuthority[sid->SubAuthorityCount] );
+            memcpy( tmp, disable_sids->Groups[i].Sid, len );
+        }
+    }
+
+    SERVER_START_REQ( filter_token )
+    {
+        req->handle          = wine_server_obj_handle( token );
+        req->flags           = flags;
+        req->privileges_size = privileges_len;
+        wine_server_add_data( req, privileges->Privileges, privileges_len );
+        wine_server_add_data( req, sids, sids_len );
+        status = wine_server_call( req );
+        if (!status) *new_token = wine_server_ptr_handle( reply->new_handle );
+    }
+    SERVER_END_REQ;
+
+    free( sids );
+    return status;
+}
+
+
+
+/***********************************************************************
  *             NtPrivilegeCheck  (NTDLL.@)
  */
 NTSTATUS WINAPI NtPrivilegeCheck( HANDLE token, PRIVILEGE_SET *privs, BOOLEAN *res )
@@ -779,8 +842,16 @@ NTSTATUS WINAPI NtSetSecurityObject( HANDLE handle, SECURITY_INFORMATION info, P
     InitializeObjectAttributes( &attr, NULL, 0, 0, descr );
     if ((status = alloc_object_attributes( &attr, &objattr, &len ))) return status;
     sd = (struct security_descriptor *)(objattr + 1);
-    if (info & OWNER_SECURITY_INFORMATION && !sd->owner_len) return STATUS_INVALID_SECURITY_DESCR;
-    if (info & GROUP_SECURITY_INFORMATION && !sd->group_len) return STATUS_INVALID_SECURITY_DESCR;
+    if (info & OWNER_SECURITY_INFORMATION && !sd->owner_len)
+    {
+        free( objattr );
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
+    if (info & GROUP_SECURITY_INFORMATION && !sd->group_len)
+    {
+        free( objattr );
+        return STATUS_INVALID_SECURITY_DESCR;
+    }
     if (info & (SACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)) sd->control |= SE_SACL_PRESENT;
     if (info & DACL_SECURITY_INFORMATION) sd->control |= SE_DACL_PRESENT;
 

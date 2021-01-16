@@ -21,6 +21,7 @@
 #include "wined3d_private.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(d3d);
+WINE_DECLARE_DEBUG_CHANNEL(d3d_sync);
 WINE_DECLARE_DEBUG_CHANNEL(fps);
 
 #define WINED3D_INITIAL_CS_SIZE 4096
@@ -50,6 +51,7 @@ enum wined3d_cs_op
     WINED3D_CS_OP_SET_SAMPLER,
     WINED3D_CS_OP_SET_SHADER,
     WINED3D_CS_OP_SET_BLEND_STATE,
+    WINED3D_CS_OP_SET_DEPTH_STENCIL_STATE,
     WINED3D_CS_OP_SET_RASTERIZER_STATE,
     WINED3D_CS_OP_SET_RENDER_STATE,
     WINED3D_CS_OP_SET_TEXTURE_STATE,
@@ -269,6 +271,12 @@ struct wined3d_cs_set_blend_state
     unsigned int sample_mask;
 };
 
+struct wined3d_cs_set_depth_stencil_state
+{
+    enum wined3d_cs_op opcode;
+    struct wined3d_depth_stencil_state *state;
+};
+
 struct wined3d_cs_set_rasterizer_state
 {
     enum wined3d_cs_op opcode;
@@ -485,6 +493,7 @@ static const char *debug_cs_op(enum wined3d_cs_op op)
         WINED3D_TO_STR(WINED3D_CS_OP_SET_SAMPLER);
         WINED3D_TO_STR(WINED3D_CS_OP_SET_SHADER);
         WINED3D_TO_STR(WINED3D_CS_OP_SET_BLEND_STATE);
+        WINED3D_TO_STR(WINED3D_CS_OP_SET_DEPTH_STENCIL_STATE);
         WINED3D_TO_STR(WINED3D_CS_OP_SET_RASTERIZER_STATE);
         WINED3D_TO_STR(WINED3D_CS_OP_SET_RENDER_STATE);
         WINED3D_TO_STR(WINED3D_CS_OP_SET_TEXTURE_STATE);
@@ -1218,9 +1227,7 @@ static void wined3d_cs_exec_set_depth_stencil_view(struct wined3d_cs *cs, const 
     if (!prev != !op->view)
     {
         /* Swapping NULL / non NULL depth stencil affects the depth and tests */
-        device_invalidate_state(device, STATE_RENDER(WINED3D_RS_ZENABLE));
-        device_invalidate_state(device, STATE_RENDER(WINED3D_RS_STENCILENABLE));
-        device_invalidate_state(device, STATE_RENDER(WINED3D_RS_STENCILWRITEMASK));
+        device_invalidate_state(device, STATE_DEPTH_STENCIL);
         device_invalidate_state(device, STATE_RASTERIZER);
     }
     else if (prev)
@@ -1651,6 +1658,26 @@ void wined3d_cs_emit_set_blend_state(struct wined3d_cs *cs, struct wined3d_blend
     op->state = state;
     op->factor = *blend_factor;
     op->sample_mask = sample_mask;
+
+    wined3d_cs_submit(cs, WINED3D_CS_QUEUE_DEFAULT);
+}
+
+static void wined3d_cs_exec_set_depth_stencil_state(struct wined3d_cs *cs, const void *data)
+{
+    const struct wined3d_cs_set_depth_stencil_state *op = data;
+
+    cs->state.depth_stencil_state = op->state;
+    device_invalidate_state(cs->device, STATE_DEPTH_STENCIL);
+}
+
+void wined3d_cs_emit_set_depth_stencil_state(struct wined3d_cs *cs,
+        struct wined3d_depth_stencil_state *state)
+{
+    struct wined3d_cs_set_depth_stencil_state *op;
+
+    op = wined3d_cs_require_space(cs, sizeof(*op), WINED3D_CS_QUEUE_DEFAULT);
+    op->opcode = WINED3D_CS_OP_SET_DEPTH_STENCIL_STATE;
+    op->state = state;
 
     wined3d_cs_submit(cs, WINED3D_CS_QUEUE_DEFAULT);
 }
@@ -2606,6 +2633,7 @@ static void (* const wined3d_cs_op_handlers[])(struct wined3d_cs *cs, const void
     /* WINED3D_CS_OP_SET_SAMPLER                 */ wined3d_cs_exec_set_sampler,
     /* WINED3D_CS_OP_SET_SHADER                  */ wined3d_cs_exec_set_shader,
     /* WINED3D_CS_OP_SET_BLEND_STATE             */ wined3d_cs_exec_set_blend_state,
+    /* WINED3D_CS_OP_SET_DEPTH_STENCIL_STATE     */ wined3d_cs_exec_set_depth_stencil_state,
     /* WINED3D_CS_OP_SET_RASTERIZER_STATE        */ wined3d_cs_exec_set_rasterizer_state,
     /* WINED3D_CS_OP_SET_RENDER_STATE            */ wined3d_cs_exec_set_render_state,
     /* WINED3D_CS_OP_SET_TEXTURE_STATE           */ wined3d_cs_exec_set_texture_state,
@@ -2839,6 +2867,18 @@ static void wined3d_cs_wait_event(struct wined3d_cs *cs)
     WaitForSingleObject(cs->event, INFINITE);
 }
 
+static void wined3d_cs_command_lock(const struct wined3d_cs *cs)
+{
+    if (cs->serialize_commands)
+        EnterCriticalSection(&wined3d_command_cs);
+}
+
+static void wined3d_cs_command_unlock(const struct wined3d_cs *cs)
+{
+    if (cs->serialize_commands)
+        LeaveCriticalSection(&wined3d_command_cs);
+}
+
 static DWORD WINAPI wined3d_cs_run(void *ctx)
 {
     struct wined3d_cs_packet *packet;
@@ -2862,7 +2902,9 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
     {
         if (++poll == WINED3D_CS_QUERY_POLL_INTERVAL)
         {
+            wined3d_cs_command_lock(cs);
             poll_queries(cs);
+            wined3d_cs_command_unlock(cs);
             poll = 0;
         }
 
@@ -2893,7 +2935,9 @@ static DWORD WINAPI wined3d_cs_run(void *ctx)
                 break;
             }
 
+            wined3d_cs_command_lock(cs);
             wined3d_cs_op_handlers[opcode](cs, packet->data);
+            wined3d_cs_command_unlock(cs);
             TRACE("%s executed.\n", debug_cs_op(opcode));
         }
 
@@ -2918,6 +2962,7 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device)
 
     cs->ops = &wined3d_cs_st_ops;
     cs->device = device;
+    cs->serialize_commands = TRACE_ON(d3d_sync) || wined3d_settings.cs_multithreaded & WINED3D_CSMT_SERIALIZE;
 
     state_init(&cs->state, d3d_info, WINED3D_STATE_NO_REF | WINED3D_STATE_INIT_DEFAULT);
 
@@ -2925,7 +2970,7 @@ struct wined3d_cs *wined3d_cs_create(struct wined3d_device *device)
     if (!(cs->data = heap_alloc(cs->data_size)))
         goto fail;
 
-    if (wined3d_settings.cs_multithreaded
+    if (wined3d_settings.cs_multithreaded & WINED3D_CSMT_ENABLE
             && !RtlIsCriticalSectionLockedByThread(NtCurrentTeb()->Peb->LoaderLock))
     {
         cs->ops = &wined3d_cs_mt_ops;

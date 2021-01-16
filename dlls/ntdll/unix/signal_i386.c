@@ -495,6 +495,16 @@ static inline struct x86_thread_data *x86_thread_data(void)
     return (struct x86_thread_data *)ntdll_get_thread_data()->cpu_data;
 }
 
+void *get_syscall_frame(void)
+{
+    return x86_thread_data()->syscall_frame;
+}
+
+void set_syscall_frame(void *frame)
+{
+    x86_thread_data()->syscall_frame = frame;
+}
+
 static inline WORD get_cs(void) { WORD res; __asm__( "movw %%cs,%0" : "=r" (res) ); return res; }
 static inline WORD get_ds(void) { WORD res; __asm__( "movw %%ds,%0" : "=r" (res) ); return res; }
 static inline WORD get_fs(void) { WORD res; __asm__( "movw %%fs,%0" : "=r" (res) ); return res; }
@@ -630,7 +640,7 @@ static inline void *init_handler( const ucontext_t *sigcontext )
          * SS is still non-system segment. This is why both CS and SS
          * are checked.
          */
-        return teb->WOW32Reserved;
+        return teb->SystemReserved1[0];
     }
     return (void *)(ESP_sig(sigcontext) & ~3);
 }
@@ -774,7 +784,7 @@ static inline void restore_xstate( const CONTEXT *context )
     XSAVE_FORMAT *xrstor_base;
     XSTATE *xs;
 
-    if (!(xs = xstate_from_context( context )))
+    if (!(user_shared_data->XState.EnabledFeatures && (xs = xstate_from_context( context ))))
         return;
 
     xrstor_base = (XSAVE_FORMAT *)xs - 1;
@@ -886,14 +896,16 @@ static inline void save_context( struct xcontext *xcontext, const ucontext_t *si
     }
     if (fpux)
     {
+        XSTATE *xs;
+
         context->ContextFlags |= CONTEXT_FLOATING_POINT | CONTEXT_EXTENDED_REGISTERS;
         memcpy( context->ExtendedRegisters, fpux, sizeof(*fpux) );
         if (!fpu) fpux_to_fpu( &context->FloatSave, fpux );
-        xcontext->xstate = XState_sig(fpux);
-    }
-    else
-    {
-        xcontext->xstate = NULL;
+        if (user_shared_data->XState.EnabledFeatures && (xs = XState_sig(fpux)))
+        {
+            context_init_xstate( context, xs );
+            xcontext->host_compaction_mask = xs->CompactionMask;
+        }
     }
     if (!fpu && !fpux) save_fpu( context );
 }
@@ -944,6 +956,7 @@ static inline void restore_context( const struct xcontext *xcontext, ucontext_t 
         {
             memcpy( &dst_xs->YmmContext, &src_xs->YmmContext, sizeof(dst_xs->YmmContext) );
             dst_xs->Mask |= src_xs->Mask;
+            dst_xs->CompactionMask = xcontext->host_compaction_mask;
         }
     }
     if (!fpu && !fpux) restore_fpu( context );
@@ -1023,6 +1036,7 @@ static unsigned int get_server_context_flags( DWORD flags )
     if (flags & CONTEXT_FLOATING_POINT) ret |= SERVER_CTX_FLOATING_POINT;
     if (flags & CONTEXT_DEBUG_REGISTERS) ret |= SERVER_CTX_DEBUG_REGISTERS;
     if (flags & CONTEXT_EXTENDED_REGISTERS) ret |= SERVER_CTX_EXTENDED_REGISTERS;
+    if (flags & CONTEXT_XSTATE) ret |= SERVER_CTX_YMM_REGISTERS;
     return ret;
 }
 
@@ -1095,6 +1109,7 @@ NTSTATUS context_to_server( context_t *to, const CONTEXT *from )
         to->flags |= SERVER_CTX_EXTENDED_REGISTERS;
         memcpy( to->ext.i386_regs, from->ExtendedRegisters, sizeof(to->ext.i386_regs) );
     }
+    xstate_to_server( to, xstate_from_context( from ) );
     return STATUS_SUCCESS;
 }
 
@@ -1108,7 +1123,7 @@ NTSTATUS context_from_server( CONTEXT *to, const context_t *from )
 {
     if (from->cpu != CPU_x86) return STATUS_INVALID_PARAMETER;
 
-    to->ContextFlags = CONTEXT_i386;
+    to->ContextFlags = CONTEXT_i386 | (to->ContextFlags & 0x40);
     if (from->flags & SERVER_CTX_CONTROL)
     {
         to->ContextFlags |= CONTEXT_CONTROL;
@@ -1165,6 +1180,7 @@ NTSTATUS context_from_server( CONTEXT *to, const context_t *from )
         to->ContextFlags |= CONTEXT_EXTENDED_REGISTERS;
         memcpy( to->ExtendedRegisters, from->ext.i386_regs, sizeof(to->ExtendedRegisters) );
     }
+    xstate_from_server( xstate_from_context( to ), from );
     return STATUS_SUCCESS;
 }
 
@@ -1246,7 +1262,7 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
 
     /* Save xstate before any calls which can potentially change volatile ymm registers.
      * E. g., debug output will clobber ymm registers. */
-    xsave_status = self ? save_xstate( context ) : STATUS_SUCCESS; /* FIXME: other thread. */
+    xsave_status = self ? save_xstate( context ) : STATUS_SUCCESS;
 
     /* debug registers require a server call */
     if (needed_flags & CONTEXT_DEBUG_REGISTERS) self = FALSE;
@@ -1293,7 +1309,6 @@ NTSTATUS WINAPI NtGetContextThread( HANDLE handle, CONTEXT *context )
         }
         if (needed_flags & CONTEXT_FLOATING_POINT) save_fpu( context );
         if (needed_flags & CONTEXT_EXTENDED_REGISTERS) save_fpux( context );
-        /* FIXME: xstate */
         /* update the cached version of the debug registers */
         if (context->ContextFlags & (CONTEXT_DEBUG_REGISTERS & ~CONTEXT_i386))
         {
@@ -1579,6 +1594,7 @@ static void setup_raise_exception( ucontext_t *sigcontext, void *stack_ptr,
 {
     CONTEXT *context = &xcontext->c;
     size_t stack_size;
+    XSTATE *src_xs;
 
     struct stack_layout
     {
@@ -1606,7 +1622,7 @@ C_ASSERT( (offsetof(struct stack_layout, xstate) == sizeof(struct stack_layout))
     if (rec->ExceptionCode == EXCEPTION_BREAKPOINT) context->Eip--;
 
     stack_size = sizeof(*stack);
-    if (xcontext->xstate)
+    if ((src_xs = xstate_from_context( context )))
     {
         stack_size += (ULONG_PTR)stack_ptr - (((ULONG_PTR)stack_ptr
                 - sizeof(XSTATE)) & ~(ULONG_PTR)63);
@@ -1616,17 +1632,18 @@ C_ASSERT( (offsetof(struct stack_layout, xstate) == sizeof(struct stack_layout))
     stack->rec          = *rec;
     stack->context      = *context;
 
-    if (xcontext->xstate)
+    if (src_xs)
     {
         XSTATE *dst_xs = (XSTATE *)stack->xstate;
 
         assert(!((ULONG_PTR)dst_xs & 63));
         context_init_xstate( &stack->context, stack->xstate );
+        memset( dst_xs, 0, offsetof(XSTATE, YmmContext) );
         dst_xs->CompactionMask = user_shared_data->XState.CompactionEnabled ? 0x8000000000000004 : 0;
-        if (xcontext->xstate->Mask & 4)
+        if (src_xs->Mask & 4)
         {
             dst_xs->Mask = 4;
-            memcpy( &dst_xs->YmmContext, &xcontext->xstate->YmmContext, sizeof(dst_xs->YmmContext) );
+            memcpy( &dst_xs->YmmContext, &src_xs->YmmContext, sizeof(dst_xs->YmmContext) );
         }
     }
 
@@ -1658,6 +1675,42 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
     setup_raise_exception( sigcontext, stack, rec, &xcontext );
 }
 
+/* stack layout when calling an user apc function.
+ * FIXME: match Windows ABI. */
+struct apc_stack_layout
+{
+    void         *context_ptr;
+    void         *ctx;
+    void         *arg1;
+    void         *arg2;
+    void         *func;
+    CONTEXT       context;
+};
+
+struct apc_stack_layout * WINAPI setup_user_apc_dispatcher_stack( CONTEXT *context, struct apc_stack_layout *stack,
+        void *ctx, void *arg1, void *arg2, void *func )
+{
+    CONTEXT c;
+
+    if (!context)
+    {
+        c.ContextFlags = CONTEXT_FULL;
+        NtGetContextThread( GetCurrentThread(), &c );
+        c.Eax = STATUS_USER_APC;
+        context = &c;
+    }
+    memmove( &stack->context, context, sizeof(stack->context) );
+    stack->context_ptr = &stack->context;
+    stack->ctx = ctx;
+    stack->arg1 = arg1;
+    stack->arg2 = arg2;
+    stack->func = func;
+    return stack;
+}
+
+C_ASSERT( sizeof(struct apc_stack_layout) == 0x2e0 );
+C_ASSERT( offsetof(struct syscall_frame, ret_addr) == 0x14 );
+C_ASSERT( offsetof(struct apc_stack_layout, context) == 20 );
 
 /***********************************************************************
  *           call_user_apc_dispatcher
@@ -1665,38 +1718,27 @@ static void setup_exception( ucontext_t *sigcontext, EXCEPTION_RECORD *rec )
 __ASM_GLOBAL_FUNC( call_user_apc_dispatcher,
                    "movl 4(%esp),%esi\n\t"       /* context_ptr */
                    "movl 24(%esp),%edi\n\t"      /* dispatcher */
+                   "leal 4(%esp),%ebp\n\t"
                    "test %esi,%esi\n\t"
                    "jz 1f\n\t"
-                   "movl 0xc4(%esi),%eax\n\t"    /* context_ptr->Rsp */
-                   "leal -0x2f8(%eax),%eax\n\t"  /* sizeof(CONTEXT) + offsetof(frame,ret_addr) + params */
-                   "movl 20(%esp),%ecx\n\t"      /* func */
-                   "movl %ecx,20(%eax)\n\t"
-                   "movl 8(%esp),%ebx\n\t"       /* ctx */
-                   "movl 12(%esp),%edx\n\t"      /* arg1 */
-                   "movl 16(%esp),%ecx\n\t"      /* arg2 */
-                   "leal 4(%eax),%esp\n\t"
-                   "jmp 2f\n"
+                   "movl 0xc4(%esi),%eax\n\t"    /* context_ptr->Esp */
+                   "jmp 2f\n\t"
                    "1:\tmovl %fs:0x1f8,%eax\n\t" /* x86_thread_data()->syscall_frame */
-                   "leal -0x2cc(%eax),%esi\n\t"
-                   "movl %esp,%ebx\n\t"
-                   "cmpl %esp,%esi\n\t"
-                   "cmovbl %esi,%esp\n\t"
-                   "movl $0x00010007,(%esi)\n\t" /* context.ContextFlags = CONTEXT_FULL */
-                   "pushl %esi\n\t"              /* context */
-                   "pushl $0xfffffffe\n\t"
-                   "call " __ASM_STDCALL("NtGetContextThread",8) "\n\t"
-                   "movl $0xc0,0xb0(%esi)\n"     /* context.Eax = STATUS_USER_APC */
-                   "movl 20(%ebx),%eax\n\t"      /* func */
-                   "movl 16(%ebx),%ecx\n\t"      /* arg2 */
-                   "movl 12(%ebx),%edx\n\t"      /* arg1 */
-                   "movl 8(%ebx),%ebx\n\t"       /* ctx */
-                   "leal -20(%esi),%esp\n\t"
-                   "movl %eax,16(%esp)\n"        /* func */
-                   "2:\tmovl %ecx,12(%esp)\n\t"  /* arg2 */
-                   "movl %edx,8(%esp)\n\t"       /* arg1 */
-                   "movl %ebx,4(%esp)\n\t"       /* ctx */
-                   "movl %esi,(%esp)\n\t"        /* context */
+                   "leal 0x14(%eax),%eax\n\t"    /* &x86_thread_data()->syscall_frame->ret_addr */
+                   "2:\tsubl $0x2e0,%eax\n\t"    /* sizeof(struct apc_stack_layout) */
+                   "movl %ebp,%esp\n\t"          /* pop return address */
+                   "cmpl %esp,%eax\n\t"
+                   "cmovbl %eax,%esp\n\t"
+                   "pushl 16(%ebp)\n\t"          /* func */
+                   "pushl 12(%ebp)\n\t"          /* arg2 */
+                   "pushl 8(%ebp)\n\t"           /* arg1 */
+                   "pushl 4(%ebp)\n\t"           /* ctx */
+                   "pushl %eax\n\t"
+                   "pushl %esi\n\t"
+                   "call " __ASM_STDCALL("setup_user_apc_dispatcher_stack",24) "\n\t"
                    "movl $0,%fs:0x1f8\n\t"       /* x86_thread_data()->syscall_frame = NULL */
+                   "movl %eax,%esp\n\t"
+                   "leal 20(%eax),%esi\n\t"
                    "movl 0xb4(%esi),%ebp\n\t"    /* context.Ebp */
                    "pushl 0xb8(%esi)\n\t"        /* context.Eip */
                    "jmp *%edi\n" )

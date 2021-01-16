@@ -406,6 +406,7 @@ static NTSTATUS get_pe_file_info( UNICODE_STRING *path, HANDLE *handle, pe_image
     OBJECT_ATTRIBUTES attr;
     IO_STATUS_BLOCK io;
 
+    *handle = 0;
     memset( info, 0, sizeof(*info) );
     InitializeObjectAttributes( &attr, path, OBJ_CASE_INSENSITIVE, 0, 0 );
     if ((status = NtOpenFile( handle, GENERIC_READ, &attr, &io,
@@ -422,7 +423,6 @@ static NTSTATUS get_pe_file_info( UNICODE_STRING *path, HANDLE *handle, pe_image
 #else
             info->cpu = client_cpu;
 #endif
-            *handle = 0;
             return STATUS_SUCCESS;
         }
         return status;
@@ -812,6 +812,28 @@ done:
     return status;
 }
 
+static NTSTATUS alloc_handle_list( const PS_ATTRIBUTE *handles_attr, obj_handle_t **handles, data_size_t *handles_len )
+{
+    SIZE_T count, i;
+    HANDLE *src;
+
+    *handles = NULL;
+    *handles_len = 0;
+
+    if (!handles_attr) return STATUS_SUCCESS;
+
+    count = handles_attr->Size / sizeof(HANDLE);
+
+    if (!(*handles = calloc( sizeof(**handles), count ))) return STATUS_NO_MEMORY;
+
+    src = handles_attr->ValuePtr;
+    for (i = 0; i < count; ++i)
+        (*handles)[i] = wine_server_obj_handle( src[i] );
+
+    *handles_len = count * sizeof(**handles);
+
+    return STATUS_SUCCESS;
+}
 
 /**********************************************************************
  *           NtCreateUserProcess  (NTDLL.@)
@@ -837,6 +859,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     HANDLE parent = 0, debug = 0, token = 0;
     UNICODE_STRING path = {0};
     SIZE_T i, attr_count = (attr->TotalLength - sizeof(attr->TotalLength)) / sizeof(PS_ATTRIBUTE);
+    const PS_ATTRIBUTE *handles_attr = NULL;
+    data_size_t handles_size;
+    obj_handle_t *handles;
 
     for (i = 0; i < attr_count; i++)
     {
@@ -855,6 +880,10 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         case PS_ATTRIBUTE_TOKEN:
             token = attr->Attributes[i].ValuePtr;
             break;
+        case PS_ATTRIBUTE_HANDLE_LIST:
+            if (process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES)
+                handles_attr = &attr->Attributes[i];
+            break;
         default:
             if (attr->Attributes[i].Attribute & PS_ATTRIBUTE_INPUT)
                 FIXME( "unhandled input attribute %lx\n", attr->Attributes[i].Attribute );
@@ -865,7 +894,6 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     TRACE( "%s image %s cmdline %s parent %p\n", debugstr_us( &path ),
            debugstr_us( &params->ImagePathName ), debugstr_us( &params->CommandLine ), parent );
     if (debug) FIXME( "debug port %p not supported yet\n", debug );
-    if (token) FIXME( "token %p not supported yet\n", token );
 
     unixdir = get_unix_curdir( params );
 
@@ -883,12 +911,19 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 
     if ((status = alloc_object_attributes( process_attr, &objattr, &attr_len ))) goto done;
 
+    if ((status = alloc_handle_list( handles_attr, &handles, &handles_size )))
+    {
+        free( objattr );
+        goto done;
+    }
+
     /* create the socket for the new process */
 
     if (socketpair( PF_UNIX, SOCK_STREAM, 0, socketfd ) == -1)
     {
         status = STATUS_TOO_MANY_OPENED_FILES;
         free( objattr );
+        free( handles );
         goto done;
     }
 #ifdef SO_PASSCRED
@@ -906,6 +941,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
 
     SERVER_START_REQ( new_process )
     {
+        req->token          = wine_server_obj_handle( token );
         req->parent_process = wine_server_obj_handle( parent );
         req->inherit_all    = !!(process_flags & PROCESS_CREATE_FLAGS_INHERIT_HANDLES);
         req->create_flags   = params->DebugFlags; /* hack: creation flags stored in DebugFlags for now */
@@ -914,7 +950,9 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
         req->access         = process_access;
         req->cpu            = pe_info.cpu;
         req->info_size      = startup_info_size;
+        req->handles_size   = handles_size;
         wine_server_add_data( req, objattr, attr_len );
+        wine_server_add_data( req, handles, handles_size );
         wine_server_add_data( req, startup_info, startup_info_size );
         wine_server_add_data( req, params->Environment, env_size );
         if (!(status = wine_server_call( req )))
@@ -926,6 +964,7 @@ NTSTATUS WINAPI NtCreateUserProcess( HANDLE *process_handle_ptr, HANDLE *thread_
     }
     SERVER_END_REQ;
     free( objattr );
+    free( handles );
 
     if (status)
     {
@@ -1042,7 +1081,6 @@ done:
  */
 NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
 {
-    static BOOL clean_exit;
     NTSTATUS ret;
     BOOL self;
 
@@ -1056,8 +1094,8 @@ NTSTATUS WINAPI NtTerminateProcess( HANDLE handle, LONG exit_code )
     SERVER_END_REQ;
     if (self)
     {
-        if (!handle) clean_exit = TRUE;
-        else if (clean_exit) exit_process( exit_code );
+        if (!handle) process_exiting = TRUE;
+        else if (process_exiting) exit_process( exit_code );
         else abort_process( exit_code );
     }
     return ret;
@@ -1703,6 +1741,16 @@ NTSTATUS WINAPI NtResumeProcess( HANDLE handle )
     }
     SERVER_END_REQ;
     return ret;
+}
+
+
+/**********************************************************************
+ *           NtDebugActiveProcess  (NTDLL.@)
+ */
+NTSTATUS WINAPI NtDebugActiveProcess( HANDLE process, HANDLE debug_object )
+{
+    FIXME( "(%p %p), stub!\n", process, debug_object );
+    return STATUS_SUCCESS;
 }
 
 

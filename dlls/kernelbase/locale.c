@@ -28,6 +28,7 @@
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
+#define WINNORMALIZEAPI
 #include "windef.h"
 #include "winbase.h"
 #include "winreg.h"
@@ -106,6 +107,7 @@ static const struct { UINT cp; const WCHAR *name; } codepage_names[] =
     { 424,   L"IBM EBCDIC Hebrew" },
     { 437,   L"OEM United States" },
     { 500,   L"IBM EBCDIC International" },
+    { 708,   L"Arabic ASMO" },
     { 737,   L"OEM Greek 437G" },
     { 775,   L"OEM Baltic" },
     { 850,   L"OEM Multilingual Latin 1" },
@@ -4122,6 +4124,20 @@ INT WINAPI DECLSPEC_HOTPATCH GetCalendarInfoEx( const WCHAR *locale, CALID calen
     return GetCalendarInfoW( lcid, calendar, type, data, count, value );
 }
 
+static CRITICAL_SECTION tzname_section;
+static CRITICAL_SECTION_DEBUG tzname_section_debug =
+{
+    0, 0, &tzname_section,
+    { &tzname_section_debug.ProcessLocksList, &tzname_section_debug.ProcessLocksList },
+      0, 0, { (DWORD_PTR)(__FILE__ ": tzname_section") }
+};
+static CRITICAL_SECTION tzname_section = { &tzname_section_debug, -1, 0, 0, 0, 0 };
+static struct {
+    LCID lcid;
+    WCHAR key_name[128];
+    WCHAR standard_name[32];
+    WCHAR daylight_name[32];
+} cached_tzname;
 
 /***********************************************************************
  *	GetDynamicTimeZoneInformation   (kernelbase.@)
@@ -4134,15 +4150,34 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetDynamicTimeZoneInformation( DYNAMIC_TIME_ZONE_
     if (!set_ntstatus( RtlQueryDynamicTimeZoneInformation( (RTL_DYNAMIC_TIME_ZONE_INFORMATION *)info )))
         return TIME_ZONE_ID_INVALID;
 
-    if (!RegOpenKeyExW( tz_key, info->TimeZoneKeyName, 0, KEY_ALL_ACCESS, &key ))
+    RtlEnterCriticalSection( &tzname_section );
+    if (cached_tzname.lcid == GetThreadLocale() &&
+        !wcscmp( info->TimeZoneKeyName, cached_tzname.key_name ))
     {
-        RegLoadMUIStringW( key, L"MUI_Std", info->StandardName,
-                           sizeof(info->StandardName), NULL, 0, system_dir );
-        RegLoadMUIStringW( key, L"MUI_Dlt", info->DaylightName,
-                           sizeof(info->DaylightName), NULL, 0, system_dir );
-        RegCloseKey( key );
+        wcscpy( info->StandardName, cached_tzname.standard_name );
+        wcscpy( info->DaylightName, cached_tzname.daylight_name );
+        RtlLeaveCriticalSection( &tzname_section );
     }
-    else return TIME_ZONE_ID_INVALID;
+    else
+    {
+        RtlLeaveCriticalSection( &tzname_section );
+        if (!RegOpenKeyExW( tz_key, info->TimeZoneKeyName, 0, KEY_ALL_ACCESS, &key ))
+        {
+            RegLoadMUIStringW( key, L"MUI_Std", info->StandardName,
+                               sizeof(info->StandardName), NULL, 0, system_dir );
+            RegLoadMUIStringW( key, L"MUI_Dlt", info->DaylightName,
+                               sizeof(info->DaylightName), NULL, 0, system_dir );
+            RegCloseKey( key );
+        }
+        else return TIME_ZONE_ID_INVALID;
+
+        RtlEnterCriticalSection( &tzname_section );
+        cached_tzname.lcid = GetThreadLocale();
+        wcscpy( cached_tzname.key_name, info->TimeZoneKeyName );
+        wcscpy( cached_tzname.standard_name, info->StandardName );
+        wcscpy( cached_tzname.daylight_name, info->DaylightName );
+        RtlLeaveCriticalSection( &tzname_section );
+    }
 
     NtQuerySystemTime( &now );
     return get_timezone_id( (TIME_ZONE_INFORMATION *)info, now, FALSE );
@@ -5170,7 +5205,7 @@ INT WINAPI DECLSPEC_HOTPATCH LCMapStringEx( const WCHAR *locale, DWORD flags, co
                                             WCHAR *dst, int dstlen, NLSVERSIONINFO *version,
                                             void *reserved, LPARAM handle )
 {
-    const struct sortguid *sortid;
+    const struct sortguid *sortid = NULL;
     LPWSTR dst_ptr;
     INT len;
 
@@ -5201,7 +5236,7 @@ INT WINAPI DECLSPEC_HOTPATCH LCMapStringEx( const WCHAR *locale, DWORD flags, co
 
     if (!dstlen) dst = NULL;
 
-    if (!(sortid = get_language_sort( locale )))
+    if (flags & LCMAP_LINGUISTIC_CASING && !(sortid = get_language_sort( locale )))
     {
         FIXME( "unknown locale %s\n", debugstr_w(locale) );
         SetLastError( ERROR_INVALID_PARAMETER );

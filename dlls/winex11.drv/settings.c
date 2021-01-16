@@ -168,7 +168,7 @@ void X11DRV_Settings_Init(void)
     depths = screen_bpp == 32 ? depths_32 : depths_24;
 
     nores_handler.name = "NoRes";
-    nores_handler.priority = 0;
+    nores_handler.priority = 1;
     nores_handler.get_id = nores_get_id;
     nores_handler.get_modes = nores_get_modes;
     nores_handler.free_modes = nores_free_modes;
@@ -359,18 +359,50 @@ BOOL get_primary_adapter(WCHAR *name)
 
 static int mode_compare(const void *p1, const void *p2)
 {
+    DWORD a_width, a_height, b_width, b_height;
     const DEVMODEW *a = p1, *b = p2;
 
+    /* Use the width and height in landscape mode for comparison */
+    if (a->u1.s2.dmDisplayOrientation == DMDO_DEFAULT || a->u1.s2.dmDisplayOrientation == DMDO_180)
+    {
+        a_width = a->dmPelsWidth;
+        a_height = a->dmPelsHeight;
+    }
+    else
+    {
+        a_width = a->dmPelsHeight;
+        a_height = a->dmPelsWidth;
+    }
+
+    if (b->u1.s2.dmDisplayOrientation == DMDO_DEFAULT || b->u1.s2.dmDisplayOrientation == DMDO_180)
+    {
+        b_width = b->dmPelsWidth;
+        b_height = b->dmPelsHeight;
+    }
+    else
+    {
+        b_width = b->dmPelsHeight;
+        b_height = b->dmPelsWidth;
+    }
+
+    /* Depth in descending order */
     if (a->dmBitsPerPel != b->dmBitsPerPel)
         return b->dmBitsPerPel - a->dmBitsPerPel;
 
-    if (a->dmPelsWidth != b->dmPelsWidth)
-        return a->dmPelsWidth - b->dmPelsWidth;
+    /* Width in ascending order */
+    if (a_width != b_width)
+        return a_width - b_width;
 
-    if (a->dmPelsHeight != b->dmPelsHeight)
-        return a->dmPelsHeight - b->dmPelsHeight;
+    /* Height in ascending order */
+    if (a_height != b_height)
+        return a_height - b_height;
 
-    return b->dmDisplayFrequency - a->dmDisplayFrequency;
+    /* Frequency in descending order */
+    if (a->dmDisplayFrequency != b->dmDisplayFrequency)
+        return b->dmDisplayFrequency - a->dmDisplayFrequency;
+
+    /* Orientation in ascending order */
+    return a->u1.s2.dmDisplayOrientation - b->u1.s2.dmDisplayOrientation;
 }
 
 /***********************************************************************
@@ -465,7 +497,7 @@ static DEVMODEW *get_full_mode(ULONG_PTR id, DEVMODEW *dev_mode)
     if (is_detached_mode(dev_mode))
         return dev_mode;
 
-    if (!handler.get_modes(id, 0, &modes, &mode_count))
+    if (!handler.get_modes(id, EDS_ROTATEDMODE, &modes, &mode_count))
         return NULL;
 
     qsort(modes, mode_count, sizeof(*modes) + modes[0].dmDriverExtra, mode_compare);
@@ -486,6 +518,9 @@ static DEVMODEW *get_full_mode(ULONG_PTR id, DEVMODEW *dev_mode)
             found_mode->dmDisplayFrequency &&
             dev_mode->dmDisplayFrequency != 1 &&
             dev_mode->dmDisplayFrequency != found_mode->dmDisplayFrequency)
+            continue;
+        if (dev_mode->dmFields & DM_DISPLAYORIENTATION &&
+            found_mode->u1.s2.dmDisplayOrientation != dev_mode->u1.s2.dmDisplayOrientation)
             continue;
 
         break;

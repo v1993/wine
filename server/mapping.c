@@ -74,6 +74,7 @@ static const struct object_ops ranges_ops =
     no_map_access,             /* map_access */
     default_get_sd,            /* get_sd */
     default_set_sd,            /* set_sd */
+    no_get_full_name,          /* get_full_name */
     no_lookup_name,            /* lookup_name */
     no_link_name,              /* link_name */
     NULL,                      /* unlink_name */
@@ -109,6 +110,7 @@ static const struct object_ops shared_map_ops =
     no_map_access,             /* map_access */
     default_get_sd,            /* get_sd */
     default_set_sd,            /* set_sd */
+    no_get_full_name,          /* get_full_name */
     no_lookup_name,            /* lookup_name */
     no_link_name,              /* link_name */
     NULL,                      /* unlink_name */
@@ -166,6 +168,7 @@ static const struct object_ops mapping_ops =
     mapping_map_access,          /* map_access */
     default_get_sd,              /* get_sd */
     default_set_sd,              /* set_sd */
+    default_get_full_name,       /* get_full_name */
     no_lookup_name,              /* lookup_name */
     directory_link_name,         /* link_name */
     default_unlink_name,         /* unlink_name */
@@ -880,6 +883,41 @@ static struct mapping *create_mapping( struct object *root, const struct unicode
     return NULL;
 }
 
+/* create a read-only file mapping for the specified fd */
+struct mapping *create_fd_mapping( struct object *root, const struct unicode_str *name,
+                                   struct fd *fd, unsigned int attr, const struct security_descriptor *sd )
+{
+    struct mapping *mapping;
+    int unix_fd;
+    struct stat st;
+
+    if (!(mapping = create_named_object( root, &mapping_ops, name, attr, sd ))) return NULL;
+    if (get_error() == STATUS_OBJECT_NAME_EXISTS) return mapping;  /* Nothing else to do */
+
+    mapping->shared    = NULL;
+    mapping->committed = NULL;
+    mapping->flags     = SEC_FILE;
+    mapping->fd        = (struct fd *)grab_object( fd );
+    set_fd_user( mapping->fd, &mapping_fd_ops, NULL );
+
+    if ((unix_fd = get_unix_fd( mapping->fd )) == -1) goto error;
+    if (fstat( unix_fd, &st ) == -1)
+    {
+        file_set_error();
+        goto error;
+    }
+    if (!(mapping->size = st.st_size))
+    {
+        set_error( STATUS_MAPPED_FILE_SIZE_ZERO );
+        goto error;
+    }
+    return mapping;
+
+ error:
+    release_object( mapping );
+    return NULL;
+}
+
 static struct mapping *get_mapping_obj( struct process *process, obj_handle_t handle, unsigned int access )
 {
     return (struct mapping *)get_handle_obj( process, handle, access, &mapping_ops );
@@ -961,8 +999,8 @@ struct object *create_user_data_mapping( struct object *root, const struct unico
     void *ptr;
     struct mapping *mapping;
 
-    if (!(mapping = create_mapping( root, name, OBJ_OPENIF, sizeof(KSHARED_USER_DATA),
-                                    SEC_COMMIT, 0, FILE_READ_DATA | FILE_WRITE_DATA, NULL ))) return NULL;
+    if (!(mapping = create_mapping( root, name, attr, sizeof(KSHARED_USER_DATA),
+                                    SEC_COMMIT, 0, FILE_READ_DATA | FILE_WRITE_DATA, sd ))) return NULL;
     ptr = mmap( NULL, mapping->size, PROT_WRITE, MAP_SHARED, get_unix_fd( mapping->fd ), 0 );
     if (ptr != MAP_FAILED)
     {

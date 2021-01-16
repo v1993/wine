@@ -15,6 +15,7 @@
 @ cdecl wined3d_incref(ptr)
 @ cdecl wined3d_register_software_device(ptr ptr)
 @ cdecl wined3d_register_window(ptr ptr ptr long)
+@ cdecl wined3d_restore_display_modes(ptr)
 @ cdecl wined3d_unregister_windows(ptr)
 
 @ cdecl wined3d_adapter_get_identifier(ptr long ptr)
@@ -31,6 +32,11 @@
 @ cdecl wined3d_buffer_get_parent(ptr)
 @ cdecl wined3d_buffer_get_resource(ptr)
 @ cdecl wined3d_buffer_incref(ptr)
+
+@ cdecl wined3d_depth_stencil_state_create(ptr ptr ptr ptr ptr)
+@ cdecl wined3d_depth_stencil_state_decref(ptr)
+@ cdecl wined3d_depth_stencil_state_get_parent(ptr)
+@ cdecl wined3d_depth_stencil_state_incref(ptr)
 
 @ cdecl wined3d_device_acquire_focus_window(ptr ptr)
 @ cdecl wined3d_device_apply_stateblock(ptr ptr)
@@ -63,6 +69,7 @@
 @ cdecl wined3d_device_get_cs_resource_view(ptr long)
 @ cdecl wined3d_device_get_cs_sampler(ptr long)
 @ cdecl wined3d_device_get_cs_uav(ptr long)
+@ cdecl wined3d_device_get_depth_stencil_state(ptr)
 @ cdecl wined3d_device_get_depth_stencil_view(ptr)
 @ cdecl wined3d_device_get_device_caps(ptr ptr)
 @ cdecl wined3d_device_get_display_mode(ptr long ptr ptr)
@@ -117,6 +124,7 @@
 @ cdecl wined3d_device_set_cs_uav(ptr long ptr long)
 @ cdecl wined3d_device_set_cursor_position(ptr long long long)
 @ cdecl wined3d_device_set_cursor_properties(ptr long long ptr long)
+@ cdecl wined3d_device_set_depth_stencil_state(ptr ptr)
 @ cdecl wined3d_device_set_depth_stencil_view(ptr ptr)
 @ cdecl wined3d_device_set_dialog_box_mode(ptr long)
 @ cdecl wined3d_device_set_domain_shader(ptr ptr)
@@ -264,7 +272,7 @@
 @ cdecl wined3d_stateblock_set_vs_consts_f(ptr long long ptr)
 @ cdecl wined3d_stateblock_set_vs_consts_i(ptr long long ptr)
 
-@ cdecl wined3d_swapchain_create(ptr ptr ptr ptr ptr)
+@ cdecl wined3d_swapchain_create(ptr ptr ptr ptr ptr ptr)
 @ cdecl wined3d_swapchain_decref(ptr)
 @ cdecl wined3d_swapchain_get_back_buffer(ptr long)
 @ cdecl wined3d_swapchain_get_device(ptr)
@@ -282,8 +290,9 @@
 @ cdecl wined3d_swapchain_set_palette(ptr ptr)
 @ cdecl wined3d_swapchain_set_window(ptr ptr)
 
-@ cdecl wined3d_swapchain_state_create(ptr ptr ptr)
+@ cdecl wined3d_swapchain_state_create(ptr ptr ptr ptr ptr)
 @ cdecl wined3d_swapchain_state_destroy(ptr)
+@ cdecl wined3d_swapchain_state_is_windowed(ptr)
 @ cdecl wined3d_swapchain_state_resize_target(ptr ptr)
 @ cdecl wined3d_swapchain_state_set_fullscreen(ptr ptr ptr)
 

@@ -469,37 +469,64 @@ static void test_query_procperf(void)
 
 static void test_query_module(void)
 {
+    const RTL_PROCESS_MODULE_INFORMATION_EX *infoex;
+    SYSTEM_MODULE_INFORMATION *info;
     NTSTATUS status;
-    ULONG ReturnLength;
-    ULONG ModuleCount, i;
+    ULONG size, i;
+    char *buffer;
 
-    ULONG SystemInformationLength = sizeof(SYSTEM_MODULE_INFORMATION);
-    SYSTEM_MODULE_INFORMATION* smi = HeapAlloc(GetProcessHeap(), 0, SystemInformationLength); 
-    SYSTEM_MODULE* sm;
+    status = pNtQuerySystemInformation(SystemModuleInformation, NULL, 0, &size);
+    ok(status == STATUS_INFO_LENGTH_MISMATCH, "got %#x\n", status);
+    ok(size > 0, "expected nonzero size\n");
 
-    /* Request the needed length */
-    status = pNtQuerySystemInformation(SystemModuleInformation, smi, 0, &ReturnLength);
-    ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status);
-    ok( ReturnLength > 0, "Expected a ReturnLength to show the needed length\n");
+    info = malloc(size);
+    status = pNtQuerySystemInformation(SystemModuleInformation, info, size, &size);
+    ok(!status, "got %#x\n", status);
 
-    SystemInformationLength = ReturnLength;
-    smi = HeapReAlloc(GetProcessHeap(), 0, smi , SystemInformationLength);
-    status = pNtQuerySystemInformation(SystemModuleInformation, smi, SystemInformationLength, &ReturnLength);
-    ok( status == STATUS_SUCCESS, "Expected STATUS_SUCCESS, got %08x\n", status);
+    ok(info->ModulesCount > 0, "Expected some modules to be loaded\n");
 
-    ModuleCount = smi->ModulesCount;
-    sm = &smi->Modules[0];
-    /* our implementation is a stub for now */
-    ok( ModuleCount > 0, "Expected some modules to be loaded\n");
-
-    /* Loop through all the modules/drivers, Wine doesn't get here (yet) */
-    for (i = 0; i < ModuleCount ; i++)
+    for (i = 0; i < info->ModulesCount; i++)
     {
-        ok( i == sm->LoadOrderIndex, "LoadOrderIndex (%d) should have matched %u\n", sm->LoadOrderIndex, i);
-        sm++;
+        const SYSTEM_MODULE *module = &info->Modules[i];
+
+        ok(module->LoadOrderIndex == i, "%u: got index %u\n", i, module->LoadOrderIndex);
+        ok(module->ImageBaseAddress || is_wow64, "%u: got NULL address for %s\n", i, module->Name);
+        ok(module->ImageSize, "%u: got 0 size\n", i);
+        ok(module->LoadCount, "%u: got 0 load count\n", i);
     }
 
-    HeapFree( GetProcessHeap(), 0, smi);
+    free(info);
+
+    status = pNtQuerySystemInformation(SystemModuleInformationEx, NULL, 0, &size);
+    if (status == STATUS_INVALID_INFO_CLASS)
+    {
+        win_skip("SystemModuleInformationEx is not supported.\n");
+        return;
+    }
+    ok(status == STATUS_INFO_LENGTH_MISMATCH, "got %#x\n", status);
+    ok(size > 0, "expected nonzero size\n");
+
+    buffer = malloc(size);
+    status = pNtQuerySystemInformation(SystemModuleInformationEx, buffer, size, &size);
+    ok(!status, "got %#x\n", status);
+
+    infoex = (const void *)buffer;
+    for (i = 0; infoex->NextOffset; i++)
+    {
+        const SYSTEM_MODULE *module = &infoex->BaseInfo;
+
+        ok(module->LoadOrderIndex == i, "%u: got index %u\n", i, module->LoadOrderIndex);
+        ok(module->ImageBaseAddress || is_wow64, "%u: got NULL address for %s\n", i, module->Name);
+        ok(module->ImageSize, "%u: got 0 size\n", i);
+        ok(module->LoadCount, "%u: got 0 load count\n", i);
+
+        infoex = (const void *)((const char *)infoex + infoex->NextOffset);
+    }
+    ok(((char *)infoex - buffer) + sizeof(infoex->NextOffset) == size,
+            "got size %u, null terminator %u\n", size, (char *)infoex - buffer);
+
+    free(buffer);
+
 }
 
 static void test_query_handle(void)
@@ -643,7 +670,8 @@ static void test_query_interrupt(void)
     sii = HeapAlloc(GetProcessHeap(), 0, NeededLength);
 
     status = pNtQuerySystemInformation(SystemInterruptInformation, sii, 0, &ReturnLength);
-    ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status);
+    ok(status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status);
+    ok(ReturnLength == NeededLength, "got %u\n", ReturnLength);
 
     /* Try it for all processors */
     status = pNtQuerySystemInformation(SystemInterruptInformation, sii, NeededLength, &ReturnLength);
@@ -2477,6 +2505,37 @@ static void test_NtGetCurrentProcessorNumber(void)
     ok(status == STATUS_SUCCESS, "got 0x%x (expected STATUS_SUCCESS)\n", status);
 }
 
+static void test_ThreadEnableAlignmentFaultFixup(void)
+{
+    NTSTATUS status;
+    ULONG dummy;
+
+    dummy = 0;
+    status = NtQueryInformationThread( GetCurrentThread(), ThreadEnableAlignmentFaultFixup, &dummy, sizeof(ULONG), NULL );
+    ok( status == STATUS_INVALID_INFO_CLASS || broken(STATUS_NOT_IMPLEMENTED), "Expected STATUS_INVALID_INFO_CLASS, got %08x\n", status );
+    status = NtQueryInformationThread( GetCurrentThread(), ThreadEnableAlignmentFaultFixup, &dummy, 1, NULL );
+    ok( status == STATUS_INVALID_INFO_CLASS || broken(STATUS_NOT_IMPLEMENTED), "Expected STATUS_INVALID_INFO_CLASS, got %08x\n", status );
+
+    dummy = 1;
+    status = pNtSetInformationThread( GetCurrentThread(), ThreadEnableAlignmentFaultFixup, &dummy, sizeof(ULONG) );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status );
+    status = pNtSetInformationThread( (HANDLE)0xdeadbeef, ThreadEnableAlignmentFaultFixup, NULL, 0 );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status );
+    status = pNtSetInformationThread( (HANDLE)0xdeadbeef, ThreadEnableAlignmentFaultFixup, NULL, 1 );
+    ok( status == STATUS_ACCESS_VIOLATION, "Expected STATUS_ACCESS_VIOLATION, got %08x\n", status );
+    status = pNtSetInformationThread( (HANDLE)0xdeadbeef, ThreadEnableAlignmentFaultFixup, &dummy, 1 );
+    todo_wine ok( status == STATUS_INVALID_HANDLE, "Expected STATUS_INVALID_HANDLE, got %08x\n", status );
+    status = pNtSetInformationThread( GetCurrentProcess(), ThreadEnableAlignmentFaultFixup, &dummy, 1 );
+    todo_wine ok( status == STATUS_OBJECT_TYPE_MISMATCH, "Expected STATUS_OBJECT_TYPE_MISMATCH, got %08x\n", status );
+    dummy = 1;
+    status = pNtSetInformationThread( GetCurrentThread(), ThreadEnableAlignmentFaultFixup, &dummy, 1 );
+    ok( status == STATUS_SUCCESS, "Expected STATUS_SUCCESS, got %08x\n", status );
+
+    dummy = 0;
+    status = pNtSetInformationThread( GetCurrentProcess(), ThreadEnableAlignmentFaultFixup, &dummy, 8 );
+    ok( status == STATUS_INFO_LENGTH_MISMATCH, "Expected STATUS_INFO_LENGTH_MISMATCH, got %08x\n", status );
+}
+
 static DWORD WINAPI start_address_thread(void *arg)
 {
     PRTL_THREAD_START_ROUTINE entry;
@@ -2746,4 +2805,6 @@ START_TEST(info)
     test_readvirtualmemory();
     test_queryvirtualmemory();
     test_NtGetCurrentProcessorNumber();
+
+    test_ThreadEnableAlignmentFaultFixup();
 }

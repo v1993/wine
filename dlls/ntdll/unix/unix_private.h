@@ -26,10 +26,6 @@
 #include "unixlib.h"
 #include "wine/list.h"
 
-#ifndef __GCC_HAVE_SYNC_COMPARE_AND_SWAP_8
-#define InterlockedCompareExchange64(dest,xchg,cmp) RtlInterlockedCompareExchange64(dest,xchg,cmp)
-#endif
-
 #ifdef __i386__
 static const enum cpu_type client_cpu = CPU_x86;
 #elif defined(__x86_64__)
@@ -107,7 +103,7 @@ extern NTSTATUS CDECL get_initial_environment( WCHAR **wargv[], WCHAR *env, SIZE
 extern NTSTATUS CDECL get_startup_info( startup_info_t *info, SIZE_T *total_size, SIZE_T *info_size ) DECLSPEC_HIDDEN;
 extern NTSTATUS CDECL get_dynamic_environment( WCHAR *env, SIZE_T *size ) DECLSPEC_HIDDEN;
 extern void CDECL get_initial_directory( UNICODE_STRING *dir ) DECLSPEC_HIDDEN;
-extern void CDECL get_initial_console( HANDLE *handle, HANDLE *std_in, HANDLE *std_out, HANDLE *std_err ) DECLSPEC_HIDDEN;
+extern void CDECL get_initial_console( RTL_USER_PROCESS_PARAMETERS *params ) DECLSPEC_HIDDEN;
 extern USHORT * CDECL get_unix_codepage_data(void) DECLSPEC_HIDDEN;
 extern void CDECL get_locales( WCHAR *sys, WCHAR *user ) DECLSPEC_HIDDEN;
 extern void CDECL virtual_release_address_space(void) DECLSPEC_HIDDEN;
@@ -132,6 +128,7 @@ extern char **main_envp DECLSPEC_HIDDEN;
 extern WCHAR **main_wargv DECLSPEC_HIDDEN;
 extern unsigned int server_cpus DECLSPEC_HIDDEN;
 extern BOOL is_wow64 DECLSPEC_HIDDEN;
+extern BOOL process_exiting DECLSPEC_HIDDEN;
 extern HANDLE keyed_event DECLSPEC_HIDDEN;
 extern timeout_t server_start_time DECLSPEC_HIDDEN;
 extern sigset_t server_block_set DECLSPEC_HIDDEN;
@@ -180,7 +177,6 @@ extern NTSTATUS alloc_object_attributes( const OBJECT_ATTRIBUTES *attr, struct o
 extern void *anon_mmap_fixed( void *start, size_t size, int prot, int flags ) DECLSPEC_HIDDEN;
 extern void *anon_mmap_alloc( size_t size, int prot ) DECLSPEC_HIDDEN;
 extern void virtual_init(void) DECLSPEC_HIDDEN;
-extern NTSTATUS virtual_map_ntdll( int fd, void **module ) DECLSPEC_HIDDEN;
 extern ULONG_PTR get_system_affinity_mask(void) DECLSPEC_HIDDEN;
 extern void virtual_get_system_info( SYSTEM_BASIC_INFORMATION *info ) DECLSPEC_HIDDEN;
 extern NTSTATUS virtual_create_builtin_view( void *module ) DECLSPEC_HIDDEN;
@@ -251,9 +247,19 @@ extern void WINAPI DECLSPEC_NORETURN call_user_exception_dispatcher( EXCEPTION_R
                                                                      NTSTATUS (WINAPI *dispatcher)(EXCEPTION_RECORD*,CONTEXT*) ) DECLSPEC_HIDDEN;
 extern void WINAPI DECLSPEC_NORETURN call_raise_user_exception_dispatcher( NTSTATUS (WINAPI *dispatcher)(void) ) DECLSPEC_HIDDEN;
 
+extern void *get_syscall_frame(void) DECLSPEC_HIDDEN;
+extern void set_syscall_frame(void *frame) DECLSPEC_HIDDEN;
+
 #define TICKSPERSEC 10000000
 #define SECS_1601_TO_1970  ((369 * 365 + 89) * (ULONGLONG)86400)
-#define TICKS_1601_TO_1970 (SECS_1601_TO_1970 * TICKSPERSEC)
+
+static inline ULONGLONG ticks_from_time_t( time_t time )
+{
+    if (sizeof(time_t) == sizeof(int))  /* time_t may be signed */
+        return ((ULONGLONG)(ULONG)time + SECS_1601_TO_1970) * TICKSPERSEC;
+    else
+        return ((ULONGLONG)time + SECS_1601_TO_1970) * TICKSPERSEC;
+}
 
 static inline const char *debugstr_us( const UNICODE_STRING *us )
 {
@@ -278,17 +284,28 @@ static inline void *get_signal_stack(void)
     return (char *)NtCurrentTeb() + teb_size - teb_offset;
 }
 
+static inline void mutex_lock( pthread_mutex_t *mutex )
+{
+    if (!process_exiting) pthread_mutex_lock( mutex );
+}
+
+static inline void mutex_unlock( pthread_mutex_t *mutex )
+{
+    if (!process_exiting) pthread_mutex_unlock( mutex );
+}
+
 #ifndef _WIN64
 static inline TEB64 *NtCurrentTeb64(void) { return (TEB64 *)NtCurrentTeb()->GdiBatchCount; }
 #endif
 
-#if defined(__i386__) || defined(__x86_64__)
 struct xcontext
 {
     CONTEXT c;
-    XSTATE *xstate; /* points to xstate in sigcontext */
+    CONTEXT_EX c_ex;
+    ULONG64 host_compaction_mask;
 };
 
+#if defined(__i386__) || defined(__x86_64__)
 static inline XSTATE *xstate_from_context( const CONTEXT *context )
 {
     CONTEXT_EX *xctx = (CONTEXT_EX *)(context + 1);
@@ -302,21 +319,62 @@ static inline XSTATE *xstate_from_context( const CONTEXT *context )
 static inline void context_init_xstate( CONTEXT *context, void *xstate_buffer )
 {
     CONTEXT_EX *xctx;
-    XSTATE *xs;
 
     xctx = (CONTEXT_EX *)(context + 1);
     xctx->Legacy.Length = sizeof(CONTEXT);
     xctx->Legacy.Offset = -(LONG)sizeof(CONTEXT);
 
     xctx->XState.Length = sizeof(XSTATE);
-    xctx->XState.Offset = xstate_buffer ? (((ULONG_PTR)xstate_buffer + 63) & ~63) - (ULONG_PTR)xctx
-            : (((ULONG_PTR)context + sizeof(CONTEXT) + sizeof(CONTEXT_EX) + 63) & ~63) - (ULONG_PTR)xctx;
+    xctx->XState.Offset = (BYTE *)xstate_buffer - (BYTE *)xctx;
+
     xctx->All.Length = sizeof(CONTEXT) + xctx->XState.Offset + xctx->XState.Length;
     xctx->All.Offset = -(LONG)sizeof(CONTEXT);
     context->ContextFlags |= 0x40;
+}
 
-    xs = xstate_from_context(context);
-    memset( xs, 0, offsetof(XSTATE, YmmContext) );
+static inline void xstate_to_server( context_t *to, const XSTATE *xs )
+{
+    if (!xs)
+        return;
+
+    to->flags |= SERVER_CTX_YMM_REGISTERS;
+    if (xs->Mask & 4)
+        memcpy(&to->ymm.ymm_high_regs.ymm_high, &xs->YmmContext, sizeof(xs->YmmContext));
+    else
+        memset(&to->ymm.ymm_high_regs.ymm_high, 0, sizeof(xs->YmmContext));
+}
+
+static inline void xstate_from_server_( XSTATE *xs, const context_t *from, BOOL compaction_enabled)
+{
+    if (!xs)
+        return;
+
+    xs->Mask = 0;
+    xs->CompactionMask = compaction_enabled ? 0x8000000000000004 : 0;
+
+    if (from->flags & SERVER_CTX_YMM_REGISTERS)
+    {
+        unsigned long *src = (unsigned long *)&from->ymm.ymm_high_regs.ymm_high;
+        unsigned int i;
+
+        for (i = 0; i < sizeof(xs->YmmContext) / sizeof(unsigned long); ++i)
+            if (src[i])
+            {
+                memcpy( &xs->YmmContext, &from->ymm.ymm_high_regs.ymm_high, sizeof(xs->YmmContext) );
+                xs->Mask = 4;
+                break;
+            }
+    }
+}
+#define xstate_from_server( xs, from ) xstate_from_server_( xs, from, user_shared_data->XState.CompactionEnabled )
+
+#else
+static inline XSTATE *xstate_from_context( const CONTEXT *context )
+{
+    return NULL;
+}
+static inline void context_init_xstate( CONTEXT *context, void *xstate_buffer )
+{
 }
 #endif
 

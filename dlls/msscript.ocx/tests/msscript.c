@@ -34,7 +34,6 @@ DEFINE_GUID(GUID_NULL,0,0,0,0,0,0,0,0,0,0,0);
 #define TESTSCRIPT_CLSID "{178fc164-f585-4e24-9c13-4bb7faf80746}"
 static const GUID CLSID_TestScript =
     {0x178fc164,0xf585,0x4e24,{0x9c,0x13,0x4b,0xb7,0xfa,0xf8,0x07,0x46}};
-static const WCHAR vbW[] = {'V','B','S','c','r','i','p','t',0};
 
 #ifdef _WIN64
 
@@ -673,6 +672,10 @@ static HRESULT WINAPI DispatchEx_GetDispID(IDispatchEx *iface, BSTR bstrName, DW
 static HRESULT WINAPI DispatchEx_InvokeEx(IDispatchEx *iface, DISPID id, LCID lcid, WORD wFlags,
         DISPPARAMS *pdp, VARIANT *pvarRes, EXCEPINFO *pei, IServiceProvider *pspCaller)
 {
+    IServiceProvider *sp;
+    IUnknown *unk;
+    HRESULT hr;
+
     CHECK_EXPECT(InvokeEx);
     ok(lcid == LOCALE_USER_DEFAULT, "unexpected lcid %u.\n", lcid);
     ok(wFlags == DISPATCH_METHOD, "unexpected wFlags %u.\n", wFlags);
@@ -690,6 +693,32 @@ static HRESULT WINAPI DispatchEx_InvokeEx(IDispatchEx *iface, DISPID id, LCID lc
             "unexpected second parameter V_VT = %d, V_I4 = %d.\n",
             V_VT(pdp->rgvarg), V_I4(pdp->rgvarg));
     }
+    ok(!!pspCaller, "unexpected NULL pspCaller.\n");
+
+    hr = IActiveScriptSite_QueryInterface(site, &IID_IServiceProvider, (void**)&sp);
+    ok(hr == S_OK, "Failed to retrieve IID_IServiceProvider from script site: 0x%08x.\n", hr);
+    ok(sp != pspCaller, "Same IServiceProvider objects.\n");
+    IServiceProvider_Release(sp);
+
+    hr = IServiceProvider_QueryInterface(pspCaller, &IID_IActiveScriptSite, (void**)&unk);
+    ok(hr == E_NOINTERFACE, "QueryInterface IActiveScriptSite returned: 0x%08x.\n", hr);
+
+    unk = (IUnknown*)0xdeadbeef;
+    hr = IServiceProvider_QueryService(pspCaller, &SID_GetCaller, NULL, (void**)&unk);
+    ok(hr == S_OK, "QueryService failed: 0x%08x.\n", hr);
+    ok(!unk, "unexpected object returned %p.\n", unk);
+    unk = (IUnknown*)0xdeadbeef;
+    hr = IServiceProvider_QueryService(pspCaller, &SID_GetCaller, &IID_IUnknown, (void**)&unk);
+    ok(hr == S_OK, "QueryService failed: 0x%08x.\n", hr);
+    ok(!unk, "unexpected object returned %p.\n", unk);
+    sp = (IServiceProvider*)0xdeadbeef;
+    hr = IServiceProvider_QueryService(pspCaller, &SID_GetCaller, &IID_IServiceProvider, (void**)&sp);
+    ok(hr == S_OK, "QueryService failed: 0x%08x.\n", hr);
+    ok(!sp, "unexpected object returned %p.\n", sp);
+    unk = (IUnknown*)0xdeadbeef;
+    hr = IServiceProvider_QueryService(pspCaller, &SID_VariantConversion, &IID_IVariantChangeType, (void**)&unk);
+    ok(hr == E_NOINTERFACE, "QueryService returned: 0x%08x.\n", hr);
+    ok(!unk, "unexpected object returned %p.\n", unk);
 
     V_VT(pvarRes) = VT_I2;
     V_I2(pvarRes) = 42;
@@ -1341,9 +1370,6 @@ static void test_olecontrol(void)
 
 static void test_Language(void)
 {
-    static const WCHAR jsW[] = {'J','S','c','r','i','p','t',0};
-    static const WCHAR vb2W[] = {'v','B','s','c','r','i','p','t',0};
-    static const WCHAR dummyW[] = {'d','u','m','m','y',0};
     IScriptControl *sc;
     HRESULT hr;
     BSTR str;
@@ -1360,39 +1386,39 @@ static void test_Language(void)
     ok(hr == S_OK, "got 0x%08x\n", hr);
     ok(str == NULL, "got %s\n", wine_dbgstr_w(str));
 
-    str = SysAllocString(vbW);
+    str = SysAllocString(L"VBScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
 
-    str = SysAllocString(vb2W);
+    str = SysAllocString(L"vBscript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
 
     hr = IScriptControl_get_Language(sc, &str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
-    ok(!lstrcmpW(str, vbW), "got %s\n", wine_dbgstr_w(str));
+    ok(!lstrcmpW(str, L"VBScript"), "got %s\n", wine_dbgstr_w(str));
     SysFreeString(str);
 
-    str = SysAllocString(dummyW);
+    str = SysAllocString(L"dummy");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == CTL_E_INVALIDPROPERTYVALUE, "got 0x%08x\n", hr);
     SysFreeString(str);
 
     hr = IScriptControl_get_Language(sc, &str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
-    ok(!lstrcmpW(str, vbW), "got %s\n", wine_dbgstr_w(str));
+    ok(!lstrcmpW(str, L"VBScript"), "got %s\n", wine_dbgstr_w(str));
     SysFreeString(str);
 
-    str = SysAllocString(jsW);
+    str = SysAllocString(L"JScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
 
     hr = IScriptControl_get_Language(sc, &str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
-    ok(!lstrcmpW(str, jsW), "got %s\n", wine_dbgstr_w(str));
+    ok(!lstrcmpW(str, L"JScript"), "got %s\n", wine_dbgstr_w(str));
     SysFreeString(str);
 
     hr = IScriptControl_put_Language(sc, NULL);
@@ -1406,8 +1432,6 @@ static void test_Language(void)
 
     /* custom script engine */
     if (have_custom_engine) {
-        static const WCHAR testscriptW[] = {'t','e','s','t','s','c','r','i','p','t',0};
-
         hr = CoCreateInstance(&CLSID_ScriptControl, NULL, CLSCTX_INPROC_SERVER|CLSCTX_INPROC_HANDLER,
                 &IID_IScriptControl, (void**)&sc);
         ok(hr == S_OK, "got 0x%08x\n", hr);
@@ -1418,7 +1442,7 @@ static void test_Language(void)
         SET_EXPECT(QI_IActiveScriptParse);
         SET_EXPECT(InitNew);
 
-        str = SysAllocString(testscriptW);
+        str = SysAllocString(L"testscript");
         hr = IScriptControl_put_Language(sc, str);
         ok(hr == S_OK, "got 0x%08x\n", hr);
         SysFreeString(str);
@@ -1432,7 +1456,7 @@ static void test_Language(void)
     todo_wine
         ok(hr == S_OK, "got 0x%08x\n", hr);
      if (hr == S_OK)
-        ok(!lstrcmpW(testscriptW, str), "%s\n", wine_dbgstr_w(str));
+        ok(!lstrcmpW(L"testscript", str), "%s\n", wine_dbgstr_w(str));
         SysFreeString(str);
 
         IActiveScriptSite_Release(site);
@@ -1657,7 +1681,7 @@ static void test_timeout(void)
     ok(hr == S_OK, "got 0x%08x\n", hr);
     ok(val == 0, "got %d\n", val);
 
-    str = SysAllocString(vbW);
+    str = SysAllocString(L"VBScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
@@ -1686,7 +1710,7 @@ static void test_Reset(void)
     hr = IScriptControl_Reset(sc);
     ok(hr == E_FAIL, "got 0x%08x\n", hr);
 
-    str = SysAllocString(vbW);
+    str = SysAllocString(L"VBScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
@@ -1696,15 +1720,13 @@ static void test_Reset(void)
 
     hr = IScriptControl_get_Language(sc, &str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
-    ok(!lstrcmpW(str, vbW), "got %s\n", wine_dbgstr_w(str));
+    ok(!lstrcmpW(str, L"VBScript"), "got %s\n", wine_dbgstr_w(str));
     SysFreeString(str);
 
     IScriptControl_Release(sc);
 
     /* custom script engine */
     if (have_custom_engine) {
-        static const WCHAR testscriptW[] = {'t','e','s','t','s','c','r','i','p','t',0};
-
         hr = CoCreateInstance(&CLSID_ScriptControl, NULL, CLSCTX_INPROC_SERVER|CLSCTX_INPROC_HANDLER,
                 &IID_IScriptControl, (void**)&sc);
         ok(hr == S_OK, "got 0x%08x\n", hr);
@@ -1715,7 +1737,7 @@ static void test_Reset(void)
         SET_EXPECT(QI_IActiveScriptParse);
         SET_EXPECT(InitNew);
 
-        str = SysAllocString(testscriptW);
+        str = SysAllocString(L"testscript");
         hr = IScriptControl_put_Language(sc, str);
         ok(hr == S_OK, "got 0x%08x\n", hr);
         SysFreeString(str);
@@ -1803,7 +1825,6 @@ static IDispatch testdisp = { &dispvtbl };
 
 static void test_AddObject(void)
 {
-    static const WCHAR oW[] = {'o',0};
     IScriptControl *sc;
     BSTR str, objname;
     HRESULT hr;
@@ -1812,14 +1833,14 @@ static void test_AddObject(void)
             &IID_IScriptControl, (void**)&sc);
     ok(hr == S_OK, "got 0x%08x\n", hr);
 
-    objname = SysAllocString(oW);
+    objname = SysAllocString(L"o");
     hr = IScriptControl_AddObject(sc, objname, NULL, VARIANT_FALSE);
     ok(hr == E_INVALIDARG, "got 0x%08x\n", hr);
 
     hr = IScriptControl_AddObject(sc, objname, &testdisp, VARIANT_FALSE);
     ok(hr == E_FAIL, "got 0x%08x\n", hr);
 
-    str = SysAllocString(vbW);
+    str = SysAllocString(L"VBScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
@@ -1837,8 +1858,6 @@ static void test_AddObject(void)
 
     /* custom script engine */
     if (have_custom_engine) {
-        static const WCHAR testscriptW[] = {'t','e','s','t','s','c','r','i','p','t',0};
-
         hr = CoCreateInstance(&CLSID_ScriptControl, NULL, CLSCTX_INPROC_SERVER|CLSCTX_INPROC_HANDLER,
                 &IID_IScriptControl, (void**)&sc);
         ok(hr == S_OK, "got 0x%08x\n", hr);
@@ -1849,7 +1868,7 @@ static void test_AddObject(void)
         SET_EXPECT(QI_IActiveScriptParse);
         SET_EXPECT(InitNew);
 
-        str = SysAllocString(testscriptW);
+        str = SysAllocString(L"testscript");
         hr = IScriptControl_put_Language(sc, str);
         ok(hr == S_OK, "got 0x%08x\n", hr);
         SysFreeString(str);
@@ -2092,7 +2111,7 @@ static void test_UseSafeSubset(void)
     ok(hr == S_OK, "got 0x%08x\n", hr);
     ok(use_safe_subset == VARIANT_TRUE, "got %d\n", use_safe_subset);
 
-    str = SysAllocString(vbW);
+    str = SysAllocString(L"VBScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);
@@ -2209,7 +2228,7 @@ static void test_State(void)
     hr = IScriptControl_put_State(sc, Connected);
     ok(hr == E_FAIL, "got 0x%08x\n", hr);
 
-    str = SysAllocString(vbW);
+    str = SysAllocString(L"VBScript");
     hr = IScriptControl_put_Language(sc, str);
     ok(hr == S_OK, "got 0x%08x\n", hr);
     SysFreeString(str);

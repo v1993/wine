@@ -28,6 +28,14 @@ WINE_DEFAULT_DEBUG_CHANNEL(amstream);
 
 static const WCHAR sink_id[] = L"I{A35FF56A-9FDA-11D0-8FDF-00C04FD9189D}";
 
+struct format
+{
+    DWORD flags;
+    DWORD width;
+    DWORD height;
+    DDPIXELFORMAT pf;
+};
+
 struct ddraw_stream
 {
     IAMMediaStream IAMMediaStream_iface;
@@ -43,14 +51,113 @@ struct ddraw_stream
     IDirectDraw *ddraw;
     CRITICAL_SECTION cs;
     IMediaStreamFilter *filter;
+    IFilterGraph *graph;
 
     IPin *peer;
     IMemAllocator *allocator;
     AM_MEDIA_TYPE mt;
+    struct format format;
+    FILTER_STATE state;
+    REFERENCE_TIME segment_start;
+    BOOL eos;
+    BOOL flushing;
+    CONDITION_VARIABLE update_queued_cv;
+    struct list update_queue;
+};
+
+struct ddraw_sample
+{
+    IDirectDrawStreamSample IDirectDrawStreamSample_iface;
+    LONG ref;
+    struct ddraw_stream *parent;
+    IMultiMediaStream *mmstream;
+    IDirectDrawSurface *surface;
+    RECT rect;
+    STREAM_TIME start_time;
+    STREAM_TIME end_time;
+    BOOL continuous_update;
+    CONDITION_VARIABLE update_cv;
+
+    struct list entry;
+    HRESULT update_hr;
+    BOOL busy;
 };
 
 static HRESULT ddrawstreamsample_create(struct ddraw_stream *parent, IDirectDrawSurface *surface,
     const RECT *rect, IDirectDrawStreamSample **ddraw_stream_sample);
+
+static void remove_queued_update(struct ddraw_sample *sample)
+{
+    sample->busy = FALSE;
+    list_remove(&sample->entry);
+    WakeConditionVariable(&sample->update_cv);
+}
+
+static void flush_update_queue(struct ddraw_stream *stream, HRESULT update_hr)
+{
+    struct list *entry;
+    while ((entry = list_head(&stream->update_queue)))
+    {
+        struct ddraw_sample *sample = LIST_ENTRY(entry, struct ddraw_sample, entry);
+        sample->update_hr = update_hr;
+        remove_queued_update(sample);
+    }
+}
+
+static HRESULT process_update(struct ddraw_sample *sample, int stride, BYTE *pointer,
+        STREAM_TIME start_time, STREAM_TIME end_time)
+{
+    DDSURFACEDESC desc;
+    DWORD row_size;
+    const BYTE *src_row;
+    BYTE *dst_row;
+    DWORD row;
+    HRESULT hr;
+
+    desc.dwSize = sizeof(desc);
+    hr = IDirectDrawSurface_Lock(sample->surface, &sample->rect, &desc, DDLOCK_WAIT, NULL);
+    if (FAILED(hr))
+        return hr;
+
+    row_size = (sample->rect.right - sample->rect.left) * desc.ddpfPixelFormat.u1.dwRGBBitCount / 8;
+    src_row = pointer;
+    dst_row = desc.lpSurface;
+    for (row = sample->rect.top; row < sample->rect.bottom; ++row)
+    {
+        memcpy(dst_row, src_row, row_size);
+        src_row += stride;
+        dst_row += desc.u1.lPitch;
+    }
+
+    hr = IDirectDrawSurface_Unlock(sample->surface, desc.lpSurface);
+    if (FAILED(hr))
+        return hr;
+
+    sample->start_time = start_time;
+    sample->end_time = end_time;
+
+    return S_OK;
+}
+
+static BOOL is_format_compatible(struct ddraw_stream *stream,
+        DWORD width, DWORD height, const DDPIXELFORMAT *connection_pf)
+{
+    if (stream->format.flags & DDSD_HEIGHT)
+    {
+        if (stream->format.width != width || stream->format.height != height)
+            return FALSE;
+    }
+    if (stream->format.flags & DDSD_PIXELFORMAT)
+    {
+        if (stream->format.pf.dwFlags & DDPF_FOURCC)
+            return FALSE;
+        if (stream->format.pf.u1.dwRGBBitCount != connection_pf->u1.dwRGBBitCount)
+            return FALSE;
+        if (stream->format.pf.u1.dwRGBBitCount == 16 && stream->format.pf.u3.dwGBitMask != connection_pf->u3.dwGBitMask)
+            return FALSE;
+    }
+    return TRUE;
+}
 
 static inline struct ddraw_stream *impl_from_IAMMediaStream(IAMMediaStream *iface)
 {
@@ -230,11 +337,22 @@ static HRESULT WINAPI ddraw_IAMMediaStream_Initialize(IAMMediaStream *iface, IUn
 
 static HRESULT WINAPI ddraw_IAMMediaStream_SetState(IAMMediaStream *iface, FILTER_STATE state)
 {
-    struct ddraw_stream *This = impl_from_IAMMediaStream(iface);
+    struct ddraw_stream *stream = impl_from_IAMMediaStream(iface);
 
-    FIXME("(%p/%p)->(%u) stub!\n", This, iface, state);
+    TRACE("stream %p, state %u.\n", stream, state);
 
-    return S_FALSE;
+    EnterCriticalSection(&stream->cs);
+
+    if (state == State_Stopped)
+        WakeConditionVariable(&stream->update_queued_cv);
+    if (stream->state == State_Stopped)
+        stream->eos = FALSE;
+
+    stream->state = state;
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_IAMMediaStream_JoinAMMultiMediaStream(IAMMediaStream *iface, IAMMultiMediaStream *mmstream)
@@ -264,6 +382,8 @@ static HRESULT WINAPI ddraw_IAMMediaStream_JoinFilterGraph(IAMMediaStream *iface
     struct ddraw_stream *stream = impl_from_IAMMediaStream(iface);
 
     TRACE("stream %p, filtergraph %p.\n", stream, filtergraph);
+
+    stream->graph = filtergraph;
 
     return S_OK;
 }
@@ -363,19 +483,163 @@ static HRESULT WINAPI ddraw_IDirectDrawMediaStream_GetFormat(IDirectDrawMediaStr
         DDSURFACEDESC *current_format, IDirectDrawPalette **palette,
         DDSURFACEDESC *desired_format, DWORD *flags)
 {
-    FIXME("(%p)->(%p,%p,%p,%p) stub!\n", iface, current_format, palette, desired_format,
-            flags);
+    struct ddraw_stream *stream = impl_from_IDirectDrawMediaStream(iface);
 
-    return MS_E_NOSTREAM;
+    TRACE("stream %p, current_format %p, palette %p, desired_format %p, flags %p.\n", stream, current_format, palette,
+            desired_format, flags);
 
+    EnterCriticalSection(&stream->cs);
+
+    if (!stream->peer)
+    {
+        LeaveCriticalSection(&stream->cs);
+        return MS_E_NOSTREAM;
+    }
+
+    if (current_format)
+    {
+        current_format->dwFlags = stream->format.flags | DDSD_WIDTH | DDSD_HEIGHT | DDSD_CAPS;
+        current_format->dwWidth = stream->format.width;
+        current_format->dwHeight = stream->format.height;
+        current_format->ddpfPixelFormat = stream->format.pf;
+        current_format->ddsCaps.dwCaps = DDSCAPS_SYSTEMMEMORY | DDSCAPS_OFFSCREENPLAIN;
+    }
+
+    if (palette)
+        *palette = NULL;
+
+    if (desired_format)
+    {
+        desired_format->dwFlags = DDSD_WIDTH | DDSD_HEIGHT;
+        desired_format->dwWidth = stream->format.width;
+        desired_format->dwHeight = stream->format.height;
+        desired_format->ddpfPixelFormat = stream->format.pf;
+        desired_format->ddsCaps.dwCaps = DDSCAPS_SYSTEMMEMORY | DDSCAPS_OFFSCREENPLAIN;
+    }
+
+    if (flags)
+        *flags = 0;
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_IDirectDrawMediaStream_SetFormat(IDirectDrawMediaStream *iface,
-        const DDSURFACEDESC *pDDSurfaceDesc, IDirectDrawPalette *pDirectDrawPalette)
+        const DDSURFACEDESC *format, IDirectDrawPalette *palette)
 {
-    FIXME("(%p)->(%p,%p) stub!\n", iface, pDDSurfaceDesc, pDirectDrawPalette);
+    struct ddraw_stream *stream = impl_from_IDirectDrawMediaStream(iface);
+    AM_MEDIA_TYPE old_media_type;
+    struct format old_format;
+    IPin *old_peer;
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("stream %p, format %p, palette %p.\n", stream, format, palette);
+
+    if (palette)
+        FIXME("Setting palette is not yet supported.\n");
+
+    if (!format)
+        return E_POINTER;
+
+    if (format->dwSize != sizeof(DDSURFACEDESC))
+        return E_INVALIDARG;
+
+    if (format->dwFlags & DDSD_PIXELFORMAT)
+    {
+        if (format->ddpfPixelFormat.dwSize != sizeof(DDPIXELFORMAT))
+            return DDERR_INVALIDSURFACETYPE;
+
+        if (format->ddpfPixelFormat.dwFlags & DDPF_FOURCC)
+        {
+            if (!format->ddpfPixelFormat.u1.dwRGBBitCount)
+                return E_INVALIDARG;
+        }
+        else
+        {
+            if (format->ddpfPixelFormat.dwFlags & (DDPF_YUV | DDPF_PALETTEINDEXED1 |
+                    DDPF_PALETTEINDEXED2 | DDPF_PALETTEINDEXED4 | DDPF_PALETTEINDEXEDTO8))
+                return DDERR_INVALIDSURFACETYPE;
+
+            if (!(format->ddpfPixelFormat.dwFlags & DDPF_RGB))
+                return DDERR_INVALIDSURFACETYPE;
+
+            switch (format->ddpfPixelFormat.u1.dwRGBBitCount)
+            {
+            case 8:
+                if (!(format->ddpfPixelFormat.dwFlags & DDPF_PALETTEINDEXED8))
+                    return DDERR_INVALIDSURFACETYPE;
+                break;
+            case 16:
+                if (format->ddpfPixelFormat.dwFlags & DDPF_PALETTEINDEXED8)
+                    return DDERR_INVALIDSURFACETYPE;
+                if ((format->ddpfPixelFormat.u2.dwRBitMask != 0x7c00 ||
+                    format->ddpfPixelFormat.u3.dwGBitMask != 0x03e0 ||
+                    format->ddpfPixelFormat.u4.dwBBitMask != 0x001f) &&
+                    (format->ddpfPixelFormat.u2.dwRBitMask != 0xf800 ||
+                    format->ddpfPixelFormat.u3.dwGBitMask != 0x07e0 ||
+                    format->ddpfPixelFormat.u4.dwBBitMask != 0x001f))
+                    return DDERR_INVALIDSURFACETYPE;
+                break;
+            case 24:
+            case 32:
+                if (format->ddpfPixelFormat.dwFlags & DDPF_PALETTEINDEXED8)
+                    return DDERR_INVALIDSURFACETYPE;
+                if (format->ddpfPixelFormat.u2.dwRBitMask != 0xff0000 ||
+                    format->ddpfPixelFormat.u3.dwGBitMask != 0x00ff00 ||
+                    format->ddpfPixelFormat.u4.dwBBitMask != 0x0000ff)
+                    return DDERR_INVALIDSURFACETYPE;
+                break;
+            default:
+                return DDERR_INVALIDSURFACETYPE;
+            }
+        }
+    }
+
+    EnterCriticalSection(&stream->cs);
+
+    old_format = stream->format;
+    stream->format.flags = format->dwFlags & (DDSD_WIDTH | DDSD_HEIGHT | DDSD_PIXELFORMAT);
+    if (format->dwFlags & (DDSD_WIDTH | DDSD_HEIGHT))
+    {
+        stream->format.width = format->dwWidth;
+        stream->format.height = format->dwHeight;
+    }
+    if (format->dwFlags & DDSD_PIXELFORMAT)
+        stream->format.pf = format->ddpfPixelFormat;
+
+    if (stream->peer && !is_format_compatible(stream, old_format.width, old_format.height, &old_format.pf))
+    {
+        hr = CopyMediaType(&old_media_type, &stream->mt);
+        if (FAILED(hr))
+        {
+            stream->format = old_format;
+            LeaveCriticalSection(&stream->cs);
+            return hr;
+        }
+        old_peer = stream->peer;
+        IPin_AddRef(old_peer);
+
+        IFilterGraph_Disconnect(stream->graph, stream->peer);
+        IFilterGraph_Disconnect(stream->graph, &stream->IPin_iface);
+        hr = IFilterGraph_ConnectDirect(stream->graph, old_peer, &stream->IPin_iface, NULL);
+        if (FAILED(hr))
+        {
+            stream->format = old_format;
+            IFilterGraph_ConnectDirect(stream->graph, old_peer, &stream->IPin_iface, &old_media_type);
+            IPin_Release(old_peer);
+            FreeMediaType(&old_media_type);
+            LeaveCriticalSection(&stream->cs);
+            return DDERR_INVALIDSURFACETYPE;
+        }
+
+        IPin_Release(old_peer);
+        FreeMediaType(&old_media_type);
+    }
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_IDirectDrawMediaStream_GetDirectDraw(IDirectDrawMediaStream *iface,
@@ -453,11 +717,28 @@ static HRESULT WINAPI ddraw_IDirectDrawMediaStream_CreateSample(IDirectDrawMedia
 }
 
 static HRESULT WINAPI ddraw_IDirectDrawMediaStream_GetTimePerFrame(IDirectDrawMediaStream *iface,
-        STREAM_TIME *pFrameTime)
+        STREAM_TIME *frame_time)
 {
-    FIXME("(%p)->(%p) stub!\n", iface, pFrameTime);
+    struct ddraw_stream *stream = impl_from_IDirectDrawMediaStream(iface);
 
-    return E_NOTIMPL;
+    TRACE("stream %p, frame_time %p.\n", stream, frame_time);
+
+    if (!frame_time)
+        return E_POINTER;
+
+    EnterCriticalSection(&stream->cs);
+
+    if (!stream->peer)
+    {
+        LeaveCriticalSection(&stream->cs);
+        return MS_E_NOSTREAM;
+    }
+
+    *frame_time = ((VIDEOINFO *)stream->mt.pbFormat)->AvgTimePerFrame;
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static const struct IDirectDrawMediaStreamVtbl ddraw_IDirectDrawMediaStream_Vtbl =
@@ -638,7 +919,11 @@ static HRESULT WINAPI ddraw_sink_Connect(IPin *iface, IPin *peer, const AM_MEDIA
 static HRESULT WINAPI ddraw_sink_ReceiveConnection(IPin *iface, IPin *peer, const AM_MEDIA_TYPE *mt)
 {
     struct ddraw_stream *stream = impl_from_IPin(iface);
+    const VIDEOINFOHEADER *video_info;
     PIN_DIRECTION dir;
+    DWORD width;
+    DWORD height;
+    DDPIXELFORMAT pf = {sizeof(DDPIXELFORMAT)};
 
     TRACE("stream %p, peer %p, mt %p.\n", stream, peer, mt);
 
@@ -651,12 +936,57 @@ static HRESULT WINAPI ddraw_sink_ReceiveConnection(IPin *iface, IPin *peer, cons
     }
 
     if (!IsEqualGUID(&mt->majortype, &MEDIATYPE_Video)
-            || (!IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB8)
-                && !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB24)
-                && !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB32)
-                && !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB555)
-                && !IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB565))
             || !IsEqualGUID(&mt->formattype, &FORMAT_VideoInfo))
+    {
+        LeaveCriticalSection(&stream->cs);
+        return VFW_E_TYPE_NOT_ACCEPTED;
+    }
+
+    video_info = (const VIDEOINFOHEADER *)mt->pbFormat;
+
+    width = video_info->bmiHeader.biWidth;
+    height = abs(video_info->bmiHeader.biHeight);
+    pf.dwFlags = DDPF_RGB;
+    if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB8))
+    {
+        pf.dwFlags |= DDPF_PALETTEINDEXED8;
+        pf.u1.dwRGBBitCount = 8;
+    }
+    else if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB555))
+    {
+        pf.u1.dwRGBBitCount = 16;
+        pf.u2.dwRBitMask = 0x7c00;
+        pf.u3.dwGBitMask = 0x03e0;
+        pf.u4.dwBBitMask = 0x001f;
+    }
+    else if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB565))
+    {
+        pf.u1.dwRGBBitCount = 16;
+        pf.u2.dwRBitMask = 0xf800;
+        pf.u3.dwGBitMask = 0x07e0;
+        pf.u4.dwBBitMask = 0x001f;
+    }
+    else if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB24))
+    {
+        pf.u1.dwRGBBitCount = 24;
+        pf.u2.dwRBitMask = 0xff0000;
+        pf.u3.dwGBitMask = 0x00ff00;
+        pf.u4.dwBBitMask = 0x0000ff;
+    }
+    else if (IsEqualGUID(&mt->subtype, &MEDIASUBTYPE_RGB32))
+    {
+        pf.u1.dwRGBBitCount = 32;
+        pf.u2.dwRBitMask = 0xff0000;
+        pf.u3.dwGBitMask = 0x00ff00;
+        pf.u4.dwBBitMask = 0x0000ff;
+    }
+    else
+    {
+        LeaveCriticalSection(&stream->cs);
+        return VFW_E_TYPE_NOT_ACCEPTED;
+    }
+
+    if (!is_format_compatible(stream, width, height, &pf))
     {
         LeaveCriticalSection(&stream->cs);
         return VFW_E_TYPE_NOT_ACCEPTED;
@@ -672,6 +1002,11 @@ static HRESULT WINAPI ddraw_sink_ReceiveConnection(IPin *iface, IPin *peer, cons
 
     CopyMediaType(&stream->mt, mt);
     IPin_AddRef(stream->peer = peer);
+
+    stream->format.width = width;
+    stream->format.height = height;
+    if (!(stream->format.flags & DDSD_PIXELFORMAT))
+        stream->format.pf = pf;
 
     LeaveCriticalSection(&stream->cs);
 
@@ -824,27 +1159,73 @@ static HRESULT WINAPI ddraw_sink_QueryInternalConnections(IPin *iface, IPin **pi
 
 static HRESULT WINAPI ddraw_sink_EndOfStream(IPin *iface)
 {
-    FIXME("iface %p, stub!\n", iface);
-    return E_NOTIMPL;
+    struct ddraw_stream *stream = impl_from_IPin(iface);
+
+    TRACE("stream %p.\n", stream);
+
+    EnterCriticalSection(&stream->cs);
+
+    if (stream->eos || stream->flushing)
+    {
+        LeaveCriticalSection(&stream->cs);
+        return E_FAIL;
+    }
+
+    stream->eos = TRUE;
+
+    flush_update_queue(stream, MS_S_ENDOFSTREAM);
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_sink_BeginFlush(IPin *iface)
 {
-    FIXME("iface %p, stub!\n", iface);
-    return E_NOTIMPL;
+    struct ddraw_stream *stream = impl_from_IPin(iface);
+
+    TRACE("stream %p.\n", stream);
+
+    EnterCriticalSection(&stream->cs);
+
+    stream->flushing = TRUE;
+    stream->eos = FALSE;
+    WakeConditionVariable(&stream->update_queued_cv);
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_sink_EndFlush(IPin *iface)
 {
-    FIXME("iface %p, stub!\n", iface);
-    return E_NOTIMPL;
+    struct ddraw_stream *stream = impl_from_IPin(iface);
+
+    TRACE("stream %p.\n", stream);
+
+    EnterCriticalSection(&stream->cs);
+
+    stream->flushing = FALSE;
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_sink_NewSegment(IPin *iface, REFERENCE_TIME start, REFERENCE_TIME stop, double rate)
 {
-    FIXME("iface %p, start %s, stop %s, rate %0.16e, stub!\n",
-            iface, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop), rate);
-    return E_NOTIMPL;
+    struct ddraw_stream *stream = impl_from_IPin(iface);
+
+    TRACE("stream %p, start %s, stop %s, rate %0.16e\n",
+            stream, wine_dbgstr_longlong(start), wine_dbgstr_longlong(stop), rate);
+
+    EnterCriticalSection(&stream->cs);
+
+    stream->segment_start = start;
+
+    LeaveCriticalSection(&stream->cs);
+
+    return S_OK;
 }
 
 static const IPinVtbl ddraw_sink_vtbl =
@@ -934,8 +1315,95 @@ static HRESULT WINAPI ddraw_meminput_GetAllocatorRequirements(IMemInputPin *ifac
 
 static HRESULT WINAPI ddraw_meminput_Receive(IMemInputPin *iface, IMediaSample *sample)
 {
-    FIXME("iface %p, sample %p, stub!\n", iface, sample);
-    return E_NOTIMPL;
+    struct ddraw_stream *stream = impl_from_IMemInputPin(iface);
+    BITMAPINFOHEADER *bitmap_info;
+    REFERENCE_TIME start_time = 0;
+    REFERENCE_TIME end_time = 0;
+    STREAM_TIME start_stream_time;
+    STREAM_TIME end_stream_time;
+    IMediaStreamFilter *filter;
+    STREAM_TIME current_time;
+    BYTE *top_down_pointer;
+    int top_down_stride;
+    BYTE *pointer;
+    BOOL top_down;
+    int stride;
+    HRESULT hr;
+
+    TRACE("stream %p, sample %p.\n", stream, sample);
+
+    hr = IMediaSample_GetPointer(sample, &pointer);
+    if (FAILED(hr))
+        return hr;
+
+    IMediaSample_GetTime(sample, &start_time, &end_time);
+
+    EnterCriticalSection(&stream->cs);
+
+    if (stream->state == State_Stopped)
+    {
+        LeaveCriticalSection(&stream->cs);
+        return S_OK;
+    }
+    if (stream->flushing)
+    {
+        LeaveCriticalSection(&stream->cs);
+        return S_FALSE;
+    }
+
+    bitmap_info = &((VIDEOINFOHEADER *)stream->mt.pbFormat)->bmiHeader;
+
+    stride = ((bitmap_info->biWidth * bitmap_info->biBitCount + 31) & ~31) / 8;
+    top_down = (bitmap_info->biHeight < 0);
+
+    top_down_stride = top_down ? stride : -stride;
+    top_down_pointer = top_down ? pointer : pointer + stride * (bitmap_info->biHeight - 1);
+
+    start_stream_time = start_time + stream->segment_start;
+    end_stream_time = end_time + stream->segment_start;
+
+    filter = stream->filter;
+
+    LeaveCriticalSection(&stream->cs);
+    if (S_OK == IMediaStreamFilter_GetCurrentStreamTime(filter, &current_time)
+            && start_time >= current_time + 10000)
+        IMediaStreamFilter_WaitUntil(filter, start_time);
+    EnterCriticalSection(&stream->cs);
+
+    for (;;)
+    {
+        if (stream->state == State_Stopped)
+        {
+            LeaveCriticalSection(&stream->cs);
+            return S_OK;
+        }
+        if (stream->flushing)
+        {
+            LeaveCriticalSection(&stream->cs);
+            return S_FALSE;
+        }
+        if (!list_empty(&stream->update_queue))
+        {
+            struct ddraw_sample *sample = LIST_ENTRY(list_head(&stream->update_queue), struct ddraw_sample, entry);
+
+            sample->update_hr = process_update(sample, top_down_stride, top_down_pointer,
+                    start_stream_time, end_stream_time);
+
+            if (sample->continuous_update && SUCCEEDED(sample->update_hr))
+            {
+                list_remove(&sample->entry);
+                list_add_tail(&sample->parent->update_queue, &sample->entry);
+            }
+            else
+            {
+                remove_queued_update(sample);
+            }
+            LeaveCriticalSection(&stream->cs);
+            return S_OK;
+        }
+
+        SleepConditionVariableCS(&stream->update_queued_cv, &stream->cs, INFINITE);
+    }
 }
 
 static HRESULT WINAPI ddraw_meminput_ReceiveMultiple(IMemInputPin *iface,
@@ -981,7 +1449,12 @@ HRESULT ddraw_stream_create(IUnknown *outer, void **out)
     object->IPin_iface.lpVtbl = &ddraw_sink_vtbl;
     object->ref = 1;
 
+    object->format.width = 100;
+    object->format.height = 100;
+
     InitializeCriticalSection(&object->cs);
+    InitializeConditionVariable(&object->update_queued_cv);
+    list_init(&object->update_queue);
 
     TRACE("Created ddraw stream %p.\n", object);
 
@@ -989,15 +1462,6 @@ HRESULT ddraw_stream_create(IUnknown *outer, void **out)
 
     return S_OK;
 }
-
-struct ddraw_sample
-{
-    IDirectDrawStreamSample IDirectDrawStreamSample_iface;
-    LONG ref;
-    struct ddraw_stream *parent;
-    IDirectDrawSurface *surface;
-    RECT rect;
-};
 
 static inline struct ddraw_sample *impl_from_IDirectDrawStreamSample(IDirectDrawStreamSample *iface)
 {
@@ -1048,6 +1512,8 @@ static ULONG WINAPI ddraw_sample_Release(IDirectDrawStreamSample *iface)
         --sample->parent->sample_refs;
         LeaveCriticalSection(&sample->parent->cs);
 
+        if (sample->mmstream)
+            IMultiMediaStream_Release(sample->mmstream);
         IAMMediaStream_Release(&sample->parent->IAMMediaStream_iface);
 
         if (sample->surface)
@@ -1077,9 +1543,19 @@ static HRESULT WINAPI ddraw_sample_GetMediaStream(IDirectDrawStreamSample *iface
 static HRESULT WINAPI ddraw_sample_GetSampleTimes(IDirectDrawStreamSample *iface, STREAM_TIME *start_time,
                                                                  STREAM_TIME *end_time, STREAM_TIME *current_time)
 {
-    FIXME("(%p)->(%p,%p,%p): stub\n", iface, start_time, end_time, current_time);
+    struct ddraw_sample *sample = impl_from_IDirectDrawStreamSample(iface);
 
-    return E_NOTIMPL;
+    TRACE("sample %p, start_time %p, end_time %p, current_time %p.\n", sample, start_time, end_time, current_time);
+
+    if (current_time)
+        IMediaStreamFilter_GetCurrentStreamTime(sample->parent->filter, current_time);
+
+    if (start_time)
+        *start_time = sample->start_time;
+    if (end_time)
+        *end_time = sample->end_time;
+
+    return S_OK;
 }
 
 static HRESULT WINAPI ddraw_sample_SetSampleTimes(IDirectDrawStreamSample *iface, const STREAM_TIME *start_time,
@@ -1090,19 +1566,104 @@ static HRESULT WINAPI ddraw_sample_SetSampleTimes(IDirectDrawStreamSample *iface
     return E_NOTIMPL;
 }
 
-static HRESULT WINAPI ddraw_sample_Update(IDirectDrawStreamSample *iface, DWORD flags, HANDLE event,
-                                                         PAPCFUNC func_APC, DWORD APC_data)
+static HRESULT WINAPI ddraw_sample_Update(IDirectDrawStreamSample *iface,
+        DWORD flags, HANDLE event, PAPCFUNC apc_func, DWORD apc_data)
 {
-    FIXME("(%p)->(%x,%p,%p,%u): stub\n", iface, flags, event, func_APC, APC_data);
+    struct ddraw_sample *sample = impl_from_IDirectDrawStreamSample(iface);
 
-    return S_OK;
+    TRACE("sample %p, flags %#x, event %p, apc_func %p, apc_data %#x.\n",
+            sample, flags, event, apc_func, apc_data);
+
+    if (event && apc_func)
+        return E_INVALIDARG;
+
+    if (apc_func)
+    {
+        FIXME("APC support is not implemented!\n");
+        return E_NOTIMPL;
+    }
+
+    if (event)
+    {
+        FIXME("Event parameter support is not implemented!\n");
+        return E_NOTIMPL;
+    }
+
+    EnterCriticalSection(&sample->parent->cs);
+
+    if (sample->parent->state != State_Running)
+    {
+        LeaveCriticalSection(&sample->parent->cs);
+        return MS_E_NOTRUNNING;
+    }
+    if (!sample->parent->peer || sample->parent->eos)
+    {
+        sample->update_hr = MS_S_ENDOFSTREAM;
+        LeaveCriticalSection(&sample->parent->cs);
+        return MS_S_ENDOFSTREAM;
+    }
+    if (sample->busy)
+    {
+        LeaveCriticalSection(&sample->parent->cs);
+        return MS_E_BUSY;
+    }
+
+    sample->continuous_update = (flags & SSUPDATE_ASYNC) && (flags & SSUPDATE_CONTINUOUS);
+
+    sample->update_hr = MS_S_NOUPDATE;
+    sample->busy = TRUE;
+    list_add_tail(&sample->parent->update_queue, &sample->entry);
+    WakeConditionVariable(&sample->parent->update_queued_cv);
+
+    if (flags & SSUPDATE_ASYNC)
+    {
+        LeaveCriticalSection(&sample->parent->cs);
+        return MS_S_PENDING;
+    }
+
+    while (sample->busy)
+        SleepConditionVariableCS(&sample->update_cv, &sample->parent->cs, INFINITE);
+
+    LeaveCriticalSection(&sample->parent->cs);
+
+    return sample->update_hr;
 }
 
 static HRESULT WINAPI ddraw_sample_CompletionStatus(IDirectDrawStreamSample *iface, DWORD flags, DWORD milliseconds)
 {
-    FIXME("(%p)->(%x,%u): stub\n", iface, flags, milliseconds);
+    struct ddraw_sample *sample = impl_from_IDirectDrawStreamSample(iface);
+    HRESULT hr;
 
-    return E_NOTIMPL;
+    TRACE("sample %p, flags %#x, milliseconds %u.\n", sample, flags, milliseconds);
+
+    EnterCriticalSection(&sample->parent->cs);
+
+    if (sample->busy)
+    {
+        if (flags & (COMPSTAT_NOUPDATEOK | COMPSTAT_ABORT))
+        {
+            remove_queued_update(sample);
+        }
+        else if (flags & COMPSTAT_WAIT)
+        {
+            DWORD start_time = GetTickCount();
+            DWORD elapsed = 0;
+            sample->continuous_update = FALSE;
+            while (sample->busy && elapsed < milliseconds)
+            {
+                DWORD sleep_time = milliseconds - elapsed;
+                if (!SleepConditionVariableCS(&sample->update_cv, &sample->parent->cs, sleep_time))
+                    break;
+                elapsed = GetTickCount() - start_time;
+            }
+        }
+    }
+
+    hr = sample->busy ? MS_S_PENDING : sample->update_hr;
+
+    LeaveCriticalSection(&sample->parent->cs);
+
+    return hr;
 }
 
 /*** IDirectDrawStreamSample methods ***/
@@ -1154,6 +1715,7 @@ static HRESULT ddrawstreamsample_create(struct ddraw_stream *parent, IDirectDraw
     const RECT *rect, IDirectDrawStreamSample **ddraw_stream_sample)
 {
     struct ddraw_sample *object;
+    DDSURFACEDESC desc;
     HRESULT hr;
 
     TRACE("(%p)\n", ddraw_stream_sample);
@@ -1165,7 +1727,11 @@ static HRESULT ddrawstreamsample_create(struct ddraw_stream *parent, IDirectDraw
     object->IDirectDrawStreamSample_iface.lpVtbl = &DirectDrawStreamSample_Vtbl;
     object->ref = 1;
     object->parent = parent;
+    object->mmstream = parent->parent;
+    InitializeConditionVariable(&object->update_cv);
     IAMMediaStream_AddRef(&parent->IAMMediaStream_iface);
+    if (object->mmstream)
+        IMultiMediaStream_AddRef(object->mmstream);
     ++parent->sample_refs;
 
     if (surface)
@@ -1175,7 +1741,6 @@ static HRESULT ddrawstreamsample_create(struct ddraw_stream *parent, IDirectDraw
     }
     else
     {
-        DDSURFACEDESC desc;
         IDirectDraw *ddraw;
 
         hr = IDirectDrawMediaStream_GetDirectDraw(&parent->IDirectDrawMediaStream_iface, &ddraw);
@@ -1187,15 +1752,22 @@ static HRESULT ddrawstreamsample_create(struct ddraw_stream *parent, IDirectDraw
 
         desc.dwSize = sizeof(desc);
         desc.dwFlags = DDSD_CAPS|DDSD_HEIGHT|DDSD_WIDTH|DDSD_PIXELFORMAT;
-        desc.dwHeight = 100;
-        desc.dwWidth = 100;
-        desc.ddpfPixelFormat.dwSize = sizeof(desc.ddpfPixelFormat);
-        desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
-        desc.ddpfPixelFormat.u1.dwRGBBitCount = 32;
-        desc.ddpfPixelFormat.u2.dwRBitMask = 0xff0000;
-        desc.ddpfPixelFormat.u3.dwGBitMask = 0x00ff00;
-        desc.ddpfPixelFormat.u4.dwBBitMask = 0x0000ff;
-        desc.ddpfPixelFormat.u5.dwRGBAlphaBitMask = 0;
+        desc.dwHeight = parent->format.height;
+        desc.dwWidth = parent->format.width;
+        if (parent->format.flags & DDSD_PIXELFORMAT)
+        {
+            desc.ddpfPixelFormat = parent->format.pf;
+        }
+        else
+        {
+            desc.ddpfPixelFormat.dwSize = sizeof(desc.ddpfPixelFormat);
+            desc.ddpfPixelFormat.dwFlags = DDPF_RGB;
+            desc.ddpfPixelFormat.u1.dwRGBBitCount = 32;
+            desc.ddpfPixelFormat.u2.dwRBitMask = 0xff0000;
+            desc.ddpfPixelFormat.u3.dwGBitMask = 0x00ff00;
+            desc.ddpfPixelFormat.u4.dwBBitMask = 0x0000ff;
+            desc.ddpfPixelFormat.u5.dwRGBAlphaBitMask = 0;
+        }
         desc.ddsCaps.dwCaps = DDSCAPS_SYSTEMMEMORY|DDSCAPS_OFFSCREENPLAIN;
         desc.lpSurface = NULL;
 
@@ -1209,14 +1781,30 @@ static HRESULT ddrawstreamsample_create(struct ddraw_stream *parent, IDirectDraw
         }
     }
 
-    if (rect)
-        object->rect = *rect;
-    else if (object->surface)
+    desc.dwSize = sizeof(desc);
+    hr = IDirectDrawSurface_GetSurfaceDesc(object->surface, &desc);
+    if (FAILED(hr))
     {
-        DDSURFACEDESC desc = { sizeof(desc) };
-        hr = IDirectDrawSurface_GetSurfaceDesc(object->surface, &desc);
-        if (hr == S_OK)
-            SetRect(&object->rect, 0, 0, desc.dwWidth, desc.dwHeight);
+        IDirectDrawStreamSample_Release(&object->IDirectDrawStreamSample_iface);
+        return hr;
+    }
+
+    if (rect)
+    {
+        object->rect = *rect;
+        desc.dwWidth = rect->right - rect->left;
+        desc.dwHeight = rect->bottom - rect->top;
+    }
+    else
+    {
+        SetRect(&object->rect, 0, 0, desc.dwWidth, desc.dwHeight);
+    }
+
+    hr = IDirectDrawMediaStream_SetFormat(&parent->IDirectDrawMediaStream_iface, &desc, NULL);
+    if (FAILED(hr))
+    {
+        IDirectDrawStreamSample_Release(&object->IDirectDrawStreamSample_iface);
+        return hr;
     }
 
     *ddraw_stream_sample = &object->IDirectDrawStreamSample_iface;

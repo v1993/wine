@@ -41,29 +41,28 @@
 
 DEFINE_OLEGUID( CLSID_DfMarshal, 0x0000030b, 0, 0 );
 
-struct apartment;
-
 /* this is what is stored in TEB->ReservedForOle */
 struct oletls
 {
     struct apartment *apt;
-    IErrorInfo       *errorinfo;   /* see errorinfo.c */
-    DWORD             thread_seqid;/* returned with CoGetCurrentProcess */
-    DWORD             apt_mask;    /* apartment mask (+0Ch on x86) */
-    void            *unknown0;
-    DWORD            inits;        /* number of times CoInitializeEx called */
-    DWORD            ole_inits;    /* number of times OleInitialize called */
-    GUID             causality_id; /* unique identifier for each COM call */
-    LONG             pending_call_count_client; /* number of client calls pending */
-    LONG             pending_call_count_server; /* number of server calls pending */
-    DWORD            unknown;
-    IObjContext     *context_token; /* (+38h on x86) */
-    IUnknown        *call_state;    /* current call context (+3Ch on x86) */
-    DWORD            unknown2[46];
-    IUnknown        *cancel_object; /* cancel object set by CoSetCancelObject (+F8h on x86) */
-    IUnknown        *state;       /* see CoSetState */
-    struct list      spies;         /* Spies installed with CoRegisterInitializeSpy */
-    DWORD            spies_lock;
+    IErrorInfo       *errorinfo;     /* see errorinfo.c */
+    DWORD             thread_seqid;  /* returned with CoGetCurrentProcess */
+    DWORD             flags;         /* tlsdata_flags (+0Ch on x86) */
+    void             *unknown0;
+    DWORD             inits;         /* number of times CoInitializeEx called */
+    DWORD             ole_inits;     /* number of times OleInitialize called */
+    GUID              causality_id;  /* unique identifier for each COM call */
+    LONG              pending_call_count_client; /* number of client calls pending */
+    LONG              pending_call_count_server; /* number of server calls pending */
+    DWORD             unknown;
+    IObjContext      *context_token; /* (+38h on x86) */
+    IUnknown         *call_state;    /* current call context (+3Ch on x86) */
+    DWORD             unknown2[46];
+    IUnknown         *cancel_object; /* cancel object set by CoSetCancelObject (+F8h on x86) */
+    IUnknown         *state;         /* see CoSetState */
+    struct list       spies;         /* Spies installed with CoRegisterInitializeSpy */
+    DWORD             spies_lock;
+    DWORD             cancelcount;
 };
 
 /* Global Interface Table Functions */
@@ -95,13 +94,7 @@ static inline struct apartment * COM_CurrentApt(void)
     return COM_CurrentInfo()->apt;
 }
 
-/* helpers for debugging */
-# define DEBUG_SET_CRITSEC_NAME(cs, name) (cs)->DebugInfo->Spare[0] = (DWORD_PTR)(__FILE__ ": " name)
-# define DEBUG_CLEAR_CRITSEC_NAME(cs) (cs)->DebugInfo->Spare[0] = 0
-
 #define CHARS_IN_GUID 39 /* including NULL */
-
-#define WINE_CLSCTX_DONT_HOST   0x80000000
 
 /* from dlldata.c */
 extern HINSTANCE hProxyDll DECLSPEC_HIDDEN;

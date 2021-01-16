@@ -186,6 +186,10 @@ typedef struct
     {
         unsigned char i386_regs[512];
     } ext;                       /* selected by SERVER_CTX_EXTENDED_REGISTERS */
+    union
+    {
+        struct { struct { unsigned __int64 low, high; } ymm_high[16]; } ymm_high_regs;
+    } ymm;                       /* selected by SERVER_CTX_YMM_REGISTERS */
 } context_t;
 
 #define SERVER_CTX_CONTROL            0x01
@@ -194,6 +198,7 @@ typedef struct
 #define SERVER_CTX_FLOATING_POINT     0x08
 #define SERVER_CTX_DEBUG_REGISTERS    0x10
 #define SERVER_CTX_EXTENDED_REGISTERS 0x20
+#define SERVER_CTX_YMM_REGISTERS      0x40
 
 /* structure used in sending an fd from client to server */
 struct send_fd
@@ -782,11 +787,21 @@ struct rawinput_device
     user_handle_t  target;
 };
 
+typedef struct
+{
+    int x;
+    int y;
+    unsigned int time;
+    int __pad;
+    lparam_t info;
+} cursor_pos_t;
+
 /****************************************************************/
 /* Request declarations */
 
 /* Create a new process from the context of the parent */
 @REQ(new_process)
+    obj_handle_t token;          /* process token */
     obj_handle_t parent_process; /* parent process */
     int          inherit_all;    /* inherit all handles from parent */
     unsigned int create_flags;   /* creation flags */
@@ -795,7 +810,9 @@ struct rawinput_device
     unsigned int access;         /* access rights for process object */
     client_cpu_t cpu;            /* CPU that the new process will use */
     data_size_t  info_size;      /* size of startup info */
+    data_size_t  handles_size;   /* length of explicit handles list */
     VARARG(objattr,object_attributes);   /* object attributes */
+    VARARG(handles,uints,handles_size);  /* handles list */
     VARARG(info,startup_info,info_size); /* startup information */
     VARARG(env,unicode_str);     /* environment for new process */
 @REPLY
@@ -1380,36 +1397,6 @@ enum server_fd_type
 @END
 
 
-/* Create a socket */
-@REQ(create_socket)
-    unsigned int access;        /* wanted access rights */
-    unsigned int attributes;    /* object attributes */
-    int          family;        /* family, see socket manpage */
-    int          type;          /* type, see socket manpage */
-    int          protocol;      /* protocol, see socket manpage */
-    unsigned int flags;         /* socket flags */
-@REPLY
-    obj_handle_t handle;        /* handle to the new socket */
-@END
-
-
-/* Accept a socket */
-@REQ(accept_socket)
-    obj_handle_t lhandle;       /* handle to the listening socket */
-    unsigned int access;        /* wanted access rights */
-    unsigned int attributes;    /* object attributes */
-@REPLY
-    obj_handle_t handle;        /* handle to the new socket */
-@END
-
-
-/* Accept into an initialized socket */
-@REQ(accept_into_socket)
-    obj_handle_t lhandle;       /* handle to the listening socket */
-    obj_handle_t ahandle;       /* handle to the accepting socket */
-@END
-
-
 /* Set socket event parameters */
 @REQ(set_socket_event)
     obj_handle_t  handle;        /* handle to the socket */
@@ -1454,64 +1441,6 @@ enum server_fd_type
 @REQ(set_socket_deferred)
     obj_handle_t handle;        /* handle to the socket */
     obj_handle_t deferred;      /* handle to the socket for which accept() is deferred */
-@END
-
-/* Allocate a console (only used by a console renderer) */
-@REQ(alloc_console)
-    unsigned int access;        /* wanted access rights */
-    unsigned int attributes;    /* object attributes */
-    process_id_t pid;           /* pid of process which shall be attached to the console */
-    int          input_fd;      /* if pid=-1 (bare console to current process), fd for input */
-@REPLY
-    obj_handle_t handle_in;     /* handle to console input */
-@END
-
-
-/* Free the console of the current process */
-@REQ(free_console)
-@END
-
-
-/* Attach to a other process's console */
-@REQ(attach_console)
-    process_id_t pid;           /* pid of attached console process */
-@END
-
-
-/* Get the input queue wait event */
-@REQ(get_console_wait_event)
-    obj_handle_t handle;        /* handle to the console */
-@REPLY
-    obj_handle_t event;
-@END
-
-
-/* appends a string to console's history */
-@REQ(append_console_input_history)
-    obj_handle_t handle;        /* handle to console input, or 0 for process' console */
-    VARARG(line,unicode_str);   /* line to add */
-@END
-
-
-/* appends a string to console's history */
-@REQ(get_console_input_history)
-    obj_handle_t handle;        /* handle to console input, or 0 for process' console */
-    int          index;         /* index to get line from */
-@REPLY
-    int          total;         /* total length of line in Unicode chars */
-    VARARG(line,unicode_str);   /* line to add */
-@END
-
-
-/* creates a new screen buffer on process' console */
-@REQ(create_console_output)
-    obj_handle_t handle_in;     /* handle to console input, or 0 for process' console */
-    unsigned int access;        /* wanted access rights */
-    unsigned int attributes;    /* object attributes */
-    unsigned int share;         /* sharing credentials */
-    int          fd;            /* for bare consoles, fd the screen-buffer is attached to */
-@REPLY
-    obj_handle_t handle_out;    /* handle to the screen buffer */
 @END
 
 
@@ -3171,6 +3100,16 @@ enum caret_state
     obj_handle_t  new_handle; /* duplicated handle */
 @END
 
+@REQ(filter_token)
+    obj_handle_t  handle;          /* handle to the token to duplicate */
+    unsigned int  flags;           /* flags */
+    data_size_t   privileges_size; /* size of privileges */
+    VARARG(privileges,LUID_AND_ATTRIBUTES,privileges_size); /* privileges to remove from new token */
+    VARARG(disable_sids,SID);      /* array of groups to remove from new token */
+@REPLY
+    obj_handle_t  new_handle;      /* filtered handle */
+@END
+
 @REQ(access_check)
     obj_handle_t    handle; /* handle to the token */
     unsigned int    desired_access; /* desired access to the object */
@@ -3612,6 +3551,12 @@ struct handle_info
 #define SET_CURSOR_POS    0x04
 #define SET_CURSOR_CLIP   0x08
 #define SET_CURSOR_NOCLIP 0x10
+
+/* Get the history of the 64 last cursor positions */
+@REQ(get_cursor_history)
+@REPLY
+    VARARG(history,cursor_positions);
+@END
 
 
 /* Batch read rawinput message data */

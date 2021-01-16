@@ -19,7 +19,6 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "config.h"
 #include <stdarg.h>
 
 #define NONAMELESSUNION
@@ -646,8 +645,6 @@ UINT WINAPI GetRawInputDeviceInfoA(HANDLE device, UINT command, void *data, UINT
 UINT WINAPI GetRawInputDeviceInfoW(HANDLE handle, UINT command, void *data, UINT *data_size)
 {
     /* FIXME: Most of this is made up. */
-    static const WCHAR keyboard_name[] = {'\\','\\','?','\\','W','I','N','E','_','K','E','Y','B','O','A','R','D',0};
-    static const WCHAR mouse_name[] = {'\\','\\','?','\\','W','I','N','E','_','M','O','U','S','E',0};
     static const RID_DEVICE_INFO_KEYBOARD keyboard_info = {0, 0, 1, 12, 3, 101};
     static const RID_DEVICE_INFO_MOUSE mouse_info = {1, 5, 0, FALSE};
 
@@ -674,17 +671,17 @@ UINT WINAPI GetRawInputDeviceInfoW(HANDLE handle, UINT command, void *data, UINT
         avail_bytes = *data_size * sizeof(WCHAR);
         if (handle == WINE_MOUSE_HANDLE)
         {
-            *data_size = ARRAY_SIZE(mouse_name);
-            to_copy = mouse_name;
+            *data_size = ARRAY_SIZE(L"\\\\?\\WINE_MOUSE");
+            to_copy = L"\\\\?\\WINE_MOUSE";
         }
         else if (handle == WINE_KEYBOARD_HANDLE)
         {
-            *data_size = ARRAY_SIZE(keyboard_name);
-            to_copy = keyboard_name;
+            *data_size = ARRAY_SIZE(L"\\\\?\\WINE_KEYBOARD");
+            to_copy = L"\\\\?\\WINE_KEYBOARD";
         }
         else
         {
-            *data_size = strlenW(device->path) + 1;
+            *data_size = lstrlenW(device->path) + 1;
             to_copy = device->path;
         }
         to_copy_bytes = *data_size * sizeof(WCHAR);
@@ -745,7 +742,7 @@ UINT WINAPI GetRawInputDeviceInfoW(HANDLE handle, UINT command, void *data, UINT
     return *data_size;
 }
 
-static int compare_raw_input_devices(const void *ap, const void *bp)
+static int __cdecl compare_raw_input_devices(const void *ap, const void *bp)
 {
     const RAWINPUTDEVICE a = *(const RAWINPUTDEVICE *)ap;
     const RAWINPUTDEVICE b = *(const RAWINPUTDEVICE *)bp;

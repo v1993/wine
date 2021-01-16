@@ -50,6 +50,21 @@ int needs_get_pc_thunk = 0;
 
 static const char builtin_signature[32] = "Wine builtin DLL";
 static const char fakedll_signature[32] = "Wine placeholder DLL";
+static struct strarray spec_extra_ld_symbols = { 0 }; /* list of extra symbols that ld should resolve */
+
+/* add a symbol to the list of extra symbols that ld must resolve */
+void add_spec_extra_ld_symbol( const char *name )
+{
+    strarray_add( &spec_extra_ld_symbols, name, NULL );
+}
+
+static unsigned int hash_filename( const char *name )
+{
+    /* FNV-1 hash */
+    unsigned int ret = 2166136261u;
+    while (*name) ret = (ret * 16777619) ^ *name++;
+    return ret;
+}
 
 /* check if entry point needs a relay thunk */
 static inline int needs_relay( const ORDDEF *odp )
@@ -405,7 +420,7 @@ void output_exports( DLLSPEC *spec )
     /* export directory header */
 
     output( "\t.long 0\n" );                       /* Characteristics */
-    output( "\t.long 0\n" );                       /* TimeDateStamp */
+    output( "\t.long %u\n", hash_filename(spec->file_name) ); /* TimeDateStamp */
     output( "\t.long 0\n" );                       /* MajorVersion/MinorVersion */
     output_rva( ".L__wine_spec_exp_names" );       /* Name */
     output( "\t.long %u\n", spec->base );          /* Base */
@@ -602,6 +617,7 @@ void output_exports( DLLSPEC *spec )
 void output_module( DLLSPEC *spec )
 {
     int machine = 0;
+    int i;
     unsigned int page_size = get_page_size();
     const char *data_dirs[16] = { NULL };
 
@@ -666,7 +682,7 @@ void output_module( DLLSPEC *spec )
     output( "\t.short 0x%04x\n",          /* Machine */
              machine );
     output( "\t.short 0\n" );             /* NumberOfSections */
-    output( "\t.long 0\n" );              /* TimeDateStamp */
+    output( "\t.long %u\n", hash_filename(spec->file_name) );  /* TimeDateStamp */
     output( "\t.long 0\n" );              /* PointerToSymbolTable */
     output( "\t.long 0\n" );              /* NumberOfSymbols */
     output( "\t.short %d\n",              /* SizeOfOptionalHeader */
@@ -680,6 +696,10 @@ void output_module( DLLSPEC *spec )
     output( "\t.long 0\n" );              /* SizeOfCode */
     output( "\t.long 0\n" );              /* SizeOfInitializedData */
     output( "\t.long 0\n" );              /* SizeOfUninitializedData */
+
+    for (i = 0; i < spec_extra_ld_symbols.count; i++)
+        output( "\t.globl %s\n", asm_name(spec_extra_ld_symbols.str[i]) );
+
     /* note: we expand the AddressOfEntryPoint field on 64-bit by overwriting the BaseOfCode field */
     output( "\t%s %s\n",                  /* AddressOfEntryPoint */
             get_asm_ptr_keyword(), spec->init_func ? asm_name(spec->init_func) : "0" );
@@ -817,7 +837,7 @@ void output_fake_module( DLLSPEC *spec )
     case CPU_ARM64:   put_word( IMAGE_FILE_MACHINE_ARM64 ); break;
     }
     put_word( nb_sections );                         /* NumberOfSections */
-    put_dword( 0 );                                  /* TimeDateStamp */
+    put_dword( hash_filename(spec->file_name) );     /* TimeDateStamp */
     put_dword( 0 );                                  /* PointerToSymbolTable */
     put_dword( 0 );                                  /* NumberOfSymbols */
     put_word( get_ptr_size() == 8 ?

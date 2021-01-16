@@ -655,13 +655,39 @@ BOOL WINAPI DECLSPEC_HOTPATCH CreateDirectoryExW( LPCWSTR template, LPCWSTR path
 HANDLE WINAPI DECLSPEC_HOTPATCH CreateFile2( LPCWSTR name, DWORD access, DWORD sharing, DWORD creation,
                                              CREATEFILE2_EXTENDED_PARAMETERS *params )
 {
+    static const DWORD attributes_mask = FILE_ATTRIBUTE_READONLY |
+                                         FILE_ATTRIBUTE_HIDDEN |
+                                         FILE_ATTRIBUTE_SYSTEM |
+                                         FILE_ATTRIBUTE_ARCHIVE |
+                                         FILE_ATTRIBUTE_NORMAL |
+                                         FILE_ATTRIBUTE_TEMPORARY |
+                                         FILE_ATTRIBUTE_OFFLINE |
+                                         FILE_ATTRIBUTE_ENCRYPTED |
+                                         FILE_ATTRIBUTE_INTEGRITY_STREAM;
+    static const DWORD flags_mask = FILE_FLAG_BACKUP_SEMANTICS |
+                                    FILE_FLAG_DELETE_ON_CLOSE |
+                                    FILE_FLAG_NO_BUFFERING |
+                                    FILE_FLAG_OPEN_NO_RECALL |
+                                    FILE_FLAG_OPEN_REPARSE_POINT |
+                                    FILE_FLAG_OVERLAPPED |
+                                    FILE_FLAG_POSIX_SEMANTICS |
+                                    FILE_FLAG_RANDOM_ACCESS |
+                                    FILE_FLAG_SEQUENTIAL_SCAN |
+                                    FILE_FLAG_WRITE_THROUGH;
+
     LPSECURITY_ATTRIBUTES sa = params ? params->lpSecurityAttributes : NULL;
-    DWORD attributes = params ? params->dwFileAttributes : 0;
     HANDLE template = params ? params->hTemplateFile : NULL;
+    DWORD attributes = params ? params->dwFileAttributes : 0;
+    DWORD flags = params ? params->dwFileFlags : 0;
 
     FIXME( "(%s %x %x %x %p), partial stub\n", debugstr_w(name), access, sharing, creation, params );
 
-    return CreateFileW( name, access, sharing, sa, creation, attributes, template );
+    if (attributes & ~attributes_mask) FIXME( "unsupported attributes %#x\n", attributes );
+    if (flags & ~flags_mask) FIXME( "unsupported flags %#x\n", flags );
+    attributes &= attributes_mask;
+    flags &= flags_mask;
+
+    return CreateFileW( name, access, sharing, sa, creation, flags | attributes, template );
 }
 
 
@@ -712,7 +738,6 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileW( LPCWSTR filename, DWORD access, DWO
     UNICODE_STRING nameW;
     IO_STATUS_BLOCK io;
     HANDLE ret;
-    DWORD dosdev;
     const WCHAR *vxd_name = NULL;
     SECURITY_QUALITY_OF_SERVICE qos;
 
@@ -744,25 +769,14 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileW( LPCWSTR filename, DWORD access, DWO
            (sharing & FILE_SHARE_DELETE) ? "FILE_SHARE_DELETE " : "",
            creation, attributes);
 
-    if (!wcsncmp( filename, L"\\\\.\\", 4 ))
+    if ((GetVersion() & 0x80000000) && !wcsncmp( filename, L"\\\\.\\", 4 ) &&
+        !RtlIsDosDeviceName_U( filename + 4 ) &&
+        wcsnicmp( filename + 4, L"PIPE\\", 5 ) &&
+        wcsnicmp( filename + 4, L"MAILSLOT\\", 9 ))
     {
-        if ((filename[4] && filename[5] == ':' && !filename[6]) ||
-            !wcsnicmp( filename + 4, L"PIPE\\", 5 ) ||
-            !wcsnicmp( filename + 4, L"MAILSLOT\\", 9 ))
-        {
-            dosdev = 0;
-        }
-        else if ((dosdev = RtlIsDosDeviceName_U( filename + 4 )))
-        {
-            dosdev += MAKELONG( 0, 4*sizeof(WCHAR) );  /* adjust position to start of filename */
-        }
-        else if (GetVersion() & 0x80000000)
-        {
-            vxd_name = filename + 4;
-            if (!creation) creation = OPEN_EXISTING;
-        }
+        vxd_name = filename + 4;
+        if (!creation) creation = OPEN_EXISTING;
     }
-    else dosdev = RtlIsDosDeviceName_U( filename );
 
     if (creation < CREATE_NEW || creation > TRUNCATE_EXISTING)
     {
@@ -828,12 +842,6 @@ HANDLE WINAPI DECLSPEC_HOTPATCH CreateFileW( LPCWSTR filename, DWORD access, DWO
     }
     else
     {
-        if (dosdev &&
-            ((LOWORD(dosdev) == 3 * sizeof(WCHAR) && !wcsnicmp( filename + HIWORD(dosdev)/sizeof(WCHAR), L"CON", 3 )) ||
-             (LOWORD(dosdev) == 6 * sizeof(WCHAR) && !wcsnicmp( filename + HIWORD(dosdev)/sizeof(WCHAR), L"CONIN$", 6 )) ||
-             (LOWORD(dosdev) == 7 * sizeof(WCHAR) && !wcsnicmp( filename + HIWORD(dosdev)/sizeof(WCHAR), L"CONOUT$", 7 ))))
-            ret = console_handle_map( ret );
-
         if ((creation == CREATE_ALWAYS && io.Information == FILE_OVERWRITTEN) ||
             (creation == OPEN_ALWAYS && io.Information == FILE_OPENED))
             SetLastError( ERROR_ALREADY_EXISTS );
@@ -3021,12 +3029,6 @@ BOOL WINAPI DECLSPEC_HOTPATCH GetFileSizeEx( HANDLE file, PLARGE_INTEGER size )
     FILE_STANDARD_INFORMATION info;
     IO_STATUS_BLOCK io;
 
-    if (is_console_handle( file ))
-    {
-        SetLastError( ERROR_INVALID_HANDLE );
-        return FALSE;
-    }
-
     if (!set_ntstatus( NtQueryInformationFile( file, &io, &info, sizeof(info), FileStandardInformation )))
         return FALSE;
 
@@ -3079,8 +3081,6 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetFileType( HANDLE file )
         file == (HANDLE)STD_ERROR_HANDLE)
         file = GetStdHandle( (DWORD_PTR)file );
 
-    if (is_console_handle( file )) return FILE_TYPE_CHAR;
-
     if (!set_ntstatus( NtQueryVolumeInformationFile( file, &io, &info, sizeof(info),
                                                      FileFsDeviceInformation )))
         return FILE_TYPE_UNKNOWN;
@@ -3088,6 +3088,7 @@ DWORD WINAPI DECLSPEC_HOTPATCH GetFileType( HANDLE file )
     switch (info.DeviceType)
     {
     case FILE_DEVICE_NULL:
+    case FILE_DEVICE_CONSOLE:
     case FILE_DEVICE_SERIAL_PORT:
     case FILE_DEVICE_PARALLEL_PORT:
     case FILE_DEVICE_TAPE:

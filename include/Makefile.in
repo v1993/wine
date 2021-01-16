@@ -50,6 +50,7 @@ SOURCES = \
 	bits2_0.idl \
 	bits2_5.idl \
 	bits3_0.idl \
+	bits5_0.idl \
 	bitsmsg.h \
 	bluetoothapis.h \
 	bthsdpdef.h \
@@ -62,6 +63,9 @@ SOURCES = \
 	cierror.h \
 	clusapi.h \
 	cmdbas.idl \
+	cmdpre.idl \
+	cmdprp.idl \
+	cmdstrm.idl \
 	cmdtxt.idl \
 	cmnquery.idl \
 	codecapi.h \
@@ -88,6 +92,7 @@ SOURCES = \
 	ctxtcall.idl \
 	custcntl.h \
 	cvconst.h \
+	cvttyp.idl \
 	d2d1.idl \
 	d2d1_1.idl \
 	d2d1_2.idl \
@@ -110,6 +115,7 @@ SOURCES = \
 	d3d11sdklayers.idl \
 	d3d11shader.h \
 	d3d12.idl \
+	d3d12sdklayers.idl \
 	d3d12shader.idl \
 	d3d8.h \
 	d3d8caps.h \
@@ -305,6 +311,7 @@ SOURCES = \
 	gdiplusmetaheader.h \
 	gdipluspixelformats.h \
 	gdiplustypes.h \
+	getdts.idl \
 	guiddef.h \
 	hidusage.h \
 	highlevelmonitorconfigurationapi.h \
@@ -436,8 +443,10 @@ SOURCES = \
 	mstask.idl \
 	mstcpip.h \
 	msvcrt/assert.h \
+	msvcrt/complex.h \
 	msvcrt/conio.h \
 	msvcrt/corecrt.h \
+	msvcrt/corecrt_io.h \
 	msvcrt/corecrt_startup.h \
 	msvcrt/corecrt_stdio_config.h \
 	msvcrt/corecrt_wctype.h \
@@ -532,6 +541,7 @@ SOURCES = \
 	objbase.h \
 	objectarray.idl \
 	objidl.idl \
+	objidlbase.idl \
 	objsafe.idl \
 	objsel.h \
 	ocidl.idl \
@@ -604,9 +614,11 @@ SOURCES = \
 	rpcproxy.h \
 	rpcsal.h \
 	rstbas.idl \
+	rstchg.idl \
 	rstinf.idl \
 	rstloc.idl \
 	rstnot.idl \
+	rstupd.idl \
 	rtutils.h \
 	rtworkq.idl \
 	sal.h \
@@ -734,12 +746,12 @@ SOURCES = \
 	windns.h \
 	windows.foundation.idl \
 	windows.h \
+	windowscontracts.idl \
 	windowsx.h \
 	wine/debug.h \
 	wine/exception.h \
 	wine/fil_data.idl \
 	wine/itss.idl \
-	wine/library.h \
 	wine/orpc.idl \
 	wine/svcctl.idl \
 	wine/winedxgi.idl \

@@ -84,6 +84,7 @@ static const struct object_ops process_ops =
     process_map_access,          /* map_access */
     process_get_sd,              /* get_sd */
     default_set_sd,              /* set_sd */
+    no_get_full_name,            /* get_full_name */
     no_lookup_name,              /* lookup_name */
     no_link_name,                /* link_name */
     NULL,                        /* unlink_name */
@@ -134,6 +135,7 @@ static const struct object_ops startup_info_ops =
     no_map_access,                 /* map_access */
     default_get_sd,                /* get_sd */
     default_set_sd,                /* set_sd */
+    no_get_full_name,              /* get_full_name */
     no_lookup_name,                /* lookup_name */
     no_link_name,                  /* link_name */
     NULL,                          /* unlink_name */
@@ -179,6 +181,7 @@ static const struct object_ops job_ops =
     job_map_access,                /* map_access */
     default_get_sd,                /* get_sd */
     default_set_sd,                /* set_sd */
+    default_get_full_name,         /* get_full_name */
     no_lookup_name,                /* lookup_name */
     directory_link_name,           /* link_name */
     default_unlink_name,           /* unlink_name */
@@ -499,8 +502,9 @@ static void start_sigkill_timer( struct process *process )
 
 /* create a new process */
 /* if the function fails the fd is closed */
-struct process *create_process( int fd, struct process *parent, int inherit_all,
-                                const struct security_descriptor *sd )
+struct process *create_process( int fd, struct process *parent, int inherit_all, const startup_info_t *info,
+                                const struct security_descriptor *sd, const obj_handle_t *handles,
+                                unsigned int handle_count, struct token *token )
 {
     struct process *process;
 
@@ -572,12 +576,18 @@ struct process *create_process( int fd, struct process *parent, int inherit_all,
     }
     else
     {
+        obj_handle_t std_handles[3];
+
+        std_handles[0] = info->hstdin;
+        std_handles[1] = info->hstdout;
+        std_handles[2] = info->hstderr;
+
         process->parent_id = parent->id;
-        process->handles = inherit_all ? copy_handle_table( process, parent )
+        process->handles = inherit_all ? copy_handle_table( process, parent, handles, handle_count, std_handles )
                                        : alloc_handle_table( process, 0 );
         /* Note: for security reasons, starting a new process does not attempt
          * to use the current impersonation token for the new process */
-        process->token = token_duplicate( parent->token, TRUE, 0, NULL );
+        process->token = token_duplicate( token ? token : parent->token, TRUE, 0, NULL, NULL, 0, NULL, 0 );
         process->affinity = parent->affinity;
     }
     if (!process->handles || !process->token) goto error;
@@ -768,7 +778,7 @@ struct process *get_process_from_id( process_id_t id )
     struct object *obj = get_ptid_entry( id );
 
     if (obj && obj->ops == &process_ops) return (struct process *)grab_object( obj );
-    set_error( STATUS_INVALID_PARAMETER );
+    set_error( STATUS_INVALID_CID );
     return NULL;
 }
 
@@ -905,9 +915,7 @@ static void process_killed( struct process *process )
     if (process->exe_file) release_object( process->exe_file );
     process->idle_event = NULL;
     process->exe_file = NULL;
-
-    /* close the console attached to this process, if any */
-    free_console( process );
+    assert( !process->console );
 
     while ((ptr = list_head( &process->rawinput_devices )))
     {
@@ -1098,9 +1106,11 @@ DECL_HANDLER(new_process)
     const struct security_descriptor *sd;
     const struct object_attributes *objattr = get_req_object_attributes( &sd, &name, NULL );
     struct process *process = NULL;
+    struct token *token = NULL;
     struct process *parent;
     struct thread *parent_thread = current;
     int socket_fd = thread_get_inflight_fd( current, req->socket_fd );
+    const obj_handle_t *handles = NULL;
 
     if (socket_fd == -1)
     {
@@ -1162,6 +1172,19 @@ DECL_HANDLER(new_process)
     info->data     = NULL;
 
     info_ptr = get_req_data_after_objattr( objattr, &info->data_size );
+
+    if ((req->handles_size & 3) || req->handles_size > info->data_size)
+    {
+        set_error( STATUS_INVALID_PARAMETER );
+        close( socket_fd );
+        goto done;
+    }
+    if (req->handles_size)
+    {
+        handles = info_ptr;
+        info_ptr = (const char *)info_ptr + req->handles_size;
+        info->data_size -= req->handles_size;
+    }
     info->info_size = min( req->info_size, info->data_size );
 
     if (req->info_size < sizeof(*info->data))
@@ -1202,7 +1225,15 @@ DECL_HANDLER(new_process)
 #undef FIXUP_LEN
     }
 
-    if (!(process = create_process( socket_fd, parent, req->inherit_all, sd ))) goto done;
+    if (req->token && !(token = get_token_obj( current->process, req->token, TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY )))
+    {
+        close( socket_fd );
+        goto done;
+    }
+
+    if (!(process = create_process( socket_fd, parent, req->inherit_all, info->data, sd,
+                                    handles, req->handles_size / sizeof(*handles), token )))
+        goto done;
 
     process->startup_info = (struct startup_info *)grab_object( info );
 
@@ -1221,15 +1252,9 @@ DECL_HANDLER(new_process)
     connect_process_winstation( process, parent_thread, parent );
 
     /* set the process console */
-    if (!(req->create_flags & (DETACHED_PROCESS | CREATE_NEW_CONSOLE)))
-    {
-        /* FIXME: some better error checking should be done...
-         * like if hConOut and hConIn are console handles, then they should be on the same
-         * physical console
-         */
-        info->data->console = inherit_console( parent_thread, info->data->console,
-                                               process, req->inherit_all ? info->data->hstdin : 0 );
-    }
+    if (info->data->console > 3)
+        info->data->console = duplicate_handle( parent, info->data->console, process,
+                                                0, 0, DUPLICATE_SAME_ACCESS );
 
     if (!req->inherit_all && !(req->create_flags & CREATE_NEW_CONSOLE))
     {
@@ -1265,6 +1290,7 @@ DECL_HANDLER(new_process)
 
  done:
     if (process) release_object( process );
+    if (token) release_object( token );
     release_object( parent );
     release_object( info );
 }
@@ -1297,7 +1323,7 @@ DECL_HANDLER(exec_process)
         close( socket_fd );
         return;
     }
-    if (!(process = create_process( socket_fd, NULL, 0, NULL ))) return;
+    if (!(process = create_process( socket_fd, NULL, 0, NULL, NULL, NULL, 0, NULL ))) return;
     create_thread( -1, process, NULL );
     release_object( process );
 }
@@ -1614,8 +1640,8 @@ DECL_HANDLER(make_process_system)
 
     if (!shutdown_event)
     {
-        if (!(shutdown_event = create_event( NULL, NULL, 0, 1, 0, NULL ))) return;
-        make_object_static( (struct object *)shutdown_event );
+        if (!(shutdown_event = create_event( NULL, NULL, OBJ_PERMANENT, 1, 0, NULL ))) return;
+        release_object( shutdown_event );
     }
 
     if (!(reply->event = alloc_handle( current->process, shutdown_event, SYNCHRONIZE, 0 )))

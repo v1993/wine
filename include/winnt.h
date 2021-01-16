@@ -462,7 +462,7 @@ typedef int             LONG,       *PLONG;
 /* Some systems might have wchar_t, but we really need 16 bit characters */
 #if defined(WINE_UNICODE_NATIVE)
 typedef wchar_t         WCHAR;
-#elif defined(WINE_UNICODE_CHAR16)
+#elif __cpp_unicode_literals >= 200710
 typedef char16_t        WCHAR;
 #else
 typedef unsigned short  WCHAR;
@@ -735,6 +735,35 @@ typedef struct _MEMORY_BASIC_INFORMATION
     DWORD    Protect;
     DWORD    Type;
 } MEMORY_BASIC_INFORMATION, *PMEMORY_BASIC_INFORMATION;
+
+#define MEM_EXTENDED_PARAMETER_TYPE_BITS 8
+
+typedef enum MEM_EXTENDED_PARAMETER_TYPE {
+    MemExtendedParameterInvalidType = 0,
+    MemExtendedParameterAddressRequirements,
+    MemExtendedParameterNumaNode,
+    MemExtendedParameterPartitionHandle,
+    MemExtendedParameterUserPhysicalHandle,
+    MemExtendedParameterAttributeFlags,
+    MemExtendedParameterMax
+} MEM_EXTENDED_PARAMETER_TYPE, *PMEM_EXTENDED_PARAMETER_TYPE;
+
+typedef struct DECLSPEC_ALIGN(8) MEM_EXTENDED_PARAMETER {
+    struct
+    {
+        DWORD64 Type : MEM_EXTENDED_PARAMETER_TYPE_BITS;
+        DWORD64 Reserved : 64 - MEM_EXTENDED_PARAMETER_TYPE_BITS;
+    } DUMMYSTRUCTNAME;
+
+    union
+    {
+        DWORD64 ULong64;
+        PVOID Pointer;
+        SIZE_T Size;
+        HANDLE Handle;
+        DWORD ULong;
+    } DUMMYUNIONNAME;
+} MEM_EXTENDED_PARAMETER, *PMEM_EXTENDED_PARAMETER;
 
 #define	PAGE_NOACCESS		0x01
 #define	PAGE_READONLY		0x02
@@ -1309,6 +1338,34 @@ NTSYSAPI PVOID WINAPI RtlVirtualUnwind(ULONG,ULONG64,ULONG64,RUNTIME_FUNCTION*,C
 #define XSTATE_IPT                   8
 #define XSTATE_CET_U                 11
 #define XSTATE_LWP                   62
+#define MAXIMUM_XSTATE_FEATURES      64
+
+#define XSTATE_MASK_LEGACY_FLOATING_POINT   (1 << XSTATE_LEGACY_FLOATING_POINT)
+#define XSTATE_MASK_LEGACY_SSE              (1 << XSTATE_LEGACY_SSE)
+#define XSTATE_MASK_LEGACY                  (XSTATE_MASK_LEGACY_FLOATING_POINT | XSTATE_MASK_LEGACY_SSE)
+#define XSTATE_MASK_GSSE                    (1 << XSTATE_GSSE)
+
+typedef struct _XSTATE_FEATURE
+{
+    ULONG Offset;
+    ULONG Size;
+} XSTATE_FEATURE, *PXSTATE_FEATURE;
+
+typedef struct _XSTATE_CONFIGURATION
+{
+    ULONG64 EnabledFeatures;
+    ULONG64 EnabledVolatileFeatures;
+    ULONG Size;
+    ULONG OptimizedSave:1;
+    ULONG CompactionEnabled:1;
+    XSTATE_FEATURE Features[MAXIMUM_XSTATE_FEATURES];
+
+    ULONG64 EnabledSupervisorFeatures;
+    ULONG64 AlignedFeatures;
+    ULONG AllFeatureSize;
+    ULONG AllFeatures[MAXIMUM_XSTATE_FEATURES];
+    ULONG64 EnabledUserVisibleSupervisorFeatures;
+} XSTATE_CONFIGURATION, *PXSTATE_CONFIGURATION;
 
 typedef struct _YMMCONTEXT
 {
@@ -4291,7 +4348,6 @@ typedef enum _TOKEN_INFORMATION_CLASS {
 #ifndef _SECURITY_DEFINED
 #define _SECURITY_DEFINED
 
-
 typedef DWORD ACCESS_MASK, *PACCESS_MASK;
 
 typedef struct _GENERIC_MAPPING {
@@ -6841,7 +6897,7 @@ static inline BOOLEAN BitScanReverse(DWORD *index, DWORD mask)
 #if defined(_MSC_VER)
 
 #define InterlockedCompareExchange128 _InterlockedCompareExchange128
-static inline unsigned char _InterlockedCompareExchange128(__int64 *dest, __int64 xchg_high, __int64 xchg_low, __int64 *compare);
+unsigned char _InterlockedCompareExchange128(volatile __int64 *dest, __int64 xchg_high, __int64 xchg_low, __int64 *compare);
 #pragma intrinsic(_InterlockedCompareExchange128)
 
 #elif defined(__x86_64__)

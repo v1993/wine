@@ -99,6 +99,9 @@
 #ifdef HAVE_SYS_PARAM_H
 #include <sys/param.h>
 #endif
+#ifdef HAVE_SYS_CONF_H
+#include <sys/conf.h>
+#endif
 #ifdef HAVE_SYS_MOUNT_H
 #include <sys/mount.h>
 #endif
@@ -764,7 +767,7 @@ static char *get_default_drive_device( const char *root )
     if (res == -1) res = stat( root, &st );
     if (res == -1) return NULL;
 
-    pthread_mutex_lock( &mnt_mutex );
+    mutex_lock( &mnt_mutex );
 
 #ifdef __ANDROID__
     if ((f = fopen( "/proc/mounts", "r" )))
@@ -786,7 +789,7 @@ static char *get_default_drive_device( const char *root )
     }
 #endif
     if (device) ret = strdup( device );
-    pthread_mutex_unlock( &mnt_mutex );
+    mutex_unlock( &mnt_mutex );
 
 #elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__ ) || defined(__DragonFly__)
     char *device = NULL;
@@ -803,14 +806,14 @@ static char *get_default_drive_device( const char *root )
     if (res == -1) res = stat( root, &st );
     if (res == -1) return NULL;
 
-    pthread_mutex_lock( &mnt_mutex );
+    mutex_lock( &mnt_mutex );
 
     /* The FreeBSD parse_mount_entries doesn't require a file argument, so just
      * pass NULL.  Leave the argument in for symmetry.
      */
     device = parse_mount_entries( NULL, st.st_dev, st.st_ino );
     if (device) ret = strdup( device );
-    pthread_mutex_unlock( &mnt_mutex );
+    mutex_unlock( &mnt_mutex );
 
 #elif defined( sun )
     FILE *f;
@@ -828,7 +831,7 @@ static char *get_default_drive_device( const char *root )
     if (res == -1) res = stat( root, &st );
     if (res == -1) return NULL;
 
-    pthread_mutex_lock( &mnt_mutex );
+    mutex_lock( &mnt_mutex );
 
     if ((f = fopen( "/etc/mnttab", "r" )))
     {
@@ -842,7 +845,7 @@ static char *get_default_drive_device( const char *root )
         fclose( f );
     }
     if (device) ret = strdup( device );
-    pthread_mutex_unlock( &mnt_mutex );
+    mutex_unlock( &mnt_mutex );
 
 #elif defined(__APPLE__)
     struct statfs *mntStat;
@@ -860,7 +863,7 @@ static char *get_default_drive_device( const char *root )
     dev = st.st_dev;
     ino = st.st_ino;
 
-    pthread_mutex_lock( &mnt_mutex );
+    mutex_lock( &mnt_mutex );
 
     mntSize = getmntinfo(&mntStat, MNT_NOWAIT);
 
@@ -881,7 +884,7 @@ static char *get_default_drive_device( const char *root )
             }
         }
     }
-    pthread_mutex_unlock( &mnt_mutex );
+    mutex_unlock( &mnt_mutex );
 #else
     static int warned;
     if (!warned++) FIXME( "auto detection of DOS devices not supported on this platform\n" );
@@ -902,7 +905,7 @@ static char *get_device_mount_point( dev_t dev )
 #ifdef linux
     FILE *f;
 
-    pthread_mutex_lock( &mnt_mutex );
+    mutex_lock( &mnt_mutex );
 
 #ifdef __ANDROID__
     if ((f = fopen( "/proc/mounts", "r" )))
@@ -949,13 +952,13 @@ static char *get_device_mount_point( dev_t dev )
         }
         fclose( f );
     }
-    pthread_mutex_unlock( &mnt_mutex );
+    mutex_unlock( &mnt_mutex );
 #elif defined(__APPLE__)
     struct statfs *entry;
     struct stat st;
     int i, size;
 
-    pthread_mutex_lock( &mnt_mutex );
+    mutex_lock( &mnt_mutex );
 
     size = getmntinfo( &entry, MNT_NOWAIT );
     for (i = 0; i < size; i++)
@@ -967,7 +970,7 @@ static char *get_device_mount_point( dev_t dev )
             break;
         }
     }
-    pthread_mutex_unlock( &mnt_mutex );
+    mutex_unlock( &mnt_mutex );
 #else
     static int warned;
     if (!warned++) FIXME( "unmounting devices not supported on this platform\n" );
@@ -1119,20 +1122,25 @@ static BOOLEAN get_dir_case_sensitivity_stat( const char *dir )
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
     struct statfs stfs;
 
-    if (statfs( dir, &stfs ) == -1) return FALSE;
-    /* Assume these file systems are always case insensitive on Mac OS.
-     * For FreeBSD, only assume CIOPFS is case insensitive (AFAIK, Mac OS
-     * is the only UNIX that supports case-insensitive lookup).
-     */
+    if (statfs( dir, &stfs ) == -1) return TRUE;
+    /* Assume these file systems are always case insensitive.*/
     if (!strcmp( stfs.f_fstypename, "fusefs" ) &&
         !strncmp( stfs.f_mntfromname, "ciopfs", 5 ))
         return FALSE;
+    /* msdosfs was case-insensitive since FreeBSD 8, if not earlier */
+    if (!strcmp( stfs.f_fstypename, "msdosfs" ) ||
+        /* older CIFS protocol versions uppercase filename on the client,
+         * newer versions should be case-insensitive on the server anyway */
+        !strcmp( stfs.f_fstypename, "smbfs" ))
+        return FALSE;
+    /* no ntfs-3g: modern fusefs has no way to report the filesystem on FreeBSD
+     * no cd9660 or udf, they're case-sensitive on FreeBSD
+     */
 #ifdef __APPLE__
     if (!strcmp( stfs.f_fstypename, "msdos" ) ||
         !strcmp( stfs.f_fstypename, "cd9660" ) ||
         !strcmp( stfs.f_fstypename, "udf" ) ||
-        !strcmp( stfs.f_fstypename, "ntfs" ) ||
-        !strcmp( stfs.f_fstypename, "smbfs" ))
+        !strcmp( stfs.f_fstypename, "ntfs" ))
         return FALSE;
 #ifdef _DARWIN_FEATURE_64_BIT_INODE
      if (!strcmp( stfs.f_fstypename, "hfs" ) && (stfs.f_fssubtype == 0 ||
@@ -1156,12 +1164,12 @@ static BOOLEAN get_dir_case_sensitivity_stat( const char *dir )
 #elif defined(__NetBSD__)
     struct statvfs stfs;
 
-    if (statvfs( dir, &stfs ) == -1) return FALSE;
+    if (statvfs( dir, &stfs ) == -1) return TRUE;
     /* Only assume CIOPFS is case insensitive. */
     if (strcmp( stfs.f_fstypename, "fusefs" ) ||
         strncmp( stfs.f_mntfromname, "ciopfs", 5 ))
-        return TRUE;
-    return FALSE;
+        return FALSE;
+    return TRUE;
 
 #elif defined(__linux__)
     BOOLEAN sens = TRUE;
@@ -1623,9 +1631,9 @@ static NTSTATUS set_file_times( int fd, const LARGE_INTEGER *mtime, const LARGE_
 static inline void get_file_times( const struct stat *st, LARGE_INTEGER *mtime, LARGE_INTEGER *ctime,
                                    LARGE_INTEGER *atime, LARGE_INTEGER *creation )
 {
-    mtime->QuadPart = st->st_mtime * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
-    ctime->QuadPart = st->st_ctime * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
-    atime->QuadPart = st->st_atime * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
+    mtime->QuadPart = ticks_from_time_t( st->st_mtime );
+    ctime->QuadPart = ticks_from_time_t( st->st_ctime );
+    atime->QuadPart = ticks_from_time_t( st->st_atime );
 #ifdef HAVE_STRUCT_STAT_ST_MTIM
     mtime->QuadPart += st->st_mtim.tv_nsec / 100;
 #elif defined(HAVE_STRUCT_STAT_ST_MTIMESPEC)
@@ -1642,14 +1650,14 @@ static inline void get_file_times( const struct stat *st, LARGE_INTEGER *mtime, 
     atime->QuadPart += st->st_atimespec.tv_nsec / 100;
 #endif
 #ifdef HAVE_STRUCT_STAT_ST_BIRTHTIME
-    creation->QuadPart = st->st_birthtime * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
+    creation->QuadPart = ticks_from_time_t( st->st_birthtime );
 #ifdef HAVE_STRUCT_STAT_ST_BIRTHTIM
     creation->QuadPart += st->st_birthtim.tv_nsec / 100;
 #elif defined(HAVE_STRUCT_STAT_ST_BIRTHTIMESPEC)
     creation->QuadPart += st->st_birthtimespec.tv_nsec / 100;
 #endif
 #elif defined(HAVE_STRUCT_STAT___ST_BIRTHTIME)
-    creation->QuadPart = st->__st_birthtime * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
+    creation->QuadPart = ticks_from_time_t( st->__st_birthtime );
 #ifdef HAVE_STRUCT_STAT___ST_BIRTHTIM
     creation->QuadPart += st->__st_birthtim.tv_nsec / 100;
 #endif
@@ -1851,7 +1859,7 @@ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
     unsigned int ret;
     time_t now = time(NULL);
 
-    pthread_mutex_lock( &cache_mutex );
+    mutex_lock( &cache_mutex );
     if (now != last_update)
     {
         char *buffer, *p;
@@ -1885,7 +1893,7 @@ static unsigned int get_drives_info( struct file_identity info[MAX_DOS_DRIVES] )
     }
     memcpy( info, cache, sizeof(cache) );
     ret = nb_drives;
-    pthread_mutex_unlock( &cache_mutex );
+    mutex_unlock( &cache_mutex );
     return ret;
 }
 
@@ -2429,7 +2437,7 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
 
     io->Information = 0;
 
-    pthread_mutex_lock( &dir_mutex );
+    mutex_lock( &dir_mutex );
 
     cwd = open( ".", O_RDONLY );
     if (fchdir( fd ) != -1)
@@ -2456,7 +2464,7 @@ NTSTATUS WINAPI NtQueryDirectoryFile( HANDLE handle, HANDLE event, PIO_APC_ROUTI
     }
     else status = errno_to_status( errno );
 
-    pthread_mutex_unlock( &dir_mutex );
+    mutex_unlock( &dir_mutex );
 
     if (needs_close) close( fd );
     if (cwd != -1) close( cwd );
@@ -2550,6 +2558,8 @@ static NTSTATUS find_file_in_dir( char *unix_name, int pos, const WCHAR *name, i
                         goto not_found;
                     }
                 }
+                /* if that did not work, restore previous state of unix_name */
+                unix_name[pos - 1] = 0;
             }
             close( fd );
         }
@@ -2802,7 +2812,6 @@ static NTSTATUS get_dos_device( const WCHAR *name, UINT name_len, char **unix_na
         if (!new_name) break;
         free( unix_name );
         unix_name = new_name;
-        unix_len = strlen(unix_name) + 1;
         dev = NULL; /* last try */
     }
     free( unix_name );
@@ -3012,7 +3021,7 @@ static NTSTATUS file_id_to_unix_file_name( const OBJECT_ATTRIBUTES *attr, char *
         goto done;
     }
 
-    pthread_mutex_lock( &dir_mutex );
+    mutex_lock( &dir_mutex );
     if ((old_cwd = open( ".", O_RDONLY )) != -1 && fchdir( root_fd ) != -1)
     {
         /* shortcut for ".." */
@@ -3033,7 +3042,7 @@ static NTSTATUS file_id_to_unix_file_name( const OBJECT_ATTRIBUTES *attr, char *
         if (fchdir( old_cwd ) == -1) chdir( "/" );
     }
     else status = errno_to_status( errno );
-    pthread_mutex_unlock( &dir_mutex );
+    mutex_unlock( &dir_mutex );
     if (old_cwd != -1) close( old_cwd );
 
 done:
@@ -3208,7 +3217,7 @@ static NTSTATUS nt_to_unix_file_name_attr( const OBJECT_ATTRIBUTES *attr, char *
         }
         else
         {
-            pthread_mutex_lock( &dir_mutex );
+            mutex_lock( &dir_mutex );
             if ((old_cwd = open( ".", O_RDONLY )) != -1 && fchdir( root_fd ) != -1)
             {
                 status = lookup_unix_name( name, name_len, &unix_name, unix_len, 1,
@@ -3216,7 +3225,7 @@ static NTSTATUS nt_to_unix_file_name_attr( const OBJECT_ATTRIBUTES *attr, char *
                 if (fchdir( old_cwd ) == -1) chdir( "/" );
             }
             else status = errno_to_status( errno );
-            pthread_mutex_unlock( &dir_mutex );
+            mutex_unlock( &dir_mutex );
             if (old_cwd != -1) close( old_cwd );
             if (needs_close) close( root_fd );
         }
@@ -6063,6 +6072,31 @@ static NTSTATUS get_device_info( int fd, FILE_FS_DEVICE_INFORMATION *info )
             info->DeviceType = FILE_DEVICE_TAPE;
             break;
         }
+#elif defined(__FreeBSD__) || defined(__FreeBSD_kernel__) || defined(__APPLE__)
+        {
+            int d_type;
+            if (ioctl(fd, FIODTYPE, &d_type) == 0)
+            {
+                switch(d_type)
+                {
+                case D_TAPE:
+                    info->DeviceType = FILE_DEVICE_TAPE;
+                    break;
+                case D_DISK:
+                    info->DeviceType = FILE_DEVICE_DISK;
+                    break;
+                case D_TTY:
+                    info->DeviceType = FILE_DEVICE_SERIAL_PORT;
+                    break;
+#if defined(__FreeBSD__) || defined(__FreeBSD_kernel__)
+                case D_MEM:
+                    info->DeviceType = FILE_DEVICE_NULL;
+                    break;
+#endif
+                }
+            /* no special d_type for parallel ports */
+            }
+        }
 #endif
     }
     else if (S_ISBLK( st.st_mode ))
@@ -6319,7 +6353,9 @@ NTSTATUS WINAPI NtQueryVolumeInformationFile( HANDLE handle, IO_STATUS_BLOCK *io
                     fs_type = MOUNTMGR_FS_TYPE_ISO9660;
                 else if (!strcmp( stfs.f_fstypename, "udf" ))
                     fs_type = MOUNTMGR_FS_TYPE_UDF;
-                else if (!strcmp( stfs.f_fstypename, "msdos" ))
+                else if (!strcmp( stfs.f_fstypename, "msdos" )) /* FreeBSD < 5, Apple */
+                    fs_type = MOUNTMGR_FS_TYPE_FAT32;
+                else if (!strcmp( stfs.f_fstypename, "msdosfs" )) /* FreeBSD >= 5 */
                     fs_type = MOUNTMGR_FS_TYPE_FAT32;
 #endif
             }

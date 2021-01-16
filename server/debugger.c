@@ -79,6 +79,7 @@ static const struct object_ops debug_event_ops =
     no_map_access,                 /* map_access */
     default_get_sd,                /* get_sd */
     default_set_sd,                /* set_sd */
+    no_get_full_name,              /* get_full_name */
     no_lookup_name,                /* lookup_name */
     no_link_name,                  /* link_name */
     NULL,                          /* unlink_name */
@@ -106,6 +107,7 @@ static const struct object_ops debug_ctx_ops =
     no_map_access,                 /* map_access */
     default_get_sd,                /* get_sd */
     default_set_sd,                /* set_sd */
+    no_get_full_name,              /* get_full_name */
     no_lookup_name,                /* lookup_name */
     no_link_name,                  /* link_name */
     NULL,                          /* unlink_name */
@@ -675,6 +677,7 @@ DECL_HANDLER(continue_debug_event)
     struct process *process;
 
     if (req->status != DBG_EXCEPTION_NOT_HANDLED &&
+        req->status != DBG_EXCEPTION_HANDLED &&
         req->status != DBG_CONTINUE &&
         req->status != DBG_REPLY_LATER)
     {

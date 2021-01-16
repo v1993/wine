@@ -35,6 +35,7 @@
 #undef strncpy
 #include "winbase.h"
 #include "winnls.h"
+#include "winuser.h"
 
 static char *buf_to_string(const unsigned char *bin, int len, int nr)
 {
@@ -114,6 +115,8 @@ static int (__cdecl *p__mbccpy_s)(unsigned char*, size_t, int*, const unsigned c
 static int (__cdecl *p__memicmp)(const char*, const char*, size_t);
 static int (__cdecl *p__memicmp_l)(const char*, const char*, size_t, _locale_t);
 static size_t (__cdecl *p___strncnt)(const char*, size_t);
+static unsigned int (__cdecl *p_mbsnextc_l)(const unsigned char*, _locale_t);
+static int (__cdecl *p_mbscmp_l)(const unsigned char*, const unsigned char*, _locale_t);
 
 int CDECL __STRINGTOLD(_LDOUBLE*, char**, const char*, int);
 
@@ -350,6 +353,11 @@ static void test_mbcp(void)
     expect_eq(_mbsnextc(mbstring), 0xb0b1, int, "%x");
     expect_eq(_mbsnextc(&mbstring[2]), 0xb220, int, "%x");  /* lead + invalid tail */
     expect_eq(_mbsnextc(&mbstring[3]), 0x20, int, "%x");    /* single char */
+
+    if (!p_mbsnextc_l)
+        win_skip("_mbsnextc_l tests\n");
+    else
+        expect_eq(p_mbsnextc_l(mbstring, NULL), 0xb0b1, int, "%x");
 
     /* _mbclen/_mbslen */
     expect_eq(_mbclen(mbstring), 2, int, "%d");
@@ -1095,7 +1103,7 @@ static void test__mbscpy_s(void)
 
 static void test_wcscpy_s(void)
 {
-    static const WCHAR szLongText[] = { 'T','h','i','s','A','L','o','n','g','s','t','r','i','n','g',0 };
+    static const WCHAR szLongText[] = L"ThisALongstring";
     static WCHAR szDest[18];
     static WCHAR szDestShort[8];
     int ret;
@@ -1201,11 +1209,8 @@ static void test_wcscpy_s(void)
 
 static void test__wcsupr_s(void)
 {
-    static const WCHAR mixedString[] = {'M', 'i', 'X', 'e', 'D', 'l', 'o', 'w',
-                                        'e', 'r', 'U', 'P', 'P', 'E', 'R', 0};
-    static const WCHAR expectedString[] = {'M', 'I', 'X', 'E', 'D', 'L', 'O',
-                                           'W', 'E', 'R', 'U', 'P', 'P', 'E',
-                                           'R', 0};
+    static const WCHAR mixedString[] = L"MiXeDlowerUPPER";
+    static const WCHAR expectedString[] = L"MIXEDLOWERUPPER";
     WCHAR testBuffer[2*ARRAY_SIZE(mixedString)];
     int ret;
 
@@ -1288,11 +1293,8 @@ static void test__wcsupr_s(void)
 
 static void test__wcslwr_s(void)
 {
-    static const WCHAR mixedString[] = {'M', 'i', 'X', 'e', 'D', 'l', 'o', 'w',
-                                        'e', 'r', 'U', 'P', 'P', 'E', 'R', 0};
-    static const WCHAR expectedString[] = {'m', 'i', 'x', 'e', 'd', 'l', 'o',
-                                           'w', 'e', 'r', 'u', 'p', 'p', 'e',
-                                           'r', 0};
+    static const WCHAR mixedString[] = L"MiXeDlowerUPPER";
+    static const WCHAR expectedString[] = L"mixedlowerupper";
     WCHAR buffer[2*ARRAY_SIZE(mixedString)];
     int ret;
 
@@ -2035,12 +2037,10 @@ static void test__strtod(void)
 
 static void test_mbstowcs(void)
 {
-    static const wchar_t wSimple[] = { 't','e','x','t',0 };
-    static const wchar_t wHiragana[] = { 0x3042,0x3043,0 };
-    static const wchar_t wEmpty[] = { 0 };
+    static const wchar_t wSimple[] = L"text";
+    static const wchar_t wHiragana[] = L"\x3042\x3043";
     static const char mSimple[] = "text";
     static const char mHiragana[] = { 0x82,0xa0,0x82,0xa1,0 };
-    static const char mEmpty[] = { 0 };
 
     const wchar_t *pwstr;
     wchar_t wOut[6];
@@ -2069,12 +2069,12 @@ static void test_mbstowcs(void)
     ok(!memcmp(wOut, wSimple, 4*sizeof(wchar_t)), "wOut = %s\n", wine_dbgstr_w(wOut));
     ok(wOut[4] == '!', "wOut[4] != \'!\'\n");
 
-    ret = mbstowcs(NULL, mEmpty, 1);
+    ret = mbstowcs(NULL, "", 1);
     ok(ret == 0, "mbstowcs did not return 0, got %d\n", (int)ret);
 
-    ret = mbstowcs(wOut, mEmpty, 1);
+    ret = mbstowcs(wOut, "", 1);
     ok(ret == 0, "mbstowcs did not return 0, got %d\n", (int)ret);
-    ok(!memcmp(wOut, wEmpty, sizeof(wEmpty)), "wOut = %s\n", wine_dbgstr_w(wOut));
+    ok(!wOut[0], "wOut = %s\n", wine_dbgstr_w(wOut));
 
     ret = wcstombs(NULL, wSimple, 0);
     ok(ret == 4, "wcstombs did not return 4\n");
@@ -2087,12 +2087,12 @@ static void test_mbstowcs(void)
     ok(ret == 2, "wcstombs did not return 2\n");
     ok(!memcmp(mOut, mSimple, 5*sizeof(char)), "mOut = %s\n", mOut);
 
-    ret = wcstombs(NULL, wEmpty, 1);
+    ret = wcstombs(NULL, L"", 1);
     ok(ret == 0, "wcstombs did not return 0, got %d\n", (int)ret);
 
-    ret = wcstombs(mOut, wEmpty, 1);
+    ret = wcstombs(mOut, L"", 1);
     ok(ret == 0, "wcstombs did not return 0, got %d\n", (int)ret);
-    ok(!memcmp(mOut, mEmpty, sizeof(mEmpty)), "mOut = %s\n", mOut);
+    ok(!mOut[0], "mOut = %s\n", mOut);
 
     if(!setlocale(LC_ALL, "Japanese_Japan.932")) {
         win_skip("Japanese_Japan.932 locale not available\n");
@@ -2103,9 +2103,9 @@ static void test_mbstowcs(void)
     ok(ret == 2, "mbstowcs did not return 2\n");
     ok(!memcmp(wOut, wHiragana, sizeof(wHiragana)), "wOut = %s\n", wine_dbgstr_w(wOut));
 
-    ret = mbstowcs(wOut, mEmpty, 6);
+    ret = mbstowcs(wOut, "", 6);
     ok(ret == 0, "mbstowcs did not return 0, got %d\n", (int)ret);
-    ok(!memcmp(wOut, wEmpty, sizeof(wEmpty)), "wOut = %s\n", wine_dbgstr_w(wOut));
+    ok(!wOut[0], "wOut = %s\n", wine_dbgstr_w(wOut));
 
     errno = 0xdeadbeef;
     ret = mbstowcs(wOut, mHiragana+1, 5);
@@ -2116,9 +2116,9 @@ static void test_mbstowcs(void)
     ok(ret == 4, "wcstombs did not return 4\n");
     ok(!memcmp(mOut, mHiragana, sizeof(mHiragana)), "mOut = %s\n", mOut);
 
-    ret = wcstombs(mOut, wEmpty, 6);
+    ret = wcstombs(mOut, L"", 6);
     ok(ret == 0, "wcstombs did not return 0, got %d\n", (int)ret);
-    ok(!memcmp(mOut, mEmpty, sizeof(mEmpty)), "mOut = %s\n", mOut);
+    ok(!mOut[0], "mOut = %s\n", mOut);
 
     if(!pmbstowcs_s || !pwcstombs_s) {
         setlocale(LC_ALL, "C");
@@ -2141,10 +2141,10 @@ static void test_mbstowcs(void)
     ok(ret == 3, "mbstowcs_s did not return 3\n");
     ok(!memcmp(wOut, wHiragana, sizeof(wHiragana)), "wOut = %s\n", wine_dbgstr_w(wOut));
 
-    err = pmbstowcs_s(&ret, wOut, 6, mEmpty, _TRUNCATE);
+    err = pmbstowcs_s(&ret, wOut, 6, "", _TRUNCATE);
     ok(err == 0, "err = %d\n", err);
     ok(ret == 1, "mbstowcs_s did not return 1, got %d\n", (int)ret);
-    ok(!memcmp(wOut, wEmpty, sizeof(wEmpty)), "wOut = %s\n", wine_dbgstr_w(wOut));
+    ok(!wOut[0], "wOut = %s\n", wine_dbgstr_w(wOut));
 
     err = pmbstowcs_s(&ret, NULL, 0, mHiragana, 1);
     ok(err == 0, "err = %d\n", err);
@@ -2160,10 +2160,10 @@ static void test_mbstowcs(void)
     ok(ret == 5, "wcstombs_s did not return 5\n");
     ok(!memcmp(mOut, mHiragana, sizeof(mHiragana)), "mOut = %s\n", mOut);
 
-    err = pwcstombs_s(&ret, mOut, 6, wEmpty, _TRUNCATE);
+    err = pwcstombs_s(&ret, mOut, 6, L"", _TRUNCATE);
     ok(err == 0, "err = %d\n", err);
     ok(ret == 1, "wcstombs_s did not return 1, got %d\n", (int)ret);
-    ok(!memcmp(mOut, mEmpty, sizeof(mEmpty)), "mOut = %s\n", mOut);
+    ok(!mOut[0], "mOut = %s\n", mOut);
 
     err = pwcstombs_s(&ret, NULL, 0, wHiragana, 1);
     ok(err == 0, "err = %d\n", err);
@@ -2530,7 +2530,6 @@ static void test__strlwr_s(void)
 
 static void test_wcsncat_s(void)
 {
-    static wchar_t abcW[] = {'a','b','c',0};
     int ret;
     wchar_t dst[4];
     wchar_t src[4];
@@ -2541,7 +2540,7 @@ static void test_wcsncat_s(void)
         return;
     }
 
-    memcpy(src, abcW, sizeof(abcW));
+    wcscpy(src, L"abc");
     dst[0] = 0;
     ret = p_wcsncat_s(NULL, 4, src, 4);
     ok(ret == EINVAL, "err = %d\n", ret);
@@ -2561,7 +2560,7 @@ static void test_wcsncat_s(void)
     ok(ret == STRUNCATE, "err = %d\n", ret);
     ok(dst[0] == 'a' && dst[1] == 0, "dst is %s\n", wine_dbgstr_w(dst));
 
-    memcpy(dst, abcW, sizeof(abcW));
+    wcscpy(dst, L"abc");
     dst[3] = 'd';
     ret = p_wcsncat_s(dst, 4, src, 4);
     ok(ret == EINVAL, "err = %d\n", ret);
@@ -3619,7 +3618,7 @@ static void test__strnset_s(void)
 
 static void test__wcsnset_s(void)
 {
-    wchar_t text[] = { 't','e','x','t',0 };
+    wchar_t text[] = L"text";
     int r;
 
     if(!p__wcsnset_s) {
@@ -3719,6 +3718,15 @@ static void test__mbscmp(void)
 
     ret = _mbscmp(b, a);
     ok(ret == 1, "got %d\n", ret);
+
+    if (!p_mbscmp_l)
+    {
+        win_skip("_mbscmp_l tests\n");
+        return;
+    }
+
+    ret = p_mbscmp_l(a, b, NULL);
+    ok(ret == -1, "got %d\n", ret);
 }
 
 static void test__ismbclx(void)
@@ -4380,6 +4388,59 @@ static void test_SpecialCasing(void)
     }
 }
 
+
+static void test__mbbtype(void)
+{
+    static const char *test_locales[] =
+    {
+        "Arabic_Algeria",
+        "Chinese_China",
+        "English_Australia",
+        "French_Belgium",
+        "German_Austria",
+        "Greek",
+        "Hindi",
+        "Japanese",
+        "Korean",
+        "Polish",
+        "Portuguese_Brazil",
+        "Russian",
+        "Spanish_Argentina",
+        "Swedish_Finland",
+        "Ukrainian",
+        "Vietnamese",
+    };
+
+    int expected, ret;
+    unsigned int c, i;
+
+    for (i = 0; i < ARRAY_SIZE(test_locales); ++i)
+    {
+        setlocale(LC_ALL, test_locales[i]);
+        _setmbcp(_MB_CP_LOCALE);
+        for (c = 0; c < 256; ++c)
+        {
+            if (_ismbblead(c))
+                expected = _MBC_LEAD;
+            else if (isprint(c))
+                expected = _MBC_SINGLE;
+            else
+                expected = _MBC_ILLEGAL;
+
+            ret = _mbbtype(c, 0);
+            ok(ret == expected, "test %u, c %#x, got ret %#x, expected %#x.\n", i, c, ret, expected);
+
+            if (_ismbbtrail(c))
+                expected = _MBC_TRAIL;
+            else
+                expected = _MBC_ILLEGAL;
+
+            ret = _mbbtype(c, 1);
+            ok(ret == expected, "test %u, c %#x, got ret %#x, expected %#x.\n", i, c, ret, expected);
+        }
+    }
+}
+
 START_TEST(string)
 {
     char mem[100];
@@ -4451,6 +4512,8 @@ START_TEST(string)
     p__memicmp = (void*)GetProcAddress(hMsvcrt, "_memicmp");
     p__memicmp_l = (void*)GetProcAddress(hMsvcrt, "_memicmp_l");
     p___strncnt = (void*)GetProcAddress(hMsvcrt, "__strncnt");
+    p_mbsnextc_l = (void*)GetProcAddress(hMsvcrt, "_mbsnextc_l");
+    p_mbscmp_l = (void*)GetProcAddress(hMsvcrt, "_mbscmp_l");
 
     /* MSVCRT memcpy behaves like memmove for overlapping moves,
        MFC42 CString::Insert seems to rely on that behaviour */
@@ -4532,4 +4595,5 @@ START_TEST(string)
     test_wcscmp();
     test___STRINGTOLD();
     test_SpecialCasing();
+    test__mbbtype();
 }

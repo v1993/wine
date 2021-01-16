@@ -104,7 +104,7 @@ static inline ULONGLONG monotonic_counter(void)
         return ts.tv_sec * (ULONGLONG)TICKSPERSEC + ts.tv_nsec / 100;
 #endif
     gettimeofday( &now, 0 );
-    return now.tv_sec * (ULONGLONG)TICKSPERSEC + now.tv_usec * 10 + TICKS_1601_TO_1970 - server_start_time;
+    return ticks_from_time_t( now.tv_sec ) + now.tv_usec * 10 - server_start_time;
 }
 
 
@@ -1392,8 +1392,7 @@ NTSTATUS WINAPI NtQuerySystemTime( LARGE_INTEGER *time )
 
     if (!clock_gettime( clock_id, &ts ))
     {
-        time->QuadPart = ts.tv_sec * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
-        time->QuadPart += (ts.tv_nsec + 50) / 100;
+        time->QuadPart = ticks_from_time_t( ts.tv_sec ) + (ts.tv_nsec + 50) / 100;
     }
     else
 #endif /* HAVE_CLOCK_GETTIME */
@@ -1401,8 +1400,7 @@ NTSTATUS WINAPI NtQuerySystemTime( LARGE_INTEGER *time )
         struct timeval now;
 
         gettimeofday( &now, 0 );
-        time->QuadPart = now.tv_sec * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970;
-        time->QuadPart += now.tv_usec * 10;
+        time->QuadPart = ticks_from_time_t( now.tv_sec ) + now.tv_usec * 10;
     }
     return STATUS_SUCCESS;
 }
@@ -1475,10 +1473,10 @@ LONGLONG WINAPI RtlGetSystemTimePrecise(void)
     struct timespec ts;
 
     if (!clock_gettime( CLOCK_REALTIME, &ts ))
-        return ts.tv_sec * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970 + (ts.tv_nsec + 50) / 100;
+        return ticks_from_time_t( ts.tv_sec ) + (ts.tv_nsec + 50) / 100;
 #endif
     gettimeofday( &now, 0 );
-    return now.tv_sec * (ULONGLONG)TICKSPERSEC + TICKS_1601_TO_1970 + now.tv_usec * 10;
+    return ticks_from_time_t( now.tv_sec ) + now.tv_usec * 10;
 }
 
 
@@ -2663,10 +2661,10 @@ NTSTATUS WINAPI RtlWaitOnAddress( const void *addr, const void *cmp, SIZE_T size
     if ((ret = fast_wait_addr( addr, cmp, size, timeout )) != STATUS_NOT_IMPLEMENTED)
         return ret;
 
-    pthread_mutex_lock( &addr_mutex );
+    mutex_lock( &addr_mutex );
     if (!compare_addr( addr, cmp, size ))
     {
-        pthread_mutex_unlock( &addr_mutex );
+        mutex_unlock( &addr_mutex );
         return STATUS_SUCCESS;
     }
 
@@ -2693,9 +2691,9 @@ void WINAPI RtlWakeAddressAll( const void *addr )
 {
     if (fast_wake_addr( addr ) != STATUS_NOT_IMPLEMENTED) return;
 
-    pthread_mutex_lock( &addr_mutex );
+    mutex_lock( &addr_mutex );
     while (NtReleaseKeyedEvent( 0, addr, 0, &zero_timeout ) == STATUS_SUCCESS) {}
-    pthread_mutex_unlock( &addr_mutex );
+    mutex_unlock( &addr_mutex );
 }
 
 /***********************************************************************
@@ -2705,7 +2703,7 @@ void WINAPI RtlWakeAddressSingle( const void *addr )
 {
     if (fast_wake_addr( addr ) != STATUS_NOT_IMPLEMENTED) return;
 
-    pthread_mutex_lock( &addr_mutex );
+    mutex_lock( &addr_mutex );
     NtReleaseKeyedEvent( 0, addr, 0, &zero_timeout );
-    pthread_mutex_unlock( &addr_mutex );
+    mutex_unlock( &addr_mutex );
 }

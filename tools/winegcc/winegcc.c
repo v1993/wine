@@ -141,6 +141,7 @@ static const char* app_loader_template =
 
 static const char *output_file_name;
 static const char *output_debug_file;
+static const char *output_implib;
 static int keep_generated = 0;
 static strarray* tmp_files;
 #ifdef HAVE_SIGSET_T
@@ -231,6 +232,7 @@ struct options
     const char* entry_point;
     const char* prelink;
     const char* debug_file;
+    const char* out_implib;
     strarray* prefix;
     strarray* lib_dirs;
     strarray* args;
@@ -273,6 +275,7 @@ static void cleanup_output_files(void)
 {
     if (output_file_name) unlink( output_file_name );
     if (output_debug_file) unlink( output_debug_file );
+    if (output_implib) unlink( output_implib );
 }
 
 static void clean_temp_files(void)
@@ -522,6 +525,9 @@ static strarray *get_link_args( struct options *opts, const char *output_name )
         if (opts->debug_file && strendswith(opts->debug_file, ".pdb"))
             strarray_add(link_args, strmake("-Wl,-pdb,%s", opts->debug_file));
 
+        if (opts->out_implib)
+            strarray_add(link_args, strmake("-Wl,--out-implib,%s", opts->out_implib));
+
         if (!try_link( opts->prefix, link_args, "-Wl,--file-alignment,0x1000" ))
             strarray_add( link_args, strmake( "-Wl,--file-alignment,%s",
                                               opts->file_align ? opts->file_align : "0x1000" ));
@@ -554,6 +560,10 @@ static strarray *get_link_args( struct options *opts, const char *output_name )
             strarray_add(link_args, "-Wl,-debug");
             strarray_add(link_args, strmake("-Wl,-pdb:%s", opts->debug_file));
         }
+
+        if (opts->out_implib)
+            strarray_add(link_args, strmake("-Wl,-implib:%s", opts->out_implib));
+
         else if (!opts->strip)
             strarray_add(link_args, "-Wl,-debug:dwarf");
         strarray_add( link_args, strmake( "-Wl,-filealign:%s", opts->file_align ? opts->file_align : "0x1000" ));
@@ -628,7 +638,7 @@ static const char *get_multiarch_dir( enum target_cpu cpu )
 static char *get_lib_dir( struct options *opts )
 {
     const char *stdlibpath[] = { libdir, LIBDIR, "/usr/lib", "/usr/local/lib", "/lib" };
-    static const char libwine[] = "/libwine.so";
+    static const char ntdll[] = "/wine/ntdll.so";
     const char *bit_suffix, *other_bit_suffix, *build_multiarch, *target_multiarch;
     const char *root = opts->sysroot ? opts->sysroot : "";
     unsigned int i;
@@ -648,31 +658,31 @@ static char *get_lib_dir( struct options *opts )
 
         if (!stdlibpath[i]) continue;
         buffer = xmalloc( strlen(root) + strlen(stdlibpath[i]) +
-                          strlen("/arm-linux-gnueabi") + strlen(libwine) + 1 );
+                          strlen("/arm-linux-gnueabi") + strlen(ntdll) + 1 );
         strcpy( buffer, root );
         strcat( buffer, stdlibpath[i] );
         p = buffer + strlen(buffer);
         while (p > buffer && p[-1] == '/') p--;
-        strcpy( p, libwine );
+        strcpy( p, ntdll );
         if (check_platform( opts, buffer )) goto found;
         if (p > buffer + 2 && (!memcmp( p - 2, "32", 2 ) || !memcmp( p - 2, "64", 2 )))
         {
             p -= 2;
-            strcpy( p, libwine );
+            strcpy( p, ntdll );
             if (check_platform( opts, buffer )) goto found;
         }
         strcpy( p, bit_suffix );
-        strcat( p, libwine );
+        strcat( p, ntdll );
         if (check_platform( opts, buffer )) goto found;
         strcpy( p, target_multiarch );
-        strcat( p, libwine );
+        strcat( p, ntdll );
         if (check_platform( opts, buffer )) goto found;
 
         strcpy( buffer, root );
         strcat( buffer, stdlibpath[i] );
         p = buffer + strlen(buffer);
         while (p > buffer && p[-1] == '/') p--;
-        strcpy( p, libwine );
+        strcpy( p, ntdll );
 
         /* try to fixup each parent dirs named lib, lib32 or lib64 with target bitness suffix */
         while (p > buffer)
@@ -714,7 +724,7 @@ static char *get_lib_dir( struct options *opts )
         continue;
 
     found:
-        buffer[strlen(buffer) - strlen(libwine)] = 0;
+        buffer[strlen(buffer) - strlen(ntdll)] = 0;
         return buffer;
     }
     return strmake( "%s%s", root, LIBDIR );
@@ -1085,7 +1095,7 @@ static void add_library( struct options *opts, strarray *lib_dirs, strarray *fil
 static void build(struct options* opts)
 {
     strarray *lib_dirs, *files;
-    strarray *spec_args, *link_args, *tool;
+    strarray *spec_args, *link_args, *implib_args, *tool;
     char *output_file, *output_path;
     const char *spec_o_name, *libgcc = NULL;
     const char *output_name, *spec_file, *lang;
@@ -1219,12 +1229,18 @@ static void build(struct options* opts)
         add_library(opts, lib_dirs, files, "user32");
     }
 
-    if (!opts->nodefaultlibs)
+    if (!opts->nodefaultlibs && !opts->unix_lib)
     {
         add_library(opts, lib_dirs, files, "winecrt0");
         if (opts->use_msvcrt)
         {
-            if (!crt_lib) add_library(opts, lib_dirs, files, "ucrtbase");
+            if (!crt_lib)
+            {
+                if (strncmp( output_name, "msvcr", 5 ) &&
+                    strncmp( output_name, "ucrt", 4 ) &&
+                    strcmp( output_name, "crtdll.dll" ))
+                    add_library(opts, lib_dirs, files, "ucrtbase");
+            }
             else strarray_add(files, strmake("-a%s", crt_lib));
         }
         if (opts->win16_app) add_library(opts, lib_dirs, files, "kernel");
@@ -1239,8 +1255,6 @@ static void build(struct options* opts)
             entry_point = (is_pe && opts->target_cpu == CPU_x86) ? "DriverEntry@8" : "DriverEntry";
         else if (opts->use_msvcrt && !opts->shared && !opts->win16_app)
             entry_point = opts->unicode_app ? "wmainCRTStartup" : "mainCRTStartup";
-        else if (!is_pe && !opts->shared && opts->unicode_app)
-            entry_point = "__wine_spec_exe_wentry";
     }
     else entry_point = opts->entry_point;
 
@@ -1252,6 +1266,8 @@ static void build(struct options* opts)
     spec_o_name = get_temp_file(output_name, ".spec.o");
     if (opts->force_pointer_size)
         strarray_add(spec_args, strmake("-m%u", 8 * opts->force_pointer_size ));
+    if(opts->unicode_app)
+        strarray_add(spec_args, "-municode");
     strarray_add(spec_args, "-D_REENTRANT");
     if (opts->pic && !is_pe) strarray_add(spec_args, "-fPIC");
     strarray_add(spec_args, opts->shared ? "--dll" : "--exe");
@@ -1424,6 +1440,7 @@ static void build(struct options* opts)
 
     output_file_name = output_path;
     output_debug_file = opts->debug_file;
+    output_implib = opts->out_implib;
     atexit( cleanup_output_files );
 
     spawn(opts->prefix, link_args, 0);
@@ -1452,6 +1469,26 @@ static void build(struct options* opts)
         strarray_add(tool, output_path);
         spawn(opts->prefix, tool, 0);
         strarray_free(tool);
+    }
+
+    if (opts->out_implib && !is_pe)
+    {
+        if (!spec_file)
+            error("--out-implib requires a .spec or .def file\n");
+
+        implib_args = get_winebuild_args( opts );
+        if ((tool = build_tool_name( opts, TOOL_CC ))) strarray_add( implib_args, strmake( "--cc-cmd=%s", strarray_tostring( tool, " " )));
+        if ((tool = build_tool_name( opts, TOOL_LD ))) strarray_add( implib_args, strmake( "--ld-cmd=%s", strarray_tostring( tool, " " )));
+
+        strarray_add(implib_args, "--implib");
+        strarray_add(implib_args, "-o");
+        strarray_add(implib_args, opts->out_implib);
+        strarray_add(implib_args, "--export");
+        strarray_add(implib_args, spec_file);
+        strarray_addall(implib_args, opts->winebuild_args);
+
+        spawn(opts->prefix, implib_args, 0);
+        strarray_free (implib_args);
     }
 
     /* set the base address with prelink if linker support is not present */
@@ -1966,6 +2003,11 @@ int main(int argc, char **argv)
                                 strarray_add( opts.files, strmake( "-Wl,%s", Wl->base[j] ));
                                 continue;
                             }
+                            if (!strcmp(Wl->base[j], "--out-implib"))
+                            {
+                                opts.out_implib = strdup( Wl->base[++j] );
+                                continue;
+                            }
                             if (!strcmp(Wl->base[j], "-static")) linking = -1;
                             strarray_add(opts.linker_args, strmake("-Wl,%s",Wl->base[j]));
                         }
@@ -2050,5 +2092,6 @@ int main(int argc, char **argv)
 
     output_file_name = NULL;
     output_debug_file = NULL;
+    output_implib = NULL;
     return 0;
 }

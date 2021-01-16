@@ -74,6 +74,9 @@
 #  define _POSIX_SPAWN_DISABLE_ASLR 0x0100
 # endif
 #endif
+#ifdef __ANDROID__
+# include <jni.h>
+#endif
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -123,6 +126,8 @@ const char *build_dir = NULL;
 const char *config_dir = NULL;
 const char **dll_paths = NULL;
 const char *user_name = NULL;
+static HMODULE ntdll_module;
+static const IMAGE_EXPORT_DIRECTORY *ntdll_exports;
 
 struct file_id
 {
@@ -136,6 +141,7 @@ struct builtin_module
     struct file_id id;
     void          *handle;
     void          *module;
+    void          *unix_handle;
 };
 
 static struct list builtin_modules = LIST_INIT( builtin_modules );
@@ -146,6 +152,7 @@ static NTSTATUS add_builtin_module( void *module, void *handle, const struct sta
     if (!(builtin = malloc( sizeof(*builtin) ))) return STATUS_NO_MEMORY;
     builtin->handle = handle;
     builtin->module = module;
+    builtin->unix_handle = NULL;
     if (st)
     {
         builtin->id.dev = st->st_dev;
@@ -212,7 +219,18 @@ static void set_max_limit( int limit )
     if (!getrlimit( limit, &rlimit ))
     {
         rlimit.rlim_cur = rlimit.rlim_max;
-        setrlimit( limit, &rlimit );
+        if (setrlimit( limit, &rlimit ) != 0)
+        {
+#if defined(__APPLE__) && defined(RLIMIT_NOFILE) && defined(OPEN_MAX)
+            /* On Leopard, setrlimit(RLIMIT_NOFILE, ...) fails on attempts to set
+             * rlim_cur above OPEN_MAX (even if rlim_max > OPEN_MAX). */
+            if (limit == RLIMIT_NOFILE && rlimit.rlim_cur > OPEN_MAX)
+            {
+                rlimit.rlim_cur = OPEN_MAX;
+                setrlimit( limit, &rlimit );
+            }
+#endif
+        }
     }
 }
 
@@ -324,7 +342,7 @@ static void set_config_dir(void)
     }
 }
 
-static void init_paths( int argc, char *argv[], char *envp[] )
+static void init_paths( char *argv[] )
 {
     Dl_info info;
 
@@ -335,7 +353,7 @@ static void init_paths( int argc, char *argv[], char *envp[] )
 
     if (!(build_dir = remove_tail( dll_dir, "/dlls/ntdll" )))
     {
-#if defined(__linux__) || defined(__FreeBSD_kernel__) || defined(__NetBSD__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__FreeBSD_kernel__) || defined(__NetBSD__)
         bin_dir = realpath_dirname( "/proc/self/exe" );
 #elif defined (__FreeBSD__) || defined(__DragonFly__)
         bin_dir = realpath_dirname( "/proc/curproc/file" );
@@ -771,11 +789,80 @@ static ULONG_PTR find_named_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY
     return 0;
 }
 
+static ULONG_PTR find_pe_export( HMODULE module, const IMAGE_EXPORT_DIRECTORY *exports,
+                                 const IMAGE_IMPORT_BY_NAME *name )
+{
+    const WORD *ordinals = (const WORD *)((BYTE *)module + exports->AddressOfNameOrdinals);
+    const DWORD *names = (const DWORD *)((BYTE *)module + exports->AddressOfNames);
+
+    if (name->Hint < exports->NumberOfNames)
+    {
+        char *ename = (char *)module + names[name->Hint];
+        if (!strcmp( ename, (char *)name->Name ))
+            return find_ordinal_export( module, exports, ordinals[name->Hint] );
+    }
+    return find_named_export( module, exports, (char *)name->Name );
+}
+
+static inline void *get_rva( void *module, ULONG_PTR addr )
+{
+    return (BYTE *)module + addr;
+}
+
+static NTSTATUS fixup_ntdll_imports( const char *name, HMODULE module )
+{
+    const IMAGE_NT_HEADERS *nt;
+    const IMAGE_IMPORT_DESCRIPTOR *descr;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_THUNK_DATA *import_list;
+    IMAGE_THUNK_DATA *thunk_list;
+
+    nt = get_rva( module, ((IMAGE_DOS_HEADER *)module)->e_lfanew );
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_FILE_IMPORT_DIRECTORY];
+    if (!dir->VirtualAddress || !dir->Size) return STATUS_SUCCESS;
+
+    descr = get_rva( module, dir->VirtualAddress );
+    for (; descr->Name && descr->FirstThunk; descr++)
+    {
+        thunk_list = get_rva( module, descr->FirstThunk );
+
+        /* ntdll must be the only import */
+        if (strcmp( get_rva( module, descr->Name ), "ntdll.dll" ))
+        {
+            ERR( "module %s is importing %s\n", debugstr_a(name), (char *)get_rva( module, descr->Name ));
+            return STATUS_PROCEDURE_NOT_FOUND;
+        }
+        if (descr->u.OriginalFirstThunk)
+            import_list = get_rva( module, descr->u.OriginalFirstThunk );
+        else
+            import_list = thunk_list;
+
+        while (import_list->u1.Ordinal)
+        {
+            if (IMAGE_SNAP_BY_ORDINAL( import_list->u1.Ordinal ))
+            {
+                int ordinal = IMAGE_ORDINAL( import_list->u1.Ordinal ) - ntdll_exports->Base;
+                thunk_list->u1.Function = find_ordinal_export( ntdll_module, ntdll_exports, ordinal );
+                if (!thunk_list->u1.Function) ERR( "%s: ntdll.%u not found\n", debugstr_a(name), ordinal );
+            }
+            else  /* import by name */
+            {
+                IMAGE_IMPORT_BY_NAME *pe_name = get_rva( module, import_list->u1.AddressOfData );
+                thunk_list->u1.Function = find_pe_export( ntdll_module, ntdll_exports, pe_name );
+                if (!thunk_list->u1.Function) ERR( "%s: ntdll.%s not found\n", debugstr_a(name), pe_name->Name );
+            }
+            import_list++;
+            thunk_list++;
+        }
+    }
+    return STATUS_SUCCESS;
+}
+
 static void load_ntdll_functions( HMODULE module )
 {
-    const IMAGE_EXPORT_DIRECTORY *ntdll_exports = get_export_dir( module );
     void **ptr;
 
+    ntdll_exports = get_export_dir( module );
     assert( ntdll_exports );
 
 #define GET_FUNC(name) \
@@ -840,7 +927,9 @@ static void load_libwine(void)
     if (build_dir) path = build_path( build_dir, "libs/wine/" LIBWINE );
     else path = build_path( dll_dir, "../" LIBWINE );
 
-    if (!(handle = dlopen( path, RTLD_NOW )) && !(handle = dlopen( LIBWINE, RTLD_NOW ))) return;
+    handle = dlopen( path, RTLD_NOW );
+    free( path );
+    if (!handle && !(handle = dlopen( LIBWINE, RTLD_NOW ))) return;
 
     p_wine_dll_set_callback = dlsym( handle, "wine_dll_set_callback" );
     p___wine_main_argc      = dlsym( handle, "__wine_main_argc" );
@@ -912,6 +1001,56 @@ already_loaded:
     *ret_module = builtin->module;
     dlclose( handle );
     return STATUS_SUCCESS;
+}
+
+
+/***********************************************************************
+ *           dlopen_unix_dll
+ */
+static NTSTATUS dlopen_unix_dll( void *module, const char *name, void **unix_entry )
+{
+    struct builtin_module *builtin;
+    void *unix_module, *handle, *entry;
+    const IMAGE_NT_HEADERS *nt;
+    NTSTATUS status = STATUS_INVALID_IMAGE_FORMAT;
+
+    handle = dlopen( name, RTLD_NOW );
+    if (!handle) return STATUS_DLL_NOT_FOUND;
+    if (!(nt = dlsym( handle, "__wine_spec_nt_header" ))) goto done;
+    if (!(entry = dlsym( handle, "__wine_init_unix_lib" ))) goto done;
+
+    unix_module = (HMODULE)((nt->OptionalHeader.ImageBase + 0xffff) & ~0xffff);
+    LIST_FOR_EACH_ENTRY( builtin, &builtin_modules, struct builtin_module, entry )
+    {
+        if (builtin->module == module)
+        {
+            if (builtin->unix_handle == handle)  /* already loaded */
+            {
+                *unix_entry = entry;
+                status = STATUS_SUCCESS;
+                goto done;
+            }
+            if (builtin->unix_handle)
+            {
+                ERR( "module %p already has a Unix module that's not %s\n", module, debugstr_a(name) );
+                goto done;
+            }
+            if ((status = map_so_dll( nt, unix_module ))) goto done;
+            if ((status = fixup_ntdll_imports( name, unix_module ))) goto done;
+            builtin->unix_handle = handle;
+            *unix_entry = entry;
+            return STATUS_SUCCESS;
+        }
+        else if (builtin->unix_handle == handle)
+        {
+            ERR( "%s already loaded for module %p\n", debugstr_a(name), module );
+            goto done;
+        }
+    }
+    ERR( "builtin module not found for %s\n", debugstr_a(name) );
+done:
+    dlclose( handle );
+    return status;
 }
 
 
@@ -1125,11 +1264,11 @@ static NTSTATUS open_builtin_file( char *name, void **module, SECTION_IMAGE_INFO
 /***********************************************************************
  *           load_builtin_dll
  */
-static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module,
+static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module, void **unix_entry,
                                         SECTION_IMAGE_INFORMATION *image_info )
 {
     unsigned int i, pos, len, namelen, maxlen = 0;
-    char *ptr, *file;
+    char *ptr = NULL, *file, *ext = NULL;
     NTSTATUS status = STATUS_DLL_NOT_FOUND;
     BOOL found_image = FALSE;
 
@@ -1146,6 +1285,7 @@ static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module,
         if (name[i] > 127) goto done;
         file[pos + i] = (char)name[i];
         if (file[pos + i] >= 'A' && file[pos + i] <= 'Z') file[pos + i] += 'a' - 'A';
+        else if (file[pos + i] == '.') ext = file + pos + i;
     }
     file[--pos] = '/';
 
@@ -1155,7 +1295,7 @@ static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module,
         ptr = file + pos;
         namelen = len + 1;
         file[pos + len + 1] = 0;
-        if (namelen > 4 && !memcmp( ptr + namelen - 4, ".dll", 4 )) namelen -= 4;
+        if (ext && !strcmp( ext, ".dll" )) namelen -= 4;
         ptr = prepend( ptr, ptr, namelen );
         ptr = prepend( ptr, "/dlls", sizeof("/dlls") - 1 );
         ptr = prepend( ptr, build_dir, strlen(build_dir) );
@@ -1166,7 +1306,7 @@ static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module,
         ptr = file + pos;
         namelen = len + 1;
         file[pos + len + 1] = 0;
-        if (namelen > 4 && !memcmp( ptr + namelen - 4, ".exe", 4 )) namelen -= 4;
+        if (ext && !strcmp( ext, ".exe" )) namelen -= 4;
         ptr = prepend( ptr, ptr, namelen );
         ptr = prepend( ptr, "/programs", sizeof("/programs") - 1 );
         ptr = prepend( ptr, build_dir, strlen(build_dir) );
@@ -1187,6 +1327,11 @@ static NTSTATUS CDECL load_builtin_dll( const WCHAR *name, void **module,
     WARN( "cannot find builtin library for %s\n", debugstr_w(name) );
 
 done:
+    if (!status && ext)
+    {
+        strcpy( ext, ".so" );
+        dlopen_unix_dll( *module, ptr, unix_entry );
+    }
     free( file );
     return status;
 }
@@ -1204,6 +1349,7 @@ static NTSTATUS CDECL unload_builtin_dll( void *module )
         if (builtin->module != module) continue;
         list_remove( &builtin->entry );
         if (builtin->handle) dlclose( builtin->handle );
+        if (builtin->unix_handle) dlclose( builtin->unix_handle );
         free( builtin );
         return STATUS_SUCCESS;
     }
@@ -1274,7 +1420,7 @@ found:
 
 #ifdef __FreeBSD__
         /* On older FreeBSD versions, l_addr was the absolute load address, now it's the relocation offset. */
-        if (!dlsym(RTLD_DEFAULT, "_rtld_version_laddr_offset"))
+        if (offsetof(struct link_map, l_addr) == 0)
             if (!get_relocbase(map->l_addr, &relocbase)) return;
 #endif
         switch (dyn->d_tag)
@@ -1302,27 +1448,16 @@ found:
 static void load_ntdll(void)
 {
     NTSTATUS status;
-    void *module;
-    int fd;
-    char *name = build_path( dll_dir, "ntdll.dll" );
+    SECTION_IMAGE_INFORMATION info;
+    void *module = NULL;
+    char *name = build_path( dll_dir, "ntdll.dll.so" );
 
-    if ((fd = open( name, O_RDONLY )) != -1)
-    {
-        struct stat st;
-        fstat( fd, &st );
-        if (!(status = virtual_map_ntdll( fd, &module )))
-            add_builtin_module( module, NULL, &st );
-        close( fd );
-    }
-    else
-    {
-        free( name );
-        name = build_path( dll_dir, "ntdll.dll.so" );
-        status = dlopen_dll( name, &module );
-    }
+    name[strlen(name) - 3] = 0;  /* remove .so */
+    status = open_builtin_file( name, &module, &info );
     if (status) fatal_error( "failed to load %s error %x\n", name, status );
     free( name );
     load_ntdll_functions( module );
+    ntdll_module = module;
 }
 
 
@@ -1440,11 +1575,131 @@ static void start_main_thread(void)
     init_cpu_info();
     init_files();
     NtCreateKeyedEvent( &keyed_event, GENERIC_READ | GENERIC_WRITE, NULL, 0 );
+    load_ntdll();
+    load_libwine();
     status = p__wine_set_unix_funcs( NTDLL_UNIXLIB_VERSION, &unix_funcs );
     if (status) exec_process( status );
     server_init_process_done();
 }
 
+#ifdef __ANDROID__
+
+#ifndef WINE_JAVA_CLASS
+#define WINE_JAVA_CLASS "org/winehq/wine/WineActivity"
+#endif
+
+JavaVM *java_vm = NULL;
+jobject java_object = 0;
+unsigned short java_gdt_sel = 0;
+
+/* main Wine initialisation */
+static jstring wine_init_jni( JNIEnv *env, jobject obj, jobjectArray cmdline, jobjectArray environment )
+{
+    char **argv;
+    char *str;
+    char error[1024];
+    int i, argc, length;
+
+    /* get the command line array */
+
+    argc = (*env)->GetArrayLength( env, cmdline );
+    for (i = length = 0; i < argc; i++)
+    {
+        jobject str_obj = (*env)->GetObjectArrayElement( env, cmdline, i );
+        length += (*env)->GetStringUTFLength( env, str_obj ) + 1;
+    }
+
+    argv = malloc( (argc + 1) * sizeof(*argv) + length );
+    str = (char *)(argv + argc + 1);
+    for (i = 0; i < argc; i++)
+    {
+        jobject str_obj = (*env)->GetObjectArrayElement( env, cmdline, i );
+        length = (*env)->GetStringUTFLength( env, str_obj );
+        (*env)->GetStringUTFRegion( env, str_obj, 0,
+                                    (*env)->GetStringLength( env, str_obj ), str );
+        argv[i] = str;
+        str[length] = 0;
+        str += length + 1;
+    }
+    argv[argc] = NULL;
+
+    /* set the environment variables */
+
+    if (environment)
+    {
+        int count = (*env)->GetArrayLength( env, environment );
+        for (i = 0; i < count - 1; i += 2)
+        {
+            jobject var_obj = (*env)->GetObjectArrayElement( env, environment, i );
+            jobject val_obj = (*env)->GetObjectArrayElement( env, environment, i + 1 );
+            const char *var = (*env)->GetStringUTFChars( env, var_obj, NULL );
+
+            if (val_obj)
+            {
+                const char *val = (*env)->GetStringUTFChars( env, val_obj, NULL );
+                setenv( var, val, 1 );
+                if (!strcmp( var, "LD_LIBRARY_PATH" ))
+                {
+                    void (*update_func)( const char * ) = dlsym( RTLD_DEFAULT,
+                                                                 "android_update_LD_LIBRARY_PATH" );
+                    if (update_func) update_func( val );
+                }
+                else if (!strcmp( var, "WINEDEBUGLOG" ))
+                {
+                    int fd = open( val, O_WRONLY | O_CREAT | O_APPEND, 0666 );
+                    if (fd != -1)
+                    {
+                        dup2( fd, 2 );
+                        close( fd );
+                    }
+                }
+                (*env)->ReleaseStringUTFChars( env, val_obj, val );
+            }
+            else unsetenv( var );
+
+            (*env)->ReleaseStringUTFChars( env, var_obj, var );
+        }
+    }
+
+    java_object = (*env)->NewGlobalRef( env, obj );
+
+    init_paths( argv );
+    virtual_init();
+    init_environment( argc, argv, environ );
+
+#ifdef __i386__
+    {
+        unsigned short java_fs;
+        __asm__( "mov %%fs,%0" : "=r" (java_fs) );
+        if (!(java_fs & 4)) java_gdt_sel = java_fs;
+        __asm__( "mov %0,%%fs" :: "r" (0) );
+        start_main_thread();
+        __asm__( "mov %0,%%fs" :: "r" (java_fs) );
+    }
+#else
+    start_main_thread();
+#endif
+    return (*env)->NewStringUTF( env, error );
+}
+
+jint JNI_OnLoad( JavaVM *vm, void *reserved )
+{
+    static const JNINativeMethod method =
+    {
+        "wine_init", "([Ljava/lang/String;[Ljava/lang/String;)Ljava/lang/String;", wine_init_jni
+    };
+
+    JNIEnv *env;
+    jclass class;
+
+    java_vm = vm;
+    if ((*vm)->AttachCurrentThread( vm, &env, NULL ) != JNI_OK) return JNI_ERR;
+    if (!(class = (*env)->FindClass( env, WINE_JAVA_CLASS ))) return JNI_ERR;
+    (*env)->RegisterNatives( env, class, &method, 1 );
+    return JNI_VERSION_1_6;
+}
+
+#endif  /* __ANDROID__ */
 
 #ifdef __APPLE__
 static void *apple_wine_thread( void *arg )
@@ -1623,7 +1878,7 @@ static void check_command_line( int argc, char *argv[] )
  */
 void __wine_main( int argc, char *argv[], char *envp[] )
 {
-    init_paths( argc, argv, envp );
+    init_paths( argv );
 
     if (!getenv( "WINELOADERNOEXEC" ))  /* first time around */
     {
@@ -1648,10 +1903,7 @@ void __wine_main( int argc, char *argv[], char *envp[] )
 #endif
 
     virtual_init();
-    load_ntdll();
-
     init_environment( argc, argv, envp );
-    load_libwine();
 
 #ifdef __APPLE__
     apple_main_thread();

@@ -37,9 +37,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(vbscript);
 const GUID GUID_CUSTOM_CONFIRMOBJECTSAFETY =
     {0x10200490,0xfa38,0x11d0,{0xac,0x0e,0x00,0xa0,0xc9,0xf,0xff,0xc0}};
 
-static const WCHAR emptyW[] = {0};
-static const WCHAR vbscriptW[] = {'V','B','S','c','r','i','p','t',0};
-
 #define BP_GET      1
 #define BP_GETPUT   2
 
@@ -600,21 +597,21 @@ static HRESULT show_msgbox(script_ctx_t *ctx, BSTR prompt, unsigned type, BSTR o
         if(orig_title && *orig_title) {
             WCHAR *ptr;
 
-            title = title_buf = heap_alloc(sizeof(vbscriptW) + (lstrlenW(orig_title)+2)*sizeof(WCHAR));
+            title = title_buf = heap_alloc(sizeof(L"VBScript") + (lstrlenW(orig_title)+2)*sizeof(WCHAR));
             if(!title)
                 return E_OUTOFMEMORY;
 
-            memcpy(title_buf, vbscriptW, sizeof(vbscriptW));
-            ptr = title_buf + ARRAY_SIZE(vbscriptW)-1;
+            memcpy(title_buf, L"VBScript", sizeof(L"VBScript"));
+            ptr = title_buf + ARRAY_SIZE(L"VBScript")-1;
 
             *ptr++ = ':';
             *ptr++ = ' ';
             lstrcpyW(ptr, orig_title);
         }else {
-            title = vbscriptW;
+            title = L"VBScript";
         }
     }else {
-        title = orig_title ? orig_title : emptyW;
+        title = orig_title ? orig_title : L"";
     }
 
     hres = IActiveScriptSiteWindow_GetWindow(acts_window, &hwnd);
@@ -1749,10 +1746,27 @@ static HRESULT Global_Asc(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VA
         str = conv_str;
     }
 
-    if(!SysStringLen(str) || *str >= 0x100)
+    if(!SysStringLen(str))
         hres = MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
-    else if(res)
-        hres = return_short(res, *str);
+    else {
+        unsigned char buf[2];
+        short val = 0;
+        int n = WideCharToMultiByte(CP_ACP, 0, str, 1, (char*)buf, sizeof(buf), NULL, NULL);
+        switch(n) {
+        case 1:
+            val = buf[0];
+            break;
+        case 2:
+            val = (buf[0] << 8) | buf[1];
+            break;
+        default:
+            WARN("Failed to convert %x\n", *str);
+            hres = MAKE_VBSERROR(VBSE_ILLEGAL_FUNC_CALL);
+        }
+        if(SUCCEEDED(hres))
+            hres = return_short(res, val);
+    }
+
     SysFreeString(conv_str);
     return hres;
 }
@@ -2186,19 +2200,6 @@ static HRESULT Global_DatePart(BuiltinDisp *This, VARIANT *arg, unsigned args_cn
 
 static HRESULT Global_TypeName(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
 {
-    static const WCHAR ByteW[]     = {'B', 'y', 't', 'e', 0};
-    static const WCHAR IntegerW[]  = {'I', 'n', 't', 'e', 'g', 'e', 'r', 0};
-    static const WCHAR LongW[]     = {'L', 'o', 'n', 'g', 0};
-    static const WCHAR SingleW[]   = {'S', 'i', 'n', 'g', 'l', 'e', 0};
-    static const WCHAR DoubleW[]   = {'D', 'o', 'u', 'b', 'l', 'e', 0};
-    static const WCHAR CurrencyW[] = {'C', 'u', 'r', 'r', 'e', 'n', 'c', 'y', 0};
-    static const WCHAR DecimalW[]  = {'D', 'e', 'c', 'i', 'm', 'a', 'l', 0};
-    static const WCHAR DateW[]     = {'D', 'a', 't', 'e', 0};
-    static const WCHAR StringW[]   = {'S', 't', 'r', 'i', 'n', 'g', 0};
-    static const WCHAR BooleanW[]  = {'B', 'o', 'o', 'l', 'e', 'a', 'n', 0};
-    static const WCHAR EmptyW[]    = {'E', 'm', 'p', 't', 'y', 0};
-    static const WCHAR NullW[]     = {'N', 'u', 'l', 'l', 0};
-
     TRACE("(%s)\n", debugstr_variant(arg));
 
     assert(args_cnt == 1);
@@ -2208,29 +2209,29 @@ static HRESULT Global_TypeName(BuiltinDisp *This, VARIANT *arg, unsigned args_cn
 
     switch(V_VT(arg)) {
         case VT_UI1:
-            return return_string(res, ByteW);
+            return return_string(res, L"Byte");
         case VT_I2:
-            return return_string(res, IntegerW);
+            return return_string(res, L"Integer");
         case VT_I4:
-            return return_string(res, LongW);
+            return return_string(res, L"Long");
         case VT_R4:
-            return return_string(res, SingleW);
+            return return_string(res, L"Single");
         case VT_R8:
-            return return_string(res, DoubleW);
+            return return_string(res, L"Double");
         case VT_CY:
-            return return_string(res, CurrencyW);
+            return return_string(res, L"Currency");
         case VT_DECIMAL:
-            return return_string(res, DecimalW);
+            return return_string(res, L"Decimal");
         case VT_DATE:
-            return return_string(res, DateW);
+            return return_string(res, L"Date");
         case VT_BSTR:
-            return return_string(res, StringW);
+            return return_string(res, L"String");
         case VT_BOOL:
-            return return_string(res, BooleanW);
+            return return_string(res, L"Boolean");
         case VT_EMPTY:
-            return return_string(res, EmptyW);
+            return return_string(res, L"Empty");
         case VT_NULL:
-            return return_string(res, NullW);
+            return return_string(res, L"Null");
         default:
             FIXME("arg %s not supported\n", debugstr_variant(arg));
             return E_NOTIMPL;
@@ -2299,8 +2300,8 @@ static HRESULT Global_Join(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, V
 
 static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt, VARIANT *res)
 {
-    BSTR str, string, delimeter = NULL;
-    int count, max, mode, len, start, end, ret, delimeterlen = 1;
+    BSTR str, string, delimiter = NULL;
+    int count, max, mode, len, start, end, ret, delimiterlen = 1;
     int i,*indices = NULL, indices_max = 8;
     SAFEARRAYBOUND bounds;
     SAFEARRAY *sa = NULL;
@@ -2325,13 +2326,13 @@ static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
 
     if(args_cnt > 1) {
         if(V_VT(args+1) != VT_BSTR) {
-            hres = to_string(args+1, &delimeter);
+            hres = to_string(args+1, &delimiter);
             if(FAILED(hres))
                 goto error;
         }else {
-            delimeter = V_BSTR(args+1);
+            delimiter = V_BSTR(args+1);
         }
-        delimeterlen = SysStringLen(delimeter);
+        delimiterlen = SysStringLen(delimiter);
     }
 
     if(args_cnt > 2) {
@@ -2371,9 +2372,9 @@ static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
 
     while(1) {
         ret = -1;
-        if (delimeterlen) {
+        if (delimiterlen) {
             ret = FindStringOrdinal(FIND_FROMSTART, string + start, len - start,
-                                    delimeter ? delimeter : L" ", delimeterlen, mode);
+                                    delimiter ? delimiter : L" ", delimiterlen, mode);
         }
 
         if (ret == -1) {
@@ -2393,7 +2394,7 @@ static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
         indices[count++] = end;
 
         if (ret == -1 || count == max) break;
-        start = start + ret + delimeterlen;
+        start = start + ret + delimiterlen;
         if (start > len) break;
     }
 
@@ -2406,7 +2407,6 @@ static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
     }
     hres = SafeArrayAccessData(sa, (void**)&data);
     if(FAILED(hres)) {
-        SafeArrayDestroy(sa);
         goto error;
     }
 
@@ -2423,10 +2423,9 @@ static HRESULT Global_Split(BuiltinDisp *This, VARIANT *args, unsigned args_cnt,
         hres = VariantCopyInd(data+i, &var);
         if(FAILED(hres)) {
             SafeArrayUnaccessData(sa);
-            SafeArrayDestroy(sa);
             goto error;
         }
-        start = indices[i]+delimeterlen;
+        start = indices[i]+delimiterlen;
     }
     SafeArrayUnaccessData(sa);
 
@@ -2435,14 +2434,14 @@ error:
         V_VT(res) = VT_ARRAY|VT_VARIANT;
         V_ARRAY(res) = sa;
     }else {
-        if (sa) SafeArrayDestroy(sa);
+        SafeArrayDestroy(sa);
     }
 
     heap_free(indices);
     if(V_VT(args) != VT_BSTR)
         SysFreeString(string);
-    if(V_VT(args+1) != VT_BSTR)
-        SysFreeString(delimeter);
+    if(args_cnt > 1 && V_VT(args+1) != VT_BSTR)
+        SysFreeString(delimiter);
     return hres;
 }
 
@@ -2650,7 +2649,7 @@ static HRESULT Global_ScriptEngine(BuiltinDisp *This, VARIANT *arg, unsigned arg
 
     assert(args_cnt == 0);
 
-    return return_string(res, vbscriptW);
+    return return_string(res, L"VBScript");
 }
 
 static HRESULT Global_ScriptEngineMajorVersion(BuiltinDisp *This, VARIANT *arg, unsigned args_cnt, VARIANT *res)
@@ -3131,7 +3130,7 @@ static HRESULT Err_Raise(BuiltinDisp *This, VARIANT *args, unsigned args_cnt, VA
     hres = to_int(args, &code);
     if(FAILED(hres))
         return hres;
-    if(code > 0 && code > 0xffff)
+    if(code == 0 || code > 0xffff)
         return E_INVALIDARG;
 
     if(args_cnt >= 2)

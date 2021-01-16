@@ -1241,9 +1241,9 @@ todo_wine
     IWICComponentFactory_Release(factory);
 }
 
-static void test_multi_encoder(const struct bitmap_data **srcs, const CLSID* clsid_encoder,
+static void test_multi_encoder_impl(const struct bitmap_data **srcs, const CLSID* clsid_encoder,
     const struct bitmap_data **dsts, const CLSID *clsid_decoder, WICRect *rc,
-    const struct setting *settings, const char *name, IWICPalette *palette)
+    const struct setting *settings, const char *name, IWICPalette *palette, BOOL set_size)
 {
     const GUID *container_format = NULL;
     HRESULT hr;
@@ -1385,23 +1385,19 @@ static void test_multi_encoder(const struct bitmap_data **srcs, const CLSID* cls
                        (IsEqualGUID(clsid_encoder, &CLSID_WICBmpEncoder) && srcs[i]->bpp == 2 && IsEqualGUID(&pixelformat, &GUID_WICPixelFormat4bppIndexed)),
                         "SetPixelFormat changed the format to %s (%s)\n", wine_dbgstr_guid(&pixelformat), name);
 
-                    hr = IWICBitmapFrameEncode_SetSize(frameencode, srcs[i]->width, srcs[i]->height);
-                    ok(SUCCEEDED(hr), "SetSize failed, hr=%x\n", hr);
+                    if (set_size)
+                    {
+                        hr = IWICBitmapFrameEncode_SetSize(frameencode, srcs[i]->width, srcs[i]->height);
+                        ok(hr == S_OK, "SetSize failed, hr=%x\n", hr);
+                    }
 
                     if (IsEqualGUID(clsid_encoder, &CLSID_WICPngEncoder))
                         test_set_frame_palette(frameencode);
 
                     if (palette)
                     {
-                        WICColor colors[256];
-
                         hr = IWICBitmapFrameEncode_SetPalette(frameencode, palette);
                         ok(SUCCEEDED(hr), "SetPalette failed, hr=%x (%s)\n", hr, name);
-
-                        /* trash the assigned palette */
-                        memset(colors, 0, sizeof(colors));
-                        hr = IWICPalette_InitializeCustom(palette, colors, 256);
-                        ok(hr == S_OK, "InitializeCustom error %#x\n", hr);
                     }
 
                     hr = IWICBitmapFrameEncode_WriteSource(frameencode, &src_obj->IWICBitmapSource_iface, rc);
@@ -1410,24 +1406,32 @@ static void test_multi_encoder(const struct bitmap_data **srcs, const CLSID* cls
                         /* WriteSource fails but WriteSource_Proxy succeeds. */
                         ok(hr == E_INVALIDARG, "WriteSource should fail, hr=%x (%s)\n", hr, name);
                         hr = IWICBitmapFrameEncode_WriteSource_Proxy(frameencode, &src_obj->IWICBitmapSource_iface, rc);
-                        ok(SUCCEEDED(hr), "WriteSource_Proxy failed, %dx%d, hr=%x (%s)\n", rc->Width, rc->Height, hr, name);
+                        if (!set_size && rc->Width < 0)
+                            todo_wine
+                            ok(hr == WINCODEC_ERR_SOURCERECTDOESNOTMATCHDIMENSIONS,
+                               "WriteSource_Proxy(%dx%d) got unexpected hr %x (%s)\n", rc->Width, rc->Height, hr, name);
+                        else
+                            ok(hr == S_OK, "WriteSource_Proxy failed, %dx%d, hr=%x (%s)\n", rc->Width, rc->Height, hr, name);
                     }
                     else
                     {
                         if (rc)
                             ok(SUCCEEDED(hr), "WriteSource(%dx%d) failed, hr=%x (%s)\n", rc->Width, rc->Height, hr, name);
                         else
-                            ok(hr == S_OK ||
-                               (FAILED(hr) && IsEqualGUID(clsid_encoder, &CLSID_WICBmpEncoder) && srcs[i]->bpp == 2) /* XP */ ||
-                               (FAILED(hr) && IsEqualGUID(clsid_encoder, &CLSID_WICTiffEncoder) && srcs[i]->bpp == 2) /* XP */ ||
-                               broken(hr == E_INVALIDARG && IsEqualGUID(clsid_encoder, &CLSID_WICBmpEncoder) && IsEqualGUID(srcs[i]->format, &GUID_WICPixelFormatBlackWhite)) /* XP */,
-                               "WriteSource(NULL) failed, hr=%x (%s)\n", hr, name);
+                            todo_wine_if((IsEqualGUID(clsid_encoder, &CLSID_WICTiffEncoder) && srcs[i]->bpp == 2) ||
+                                         (IsEqualGUID(clsid_encoder, &CLSID_WICBmpEncoder)  && srcs[i]->bpp == 2))
+                            ok(hr == S_OK, "WriteSource(NULL) failed, hr=%x (%s)\n", hr, name);
+
                     }
 
                     if (SUCCEEDED(hr))
                     {
                         hr = IWICBitmapFrameEncode_Commit(frameencode);
-                        ok(SUCCEEDED(hr), "Commit failed, hr=%x (%s)\n", hr, name);
+                        if (!set_size && rc && rc->Height < 0)
+                            todo_wine
+                            ok(hr == WINCODEC_ERR_UNEXPECTEDSIZE, "Commit got unexpected hr %x (%s)\n", hr, name);
+                        else
+                            ok(hr == S_OK, "Commit failed, hr=%x (%s)\n", hr, name);
                     }
 
                     IWICBitmapFrameEncode_Release(frameencode);
@@ -1600,6 +1604,14 @@ static void test_multi_encoder(const struct bitmap_data **srcs, const CLSID* cls
 
         IWICBitmapEncoder_Release(encoder);
     }
+}
+
+static void test_multi_encoder(const struct bitmap_data **srcs, const CLSID* clsid_encoder,
+    const struct bitmap_data **dsts, const CLSID *clsid_decoder, WICRect *rc,
+    const struct setting *settings, const char *name, IWICPalette *palette)
+{
+    test_multi_encoder_impl(srcs, clsid_encoder, dsts, clsid_decoder, rc, settings, name, palette, TRUE);
+    test_multi_encoder_impl(srcs, clsid_encoder, dsts, clsid_decoder, rc, settings, name, palette, FALSE);
 }
 
 static void test_encoder(const struct bitmap_data *src, const CLSID* clsid_encoder,
@@ -1877,6 +1889,9 @@ START_TEST(converter)
     test_conversion(&testdata_24bppRGB, &testdata_32bppBGR, "24bppRGB -> 32bppBGR", FALSE);
     test_conversion(&testdata_32bppBGRA, &testdata_24bppRGB, "32bppBGRA -> 24bppRGB", FALSE);
     test_conversion(&testdata_32bppRGBA, &testdata_24bppBGR, "32bppRGBA -> 24bppBGR", FALSE);
+
+    test_conversion(&testdata_32bppRGBA, &testdata_32bppBGRA, "32bppRGBA -> 32bppBGRA", FALSE);
+    test_conversion(&testdata_32bppBGRA, &testdata_32bppRGBA, "32bppBGRA -> 32bppRGBA", FALSE);
 
     test_conversion(&testdata_64bppRGBA, &testdata_32bppRGBA, "64bppRGBA -> 32bppRGBA", FALSE);
     test_conversion(&testdata_64bppRGBA, &testdata_32bppRGB, "64bppRGBA -> 32bppRGB", FALSE);

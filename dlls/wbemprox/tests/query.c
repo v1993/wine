@@ -460,6 +460,8 @@ static void test_Win32_Process( IWbemServices *services, BOOL use_full_path )
     IWbemClassObject *process, *sig_in, *out;
     IWbemQualifierSet *qualifiers;
     VARIANT retval, val;
+    SAFEARRAY *names;
+    LONG bound, i;
     DWORD full_path_len = 0;
     LONG flavor;
     CIMTYPE type;
@@ -484,6 +486,21 @@ static void test_Win32_Process( IWbemServices *services, BOOL use_full_path )
         win_skip( "Win32_Process not available\n" );
         return;
     }
+    names = NULL;
+    hr = IWbemClassObject_GetNames( process, NULL, 0, NULL, &names );
+    ok( hr == S_OK, "got %08x\n", hr );
+    ok( names != NULL, "names not set\n" );
+    hr = SafeArrayGetUBound( names, 1, &bound );
+    ok( hr == S_OK, "got %08x\n", hr );
+    for (i = 0; i <= bound; i++)
+    {
+        BSTR str;
+        hr = SafeArrayGetElement( names, &i, &str );
+        ok( hr == S_OK, "%d: got %08x\n", i, hr );
+        SysFreeString( str );
+    }
+    SafeArrayDestroy( names );
+
     sig_in = (void*)0xdeadbeef;
     hr = IWbemClassObject_GetMethod( process, L"GetOwner", 0, &sig_in, NULL );
     ok( hr == S_OK, "failed to get GetOwner method %08x\n", hr );
@@ -1414,6 +1431,13 @@ static void test_Win32_VideoController( IWbemServices *services )
         hr = IEnumWbemClassObject_Next( result, 10000, 1, &obj, &count );
         if (hr != S_OK) break;
 
+        check_property( obj, L"__CLASS", VT_BSTR, CIM_STRING );
+        check_property( obj, L"__GENUS", VT_I4, CIM_SINT32 );
+        check_property( obj, L"__NAMESPACE", VT_BSTR, CIM_STRING );
+        check_property( obj, L"__PATH", VT_BSTR, CIM_STRING );
+        check_property( obj, L"__PROPERTY_COUNT", VT_I4, CIM_SINT32 );
+        check_property( obj, L"__RELPATH", VT_BSTR, CIM_STRING );
+        check_property( obj, L"__SERVER", VT_BSTR, CIM_STRING );
         check_property( obj, L"AdapterCompatibility", VT_BSTR, CIM_STRING );
         check_property( obj, L"Availability", VT_I4, CIM_UINT16 );
         check_property( obj, L"ConfigManagerErrorCode", VT_I4, CIM_UINT32 );
@@ -1429,6 +1453,31 @@ static void test_Win32_VideoController( IWbemServices *services )
         VariantClear( &val );
 
         check_property( obj, L"Status", VT_BSTR, CIM_STRING );
+        IWbemClassObject_Release( obj );
+    }
+
+    IEnumWbemClassObject_Release( result );
+    SysFreeString( query );
+
+    query = SysAllocString( L"SELECT AdapterRAM FROM Win32_VideoController" );
+    hr = IWbemServices_ExecQuery( services, wql, query, 0, NULL, &result );
+    if (hr != S_OK)
+    {
+        win_skip( "Win32_VideoController not available\n" );
+        return;
+    }
+
+    for (;;)
+    {
+        hr = IEnumWbemClassObject_Next( result, 10000, 1, &obj, &count );
+        if (hr != S_OK) break;
+        check_property( obj, L"__CLASS", VT_BSTR, CIM_STRING );
+        check_property( obj, L"__GENUS", VT_I4, CIM_SINT32 );
+        check_property( obj, L"__NAMESPACE", VT_NULL, CIM_STRING );
+        check_property( obj, L"__PATH", VT_NULL, CIM_STRING );
+        check_property( obj, L"__PROPERTY_COUNT", VT_I4, CIM_SINT32 );
+        check_property( obj, L"__RELPATH", VT_NULL, CIM_STRING );
+        check_property( obj, L"__SERVER", VT_NULL, CIM_STRING );
         IWbemClassObject_Release( obj );
     }
 
@@ -1696,16 +1745,80 @@ static void test_Win32_SoundDevice( IWbemServices *services )
         hr = IEnumWbemClassObject_Next( result, 10000, 1, &obj, &count );
         if (hr != S_OK) break;
 
-        check_property( obj, L"Name", VT_BSTR, CIM_STRING );
-        check_property( obj, L"ProductName", VT_BSTR, CIM_STRING );
-        check_property( obj, L"StatusInfo", VT_I4, CIM_UINT16 );
+        check_property( obj, L"DeviceID", VT_BSTR, CIM_STRING );
         check_property( obj, L"Manufacturer", VT_BSTR, CIM_STRING );
+        check_property( obj, L"Name", VT_BSTR, CIM_STRING );
+        check_property( obj, L"PNPDeviceID", VT_BSTR, CIM_STRING );
+        check_property( obj, L"ProductName", VT_BSTR, CIM_STRING );
+        check_property( obj, L"Status", VT_BSTR, CIM_STRING );
+        check_property( obj, L"StatusInfo", VT_I4, CIM_UINT16 );
         IWbemClassObject_Release( obj );
     }
 
     IEnumWbemClassObject_Release( result );
     SysFreeString( query );
     SysFreeString( wql );
+}
+
+static void test_SystemRestore( IWbemServices *services )
+{
+    WCHAR path[MAX_PATH];
+    BSTR class, method;
+    IWbemClassObject *service, *sig_in, *in, *out;
+    VARIANT var;
+    HRESULT hr;
+
+    class = SysAllocString( L"SystemRestore" );
+    hr = IWbemServices_GetObject( services, class, 0, NULL, &service, NULL );
+    if (hr != S_OK)
+    {
+        skip( "SystemRestore not available\n" );
+        SysFreeString( class );
+        return;
+    }
+
+    check_property( service, L"CreationTime", VT_NULL, CIM_STRING );
+    check_property( service, L"Description", VT_NULL, CIM_STRING );
+    check_property( service, L"EventType", VT_NULL, CIM_UINT32 );
+    check_property( service, L"RestorePointType", VT_NULL, CIM_UINT32 );
+    check_property( service, L"SequenceNumber", VT_NULL, CIM_UINT32 );
+
+    method = SysAllocString( L"Enable" );
+    sig_in = NULL;
+    hr = IWbemClassObject_GetMethod( service, method, 0, &sig_in, NULL );
+    ok( hr == S_OK, "failed to get Enable method %08x\n", hr );
+
+    hr = IWbemClassObject_SpawnInstance( sig_in, 0, &in );
+    ok( hr == S_OK, "failed to spawn instance %08x\n", hr );
+
+    GetWindowsDirectoryW(path, ARRAY_SIZE(path));
+    path[3] = 0; /* otherwise XP fails */
+    V_VT( &var ) = VT_BSTR;
+    V_BSTR( &var ) = SysAllocString( path );
+    hr = IWbemClassObject_Put( in, L"Drive", 0, &var, 0 );
+    ok( hr == S_OK, "failed to set Drive %08x\n", hr );
+    SysFreeString( V_BSTR( &var ) );
+
+    out = NULL;
+    hr = IWbemServices_ExecMethod( services, class, method, 0, NULL, in, &out, NULL );
+    ok( hr == S_OK || hr == WBEM_E_ACCESS_DENIED, "failed to execute method %08x\n", hr );
+    if (hr == S_OK)
+    {
+        VariantInit( &var );
+        hr = IWbemClassObject_Get( out, L"ReturnValue", 0, &var, NULL, NULL );
+        ok( hr == S_OK, "failed to get return value %08x\n", hr );
+        ok( V_I4( &var ) == ERROR_SUCCESS, "unexpected error %u\n", V_UI4( &var ) );
+
+        IWbemClassObject_Release( out );
+    }
+    else if (hr == WBEM_E_ACCESS_DENIED)
+        win_skip( "insufficient privs to test SystemRestore\n" );
+
+    IWbemClassObject_Release( in );
+    IWbemClassObject_Release( sig_in );
+    IWbemClassObject_Release( service );
+    SysFreeString( method );
+    SysFreeString( class );
 }
 
 START_TEST(query)
@@ -1771,6 +1884,21 @@ START_TEST(query)
     test_Win32_SystemEnclosure( services );
     test_Win32_VideoController( services );
     test_Win32_WinSAT( services );
+    test_SystemRestore( services );
+
+    SysFreeString( path );
+    IWbemServices_Release( services );
+
+    /* Some tests need other connection point */
+    path = SysAllocString( L"ROOT\\DEFAULT" );
+    hr = IWbemLocator_ConnectServer( locator, path, NULL, NULL, NULL, 0, NULL, NULL, &services );
+    ok( hr == S_OK, "failed to get IWbemServices interface %08x\n", hr );
+    hr = CoSetProxyBlanket( (IUnknown *)services, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                            RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE, NULL, EOAC_NONE );
+    ok( hr == S_OK, "failed to set proxy blanket %08x\n", hr );
+
+    test_StdRegProv( services );
+    test_SystemRestore( services );
 
     SysFreeString( path );
     IWbemServices_Release( services );

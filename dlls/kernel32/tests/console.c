@@ -19,10 +19,14 @@
  * Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301, USA
  */
 
-#include "wine/test.h"
+#include <ntstatus.h>
+#define WIN32_NO_STATUS
 #include <windows.h>
 #include <winternl.h>
+#include <winioctl.h>
 #include <stdio.h>
+
+#include "wine/test.h"
 
 static void (WINAPI *pClosePseudoConsole)(HPCON);
 static HRESULT (WINAPI *pCreatePseudoConsole)(COORD,HANDLE,HANDLE,DWORD,HPCON*);
@@ -79,6 +83,25 @@ static void init_function_pointers(void)
     KERNEL32_GET_PROC(VerifyConsoleIoHandle);
 
 #undef KERNEL32_GET_PROC
+}
+
+static HANDLE create_unbound_handle(BOOL output, BOOL test_status)
+{
+    OBJECT_ATTRIBUTES attr = {sizeof(attr)};
+    IO_STATUS_BLOCK iosb;
+    UNICODE_STRING name;
+    HANDLE handle;
+    NTSTATUS status;
+
+    attr.ObjectName = &name;
+    attr.Attributes = OBJ_INHERIT;
+    RtlInitUnicodeString( &name, output ? L"\\Device\\ConDrv\\Output" : L"\\Device\\ConDrv\\Input" );
+    status = NtCreateFile( &handle, FILE_READ_DATA | FILE_WRITE_DATA | SYNCHRONIZE | FILE_READ_ATTRIBUTES |
+                           FILE_WRITE_ATTRIBUTES, &attr, &iosb, NULL, FILE_ATTRIBUTE_NORMAL,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_CREATE,
+                           FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, NULL, 0 );
+    if (test_status) ok(!status, "NtCreateFile failed: %#x\n", status);
+    return status ? NULL : handle;
 }
 
 /* FIXME: this could be optimized on a speed point of view */
@@ -245,12 +268,26 @@ static void testWriteSimple(HANDLE hCon)
     const char*	mytest = "abcdefg";
     int mylen = strlen(mytest);
     COORD c = {0, 0};
+    DWORD len;
+    BOOL ret;
 
     simple_write_console(hCon, mytest);
 
     for (c.X = 0; c.X < mylen; c.X++)
     {
         okCHAR(hCon, c, mytest[c.X], TEST_ATTRIB);
+    }
+
+    okCURSOR(hCon, c);
+    okCHAR(hCon, c, ' ', DEFAULT_ATTRIB);
+
+    ret = WriteFile(hCon, mytest, mylen, &len, NULL);
+    ok(ret, "WriteFile failed: %u\n", GetLastError());
+    ok(len == mylen, "unexpected len = %u\n", len);
+
+    for (c.X = 0; c.X < 2 * mylen; c.X++)
+    {
+        okCHAR(hCon, c, mytest[c.X % mylen], TEST_ATTRIB);
     }
 
     okCURSOR(hCon, c);
@@ -988,6 +1025,79 @@ static void testWaitForConsoleInput(HANDLE input_handle)
     CloseHandle(complete_event);
 }
 
+static void test_wait(HANDLE input, HANDLE orig_output)
+{
+    HANDLE output, unbound_output, unbound_input;
+    LARGE_INTEGER zero;
+    INPUT_RECORD ir;
+    DWORD res, count;
+    NTSTATUS status;
+    BOOL ret;
+
+    if (skip_nt) return;
+
+    memset(&ir, 0, sizeof(ir));
+    ir.EventType = MOUSE_EVENT;
+    ir.Event.MouseEvent.dwEventFlags = MOUSE_MOVED;
+    zero.QuadPart = 0;
+
+    output = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE,
+                                       FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                       CONSOLE_TEXTMODE_BUFFER, NULL);
+    ok(output != INVALID_HANDLE_VALUE, "CreateConsoleScreenBuffer failed: %u\n", GetLastError());
+
+    ret = SetConsoleActiveScreenBuffer(output);
+    ok(ret, "SetConsoleActiveScreenBuffer failed: %u\n", GetLastError());
+    FlushConsoleInputBuffer(input);
+
+    unbound_output = create_unbound_handle(TRUE, TRUE);
+    unbound_input = create_unbound_handle(FALSE, TRUE);
+
+    res = WaitForSingleObject(input, 0);
+    ok(res == WAIT_TIMEOUT, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(output, 0);
+    ok(res == WAIT_TIMEOUT, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(orig_output, 0);
+    ok(res == WAIT_TIMEOUT, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(unbound_output, 0);
+    ok(res == WAIT_TIMEOUT, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(unbound_input, 0);
+    ok(res == WAIT_TIMEOUT, "WaitForSingleObject returned %x\n", res);
+    status = NtWaitForSingleObject(input, FALSE, &zero);
+    ok(status == STATUS_TIMEOUT || broken(status == STATUS_ACCESS_DENIED /* win2k8 */),
+       "NtWaitForSingleObject returned %x\n", status);
+    status = NtWaitForSingleObject(output, FALSE, &zero);
+    ok(status == STATUS_TIMEOUT || broken(status == STATUS_ACCESS_DENIED /* win2k8 */),
+       "NtWaitForSingleObject returned %x\n", status);
+
+    ret = WriteConsoleInputW(input, &ir, 1, &count);
+    ok(ret, "WriteConsoleInputW failed: %u\n", GetLastError());
+
+    res = WaitForSingleObject(input, 0);
+    ok(!res, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(output, 0);
+    ok(!res, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(orig_output, 0);
+    ok(!res, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(unbound_output, 0);
+    ok(!res, "WaitForSingleObject returned %x\n", res);
+    res = WaitForSingleObject(unbound_input, 0);
+    ok(!res, "WaitForSingleObject returned %x\n", res);
+    status = NtWaitForSingleObject(input, FALSE, &zero);
+    ok(!status || broken(status == STATUS_ACCESS_DENIED /* win2k8 */),
+       "NtWaitForSingleObject returned %x\n", status);
+    status = NtWaitForSingleObject(output, FALSE, &zero);
+    ok(!status || broken(status == STATUS_ACCESS_DENIED /* win2k8 */),
+       "NtWaitForSingleObject returned %x\n", status);
+
+    ret = SetConsoleActiveScreenBuffer(orig_output);
+    ok(ret, "SetConsoleActiveScreenBuffer failed: %u\n", GetLastError());
+
+    CloseHandle(unbound_input);
+    CloseHandle(unbound_output);
+    CloseHandle(output);
+}
+
 static void test_GetSetConsoleInputExeName(void)
 {
     BOOL ret;
@@ -1323,12 +1433,6 @@ static void test_CreateFileW(void)
         ret = CreateFileW(cf_table[index].input ? L"\\??\\CONIN$" : L"\\??\\CONOUT$", cf_table[index].access,
                           FILE_SHARE_READ|FILE_SHARE_WRITE, &sa,
                           cf_table[index].creation, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (!index && ret == INVALID_HANDLE_VALUE)
-        {
-            win_skip("Skipping NT path tests, not supported on this Windows version\n");
-            skip_nt = TRUE;
-            continue;
-        }
         if (cf_table[index].gle)
             ok(ret == INVALID_HANDLE_VALUE && GetLastError() == cf_table[index].gle,
                "CreateFileW to returned %p %u for index %d\n", ret, GetLastError(), index);
@@ -1441,6 +1545,32 @@ static void test_GetSetStdHandle(void)
     error = GetLastError();
     ok(ret, "expected SetStdHandle to succeed\n");
     ok(error == 0xdeadbeef, "wrong GetLastError() %d\n", error);
+}
+
+static void test_DuplicateConsoleHandle(void)
+{
+    HANDLE handle, event;
+    BOOL ret;
+
+    if (skip_nt) return;
+
+    event = CreateEventW(NULL, TRUE, FALSE, NULL);
+
+    /* duplicate an event handle with DuplicateConsoleHandle */
+    handle = DuplicateConsoleHandle(event, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    ok(handle != NULL, "DuplicateConsoleHandle failed: %u\n", GetLastError());
+
+    ret = SetEvent(handle);
+    ok(ret, "SetEvent failed: %u\n", GetLastError());
+
+    ret = CloseConsoleHandle(handle);
+    ok(ret, "CloseConsoleHandle failed: %u\n", GetLastError());
+    ret = CloseConsoleHandle(event);
+    ok(ret, "CloseConsoleHandle failed: %u\n", GetLastError());
+
+    handle = DuplicateConsoleHandle((HANDLE)0xdeadbeef, 0, FALSE, DUPLICATE_SAME_ACCESS);
+    ok(handle == INVALID_HANDLE_VALUE, "DuplicateConsoleHandle failed: %u\n", GetLastError());
+    ok(GetLastError() == ERROR_INVALID_HANDLE, "last error = %u\n", GetLastError());
 }
 
 static void test_GetNumberOfConsoleInputEvents(HANDLE input_handle)
@@ -1968,6 +2098,63 @@ static void test_WriteConsoleInputW(HANDLE input_handle)
     /* Restore the old console mode. */
     ret = SetConsoleMode(input_handle, console_mode);
     ok(ret == TRUE, "Expected SetConsoleMode to return TRUE, got %d\n", ret);
+}
+
+static void test_FlushConsoleInputBuffer(HANDLE input, HANDLE output)
+{
+    INPUT_RECORD record;
+    DWORD count;
+    BOOL ret;
+
+    ret = FlushConsoleInputBuffer(input);
+    ok(ret, "FlushConsoleInputBuffer failed: %u\n", GetLastError());
+
+    ret = GetNumberOfConsoleInputEvents(input, &count);
+    ok(ret, "GetNumberOfConsoleInputEvents failed: %u\n", GetLastError());
+    ok(count == 0, "Expected count to be 0, got %u\n", count);
+
+    record.EventType = KEY_EVENT;
+    record.Event.KeyEvent.bKeyDown = 1;
+    record.Event.KeyEvent.wRepeatCount = 1;
+    record.Event.KeyEvent.wVirtualKeyCode = VK_RETURN;
+    record.Event.KeyEvent.wVirtualScanCode = VK_RETURN;
+    record.Event.KeyEvent.uChar.UnicodeChar = '\r';
+    record.Event.KeyEvent.dwControlKeyState = 0;
+    ret = WriteConsoleInputW(input, &record, 1, &count);
+    ok(ret, "WriteConsoleInputW failed: %u\n", GetLastError());
+
+    ret = GetNumberOfConsoleInputEvents(input, &count);
+    ok(ret, "GetNumberOfConsoleInputEvents failed: %u\n", GetLastError());
+    ok(count == 1, "Expected count to be 0, got %u\n", count);
+
+    ret = FlushConsoleInputBuffer(input);
+    ok(ret, "FlushConsoleInputBuffer failed: %u\n", GetLastError());
+
+    ret = GetNumberOfConsoleInputEvents(input, &count);
+    ok(ret, "GetNumberOfConsoleInputEvents failed: %u\n", GetLastError());
+    ok(count == 0, "Expected count to be 0, got %u\n", count);
+
+    ret = WriteConsoleInputW(input, &record, 1, &count);
+    ok(ret, "WriteConsoleInputW failed: %u\n", GetLastError());
+
+    ret = GetNumberOfConsoleInputEvents(input, &count);
+    ok(ret, "GetNumberOfConsoleInputEvents failed: %u\n", GetLastError());
+    ok(count == 1, "Expected count to be 0, got %u\n", count);
+
+    ret = FlushFileBuffers(input);
+    ok(ret, "FlushFileBuffers failed: %u\n", GetLastError());
+
+    ret = GetNumberOfConsoleInputEvents(input, &count);
+    ok(ret, "GetNumberOfConsoleInputEvents failed: %u\n", GetLastError());
+    ok(count == 0, "Expected count to be 0, got %u\n", count);
+
+    ret = FlushConsoleInputBuffer(output);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "FlushConsoleInputBuffer returned: %x(%u)\n",
+       ret, GetLastError());
+
+    ret = FlushFileBuffers(output);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "FlushFileBuffers returned: %x(%u)\n",
+       ret, GetLastError());
 }
 
 static void test_WriteConsoleOutputCharacterA(HANDLE output_handle)
@@ -2977,21 +3164,14 @@ static void test_ReadConsoleOutput(HANDLE console)
     ok(ch == 'z', "unexpected char %c/%x\n", ch, ch);
 }
 
-static void test_ReadConsole(void)
+static void test_ReadConsole(HANDLE input)
 {
-    HANDLE std_input;
     DWORD ret, bytes;
     char buf[1024];
-
-    std_input = GetStdHandle(STD_INPUT_HANDLE);
+    HANDLE output;
 
     SetLastError(0xdeadbeef);
-    ret = GetFileSize(std_input, NULL);
-    if (GetLastError() == 0xdeadbeef)
-    {
-        skip("stdin is redirected\n");
-        return;
-    }
+    ret = GetFileSize(input, NULL);
     ok(ret == INVALID_FILE_SIZE, "expected INVALID_FILE_SIZE, got %#x\n", ret);
     ok(GetLastError() == ERROR_INVALID_HANDLE ||
        GetLastError() == ERROR_INVALID_FUNCTION, /* Win 8, 10 */
@@ -2999,7 +3179,7 @@ static void test_ReadConsole(void)
 
     bytes = 0xdeadbeef;
     SetLastError(0xdeadbeef);
-    ret = ReadFile(std_input, buf, -128, &bytes, NULL);
+    ret = ReadFile(input, buf, -128, &bytes, NULL);
     ok(!ret, "expected 0, got %u\n", ret);
     ok(GetLastError() == ERROR_NOT_ENOUGH_MEMORY ||
        GetLastError() == ERROR_NOACCESS, /* Win 8, 10 */
@@ -3008,7 +3188,7 @@ static void test_ReadConsole(void)
 
     bytes = 0xdeadbeef;
     SetLastError(0xdeadbeef);
-    ret = ReadConsoleA(std_input, buf, -128, &bytes, NULL);
+    ret = ReadConsoleA(input, buf, -128, &bytes, NULL);
     ok(!ret, "expected 0, got %u\n", ret);
     ok(GetLastError() == ERROR_NOT_ENOUGH_MEMORY ||
        GetLastError() == ERROR_NOACCESS, /* Win 8, 10 */
@@ -3017,12 +3197,29 @@ static void test_ReadConsole(void)
 
     bytes = 0xdeadbeef;
     SetLastError(0xdeadbeef);
-    ret = ReadConsoleW(std_input, buf, -128, &bytes, NULL);
+    ret = ReadConsoleW(input, buf, -128, &bytes, NULL);
     ok(!ret, "expected 0, got %u\n", ret);
     ok(GetLastError() == ERROR_NOT_ENOUGH_MEMORY ||
        GetLastError() == ERROR_NOACCESS, /* Win 8, 10 */
        "expected ERROR_NOT_ENOUGH_MEMORY, got %d\n", GetLastError());
     ok(bytes == 0xdeadbeef, "expected 0xdeadbeef, got %#x\n", bytes);
+
+    output = CreateFileA("CONOUT$", GENERIC_READ | GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0);
+    ok(output != INVALID_HANDLE_VALUE, "Could not open console\n");
+
+    ret = ReadConsoleW(output, buf, sizeof(buf) / sizeof(WCHAR), &bytes, NULL);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "ReadConsoleW returned %x(%u)\n", ret, GetLastError());
+
+    ret = ReadConsoleA(output, buf, sizeof(buf), &bytes, NULL);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "ReadConsoleA returned %x(%u)\n", ret, GetLastError());
+
+    ret = ReadFile(output, buf, sizeof(buf), &bytes, NULL);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "ReadFile returned %x(%u)\n", ret, GetLastError());
+
+    CloseHandle(output);
 }
 
 static void test_GetCurrentConsoleFont(HANDLE std_output)
@@ -3593,14 +3790,20 @@ static void test_GetConsoleScreenBufferInfoEx(HANDLE std_output)
 
 static void test_FreeConsole(void)
 {
+    HANDLE handle, unbound_output = NULL, unbound_input = NULL;
+    DWORD size, mode, type;
     WCHAR title[16];
-    HANDLE handle;
-    DWORD size;
+    char buf[32];
     HWND hwnd;
     UINT cp;
     BOOL ret;
 
     ok(RtlGetCurrentPeb()->ProcessParameters->ConsoleHandle != NULL, "ConsoleHandle is NULL\n");
+    if (!skip_nt)
+    {
+        unbound_input  = create_unbound_handle(FALSE, TRUE);
+        unbound_output = create_unbound_handle(TRUE, TRUE);
+    }
 
     ret = FreeConsole();
     ok(ret, "FreeConsole failed: %u\n", GetLastError());
@@ -3652,14 +3855,14 @@ static void test_FreeConsole(void)
     ret = SetConsoleOutputCP(GetOEMCP());
     ok(!ret && GetLastError() == ERROR_INVALID_HANDLE, "SetConsoleCP returned %x(%u)\n", ret, GetLastError());
 
+    if (skip_nt) return;
+
     SetLastError(0xdeadbeef);
     memset( title, 0xc0, sizeof(title) );
     size = GetConsoleTitleW( title, ARRAY_SIZE(title) );
     ok(!size, "GetConsoleTitleW returned %u\n", size);
     ok(title[0] == 0xc0c0, "title byffer changed\n");
     ok(GetLastError() == ERROR_INVALID_HANDLE, "last error %u\n", GetLastError());
-
-    if (skip_nt) return;
 
     SetLastError(0xdeadbeef);
     ret = SetConsoleTitleW( L"test" );
@@ -3680,6 +3883,33 @@ static void test_FreeConsole(void)
     SetStdHandle( STD_INPUT_HANDLE, NULL );
     handle = GetConsoleInputWaitHandle();
     ok(!handle, "GetConsoleInputWaitHandle returned %p\n", handle);
+
+    ret = ReadFile(unbound_input, buf, sizeof(buf), &size, NULL);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "ReadFile returned %x %u\n", ret, GetLastError());
+
+    ret = FlushFileBuffers(unbound_input);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "ReadFile returned %x %u\n", ret, GetLastError());
+
+    ret = WriteFile(unbound_input, "test", 4, &size, NULL);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "ReadFile returned %x %u\n", ret, GetLastError());
+
+    ret = GetConsoleMode(unbound_input, &mode);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "GetConsoleMode returned %x %u\n", ret, GetLastError());
+    ret = GetConsoleMode(unbound_output, &mode);
+    ok(!ret && GetLastError() == ERROR_INVALID_HANDLE,
+       "GetConsoleMode returned %x %u\n", ret, GetLastError());
+
+    type = GetFileType(unbound_input);
+    ok(type == FILE_TYPE_CHAR, "GetFileType returned %u\n", type);
+    type = GetFileType(unbound_output);
+    ok(type == FILE_TYPE_CHAR, "GetFileType returned %u\n", type);
+
+    CloseHandle(unbound_input);
+    CloseHandle(unbound_output);
 }
 
 static void test_SetConsoleScreenBufferInfoEx(HANDLE std_output)
@@ -3751,6 +3981,50 @@ static void test_console_title(void)
         ok(ret, "GetConsoleTitleW failed: %u\n", GetLastError());
         ok(!wcscmp(buf, L"tes"), "title = %s\n", wine_dbgstr_w(buf));
     }
+}
+
+static void test_file_info(HANDLE input, HANDLE output)
+{
+    FILE_STANDARD_INFORMATION std_info;
+    FILE_FS_DEVICE_INFORMATION fs_info;
+    LARGE_INTEGER size;
+    IO_STATUS_BLOCK io;
+    DWORD type;
+    NTSTATUS status;
+    BOOL ret;
+
+    if (skip_nt) return;
+
+    status = NtQueryInformationFile(input, &io, &std_info, sizeof(std_info), FileStandardInformation);
+    ok(status == STATUS_INVALID_DEVICE_REQUEST, "NtQueryInformationFile returned: %#x\n", status);
+
+    status = NtQueryInformationFile(output, &io, &std_info, sizeof(std_info), FileStandardInformation);
+    ok(status == STATUS_INVALID_DEVICE_REQUEST, "NtQueryInformationFile returned: %#x\n", status);
+
+    ret = GetFileSizeEx(input, &size);
+    ok(!ret && GetLastError() == ERROR_INVALID_FUNCTION,
+       "GetFileSizeEx returned %x(%u)\n", ret, GetLastError());
+
+    ret = GetFileSizeEx(output, &size);
+    ok(!ret && GetLastError() == ERROR_INVALID_FUNCTION,
+       "GetFileSizeEx returned %x(%u)\n", ret, GetLastError());
+
+    status = NtQueryVolumeInformationFile(input, &io, &fs_info, sizeof(fs_info), FileFsDeviceInformation);
+    ok(!status, "NtQueryVolumeInformationFile failed: %#x\n", status);
+    ok(fs_info.DeviceType == FILE_DEVICE_CONSOLE, "DeviceType = %u\n", fs_info.DeviceType);
+    ok(fs_info.Characteristics == FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL,
+       "Characteristics = %x\n", fs_info.Characteristics);
+
+    status = NtQueryVolumeInformationFile(output, &io, &fs_info, sizeof(fs_info), FileFsDeviceInformation);
+    ok(!status, "NtQueryVolumeInformationFile failed: %#x\n", status);
+    ok(fs_info.DeviceType == FILE_DEVICE_CONSOLE, "DeviceType = %u\n", fs_info.DeviceType);
+    ok(fs_info.Characteristics == FILE_DEVICE_ALLOW_APPCONTAINER_TRAVERSAL,
+       "Characteristics = %x\n", fs_info.Characteristics);
+
+    type = GetFileType(input);
+    ok(type == FILE_TYPE_CHAR, "GetFileType returned %u\n", type);
+    type = GetFileType(output);
+    ok(type == FILE_TYPE_CHAR, "GetFileType returned %u\n", type);
 }
 
 static void test_AttachConsole_child(DWORD console_pid)
@@ -3879,7 +4153,6 @@ static void test_AllocConsole_child(void)
     ok(GetStdHandle(STD_OUTPUT_HANDLE) == prev_output, "GetStdHandle(STD_OUTPUT_HANDLE) = %p\n", GetStdHandle(STD_OUTPUT_HANDLE));
     ok(GetStdHandle(STD_ERROR_HANDLE) == prev_error, "GetStdHandle(STD_ERROR_HANDLE) = %p\n", GetStdHandle(STD_ERROR_HANDLE));
     res = GetConsoleMode(unbound_output, &mode);
-    todo_wine
     ok(!res && GetLastError() == ERROR_INVALID_HANDLE, "GetConsoleMode failed: %u\n", GetLastError());
 
     res = AllocConsole();
@@ -3950,6 +4223,8 @@ static void test_AllocConsole(void)
 
 static void test_pseudo_console_child(HANDLE input, HANDLE output)
 {
+    CONSOLE_SCREEN_BUFFER_INFO sb_info;
+    CONSOLE_CURSOR_INFO cursor_info;
     DWORD mode;
     BOOL ret;
 
@@ -3972,6 +4247,7 @@ static void test_pseudo_console_child(HANDLE input, HANDLE output)
 
     ret = GetConsoleMode(output, &mode);
     ok(ret, "GetConsoleMode failed: %u\n", GetLastError());
+    mode &= ~ENABLE_VIRTUAL_TERMINAL_PROCESSING;
     ok(mode == (ENABLE_PROCESSED_OUTPUT | ENABLE_WRAP_AT_EOL_OUTPUT), "mode = %x\n", mode);
 
     ret = SetConsoleMode(output, mode & ~ENABLE_WRAP_AT_EOL_OUTPUT);
@@ -3983,6 +4259,25 @@ static void test_pseudo_console_child(HANDLE input, HANDLE output)
 
     ret = SetConsoleMode(output, mode | ENABLE_WRAP_AT_EOL_OUTPUT);
     ok(ret, "SetConsoleMode failed: %u\n", GetLastError());
+
+    ret = GetConsoleScreenBufferInfo(output, &sb_info);
+    ok(ret, "GetConsoleScreenBufferInfo failed: %u\n", GetLastError());
+    ok(sb_info.dwSize.X == 40, "dwSize.X = %u\n", sb_info.dwSize.X);
+    ok(sb_info.dwSize.Y == 30, "dwSize.Y = %u\n", sb_info.dwSize.Y);
+    ok(sb_info.dwCursorPosition.X == 0, "dwCursorPosition.X = %u\n", sb_info.dwCursorPosition.X);
+    ok(sb_info.dwCursorPosition.Y == 0, "dwCursorPosition.Y = %u\n", sb_info.dwCursorPosition.Y);
+    ok(sb_info.wAttributes == 7, "wAttributes = %x\n", sb_info.wAttributes);
+    ok(sb_info.srWindow.Left == 0, "srWindow.Left = %u\n", sb_info.srWindow.Left);
+    ok(sb_info.srWindow.Top == 0, "srWindow.Top = %u\n", sb_info.srWindow.Top);
+    ok(sb_info.srWindow.Right == 39, "srWindow.Right = %u\n", sb_info.srWindow.Right);
+    ok(sb_info.srWindow.Bottom == 29, "srWindow.Bottom = %u\n", sb_info.srWindow.Bottom);
+    ok(sb_info.dwMaximumWindowSize.X == 40, "dwMaximumWindowSize.X = %u\n", sb_info.dwMaximumWindowSize.X);
+    ok(sb_info.dwMaximumWindowSize.Y == 30, "dwMaximumWindowSize.Y = %u\n", sb_info.dwMaximumWindowSize.Y);
+
+    ret = GetConsoleCursorInfo(output, &cursor_info);
+    ok(ret, "GetConsoleCursorInfo failed: %u\n", GetLastError());
+    ok(cursor_info.dwSize == 25, "dwSize = %u\n", cursor_info.dwSize);
+    ok(cursor_info.bVisible == TRUE, "bVisible = %x\n", cursor_info.bVisible);
 
     test_console_title();
     test_WriteConsoleInputW(input);
@@ -4064,7 +4359,7 @@ static void test_pseudo_console(void)
 
 START_TEST(console)
 {
-    HANDLE hConIn, hConOut;
+    HANDLE hConIn, hConOut, revert_output = NULL, unbound_output;
     BOOL ret, test_current;
     CONSOLE_SCREEN_BUFFER_INFO	sbi;
     BOOL using_pseudo_console;
@@ -4152,6 +4447,23 @@ START_TEST(console)
         }
     }
 
+    unbound_output = create_unbound_handle(TRUE, FALSE);
+    if (!unbound_output)
+    {
+        win_skip("Skipping NT path tests, not supported on this Windows version\n");
+        skip_nt = TRUE;
+    }
+
+    if (test_current)
+    {
+        HANDLE sb;
+        revert_output = CreateFileA("CONOUT$", GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0);
+        sb = CreateConsoleScreenBuffer(GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                                       CONSOLE_TEXTMODE_BUFFER, NULL);
+        ok(sb != INVALID_HANDLE_VALUE, "Could not allocate screen buffer: %u\n", GetLastError());
+        SetConsoleActiveScreenBuffer(sb);
+    }
+
     hConIn = CreateFileA("CONIN$", GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0);
     hConOut = CreateFileA("CONOUT$", GENERIC_READ|GENERIC_WRITE, 0, NULL, OPEN_EXISTING, 0, 0);
 
@@ -4181,7 +4493,7 @@ START_TEST(console)
     ok(sbi.dwSize.Y == size, "Unexpected buffer size: %d instead of %d\n", sbi.dwSize.Y, size);
     if (!ret) return;
 
-    test_ReadConsole();
+    test_ReadConsole(hConIn);
     /* Non interactive tests */
     testCursor(hConOut, sbi.dwSize);
     /* test parameters (FIXME: test functionality) */
@@ -4196,6 +4508,7 @@ START_TEST(console)
     if (!test_current) testScreenBuffer(hConOut);
     /* Test waiting for a console handle */
     testWaitForConsoleInput(hConIn);
+    test_wait(hConIn, hConOut);
 
     if (!test_current)
     {
@@ -4218,15 +4531,17 @@ START_TEST(console)
     else
         test_GetSetConsoleInputExeName();
 
-    test_GetConsoleProcessList();
+    if (!test_current) test_GetConsoleProcessList();
     test_OpenConsoleW();
     test_CreateFileW();
     test_OpenCON();
     test_VerifyConsoleIoHandle(hConOut);
     test_GetSetStdHandle();
+    test_DuplicateConsoleHandle();
     test_GetNumberOfConsoleInputEvents(hConIn);
     test_WriteConsoleInputA(hConIn);
     test_WriteConsoleInputW(hConIn);
+    test_FlushConsoleInputBuffer(hConIn, hConOut);
     test_WriteConsoleOutputCharacterA(hConOut);
     test_WriteConsoleOutputCharacterW(hConOut);
     test_WriteConsoleOutputAttribute(hConOut);
@@ -4238,20 +4553,27 @@ START_TEST(console)
     test_ReadConsoleOutputCharacterW(hConOut);
     test_ReadConsoleOutputAttribute(hConOut);
     test_ReadConsoleOutput(hConOut);
-    test_GetCurrentConsoleFont(hConOut);
-    test_GetCurrentConsoleFontEx(hConOut);
-    test_GetConsoleFontSize(hConOut);
-    test_GetLargestConsoleWindowSize(hConOut);
-    test_GetConsoleFontInfo(hConOut);
-    test_SetConsoleFont(hConOut);
+    if (!test_current)
+    {
+        test_GetCurrentConsoleFont(hConOut);
+        test_GetCurrentConsoleFontEx(hConOut);
+        test_GetConsoleFontSize(hConOut);
+        test_GetLargestConsoleWindowSize(hConOut);
+        test_GetConsoleFontInfo(hConOut);
+        test_SetConsoleFont(hConOut);
+    }
     test_GetConsoleScreenBufferInfoEx(hConOut);
     test_SetConsoleScreenBufferInfoEx(hConOut);
+    test_file_info(hConIn, hConOut);
     test_console_title();
     if (!test_current)
     {
+        test_pseudo_console();
         test_AttachConsole(hConOut);
         test_AllocConsole();
         test_FreeConsole();
-        test_pseudo_console();
     }
+    else if (revert_output) SetConsoleActiveScreenBuffer(revert_output);
+
+    CloseHandle(unbound_output);
 }
