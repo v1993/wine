@@ -46,6 +46,7 @@
 #include "d3d9types.h"
 #include "ks.h"
 #include "ksmedia.h"
+#include "dxva2api.h"
 
 DEFINE_GUID(DUMMY_CLSID, 0x12345678,0x1234,0x1234,0x12,0x13,0x14,0x15,0x16,0x17,0x18,0x19);
 DEFINE_GUID(DUMMY_GUID1, 0x12345678,0x1234,0x1234,0x21,0x21,0x21,0x21,0x21,0x21,0x21,0x21);
@@ -70,6 +71,13 @@ static void _expect_ref(IUnknown *obj, ULONG ref, int line)
     ok_(__FILE__,line)(rc == ref, "Unexpected refcount %d, expected %d.\n", rc, ref);
 }
 
+static ULONG get_refcount(void *iface)
+{
+    IUnknown *unknown = iface;
+    IUnknown_AddRef(unknown);
+    return IUnknown_Release(unknown);
+}
+
 #define check_interface(a, b, c) check_interface_(__LINE__, a, b, c)
 static void check_interface_(unsigned int line, void *iface_ptr, REFIID iid, BOOL supported)
 {
@@ -83,6 +91,129 @@ static void check_interface_(unsigned int line, void *iface_ptr, REFIID iid, BOO
     ok_(__FILE__, line)(hr == expected_hr, "Got hr %#x, expected %#x.\n", hr, expected_hr);
     if (SUCCEEDED(hr))
         IUnknown_Release(unk);
+}
+
+#define check_service_interface(a, b, c, d) check_service_interface_(__LINE__, a, b, c, d)
+static void check_service_interface_(unsigned int line, void *iface_ptr, REFGUID service, REFIID iid, BOOL supported)
+{
+    IUnknown *iface = iface_ptr;
+    HRESULT hr, expected_hr;
+    IMFGetService *gs;
+    IUnknown *unk;
+
+    expected_hr = supported ? S_OK : E_NOINTERFACE;
+
+    if (SUCCEEDED(hr = IUnknown_QueryInterface(iface, &IID_IMFGetService, (void **)&gs)))
+    {
+        hr = IMFGetService_GetService(gs, service, iid, (void **)&unk);
+        IMFGetService_Release(gs);
+    }
+    ok_(__FILE__, line)(hr == expected_hr, "Got hr %#x, expected %#x.\n", hr, expected_hr);
+    if (SUCCEEDED(hr))
+        IUnknown_Release(unk);
+}
+
+struct d3d11_resource_readback
+{
+    ID3D11Resource *resource;
+    D3D11_MAPPED_SUBRESOURCE map_desc;
+    ID3D11DeviceContext *immediate_context;
+    unsigned int width, height, depth, sub_resource_idx;
+};
+
+static void init_d3d11_resource_readback(ID3D11Resource *resource, ID3D11Resource *readback_resource,
+        unsigned int width, unsigned int height, unsigned int depth, unsigned int sub_resource_idx,
+        ID3D11Device *device, struct d3d11_resource_readback *rb)
+{
+    HRESULT hr;
+
+    rb->resource = readback_resource;
+    rb->width = width;
+    rb->height = height;
+    rb->depth = depth;
+    rb->sub_resource_idx = sub_resource_idx;
+
+    ID3D11Device_GetImmediateContext(device, &rb->immediate_context);
+
+    ID3D11DeviceContext_CopyResource(rb->immediate_context, rb->resource, resource);
+    if (FAILED(hr = ID3D11DeviceContext_Map(rb->immediate_context,
+            rb->resource, sub_resource_idx, D3D11_MAP_READ, 0, &rb->map_desc)))
+    {
+        trace("Failed to map resource, hr %#x.\n", hr);
+        ID3D11Resource_Release(rb->resource);
+        rb->resource = NULL;
+        ID3D11DeviceContext_Release(rb->immediate_context);
+        rb->immediate_context = NULL;
+    }
+}
+
+static void get_d3d11_texture2d_readback(ID3D11Texture2D *texture, unsigned int sub_resource_idx,
+        struct d3d11_resource_readback *rb)
+{
+    D3D11_TEXTURE2D_DESC texture_desc;
+    ID3D11Resource *rb_texture;
+    unsigned int miplevel;
+    ID3D11Device *device;
+    HRESULT hr;
+
+    memset(rb, 0, sizeof(*rb));
+
+    ID3D11Texture2D_GetDevice(texture, &device);
+
+    ID3D11Texture2D_GetDesc(texture, &texture_desc);
+    texture_desc.Usage = D3D11_USAGE_STAGING;
+    texture_desc.BindFlags = 0;
+    texture_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    texture_desc.MiscFlags = 0;
+    if (FAILED(hr = ID3D11Device_CreateTexture2D(device, &texture_desc, NULL, (ID3D11Texture2D **)&rb_texture)))
+    {
+        trace("Failed to create texture, hr %#x.\n", hr);
+        ID3D11Device_Release(device);
+        return;
+    }
+
+    miplevel = sub_resource_idx % texture_desc.MipLevels;
+    init_d3d11_resource_readback((ID3D11Resource *)texture, rb_texture,
+            max(1, texture_desc.Width >> miplevel),
+            max(1, texture_desc.Height >> miplevel),
+            1, sub_resource_idx, device, rb);
+
+    ID3D11Device_Release(device);
+}
+
+static void release_d3d11_resource_readback(struct d3d11_resource_readback *rb)
+{
+    ID3D11DeviceContext_Unmap(rb->immediate_context, rb->resource, rb->sub_resource_idx);
+    ID3D11Resource_Release(rb->resource);
+    ID3D11DeviceContext_Release(rb->immediate_context);
+}
+
+static void *get_d3d11_readback_data(struct d3d11_resource_readback *rb,
+        unsigned int x, unsigned int y, unsigned int z, unsigned byte_width)
+{
+    return (BYTE *)rb->map_desc.pData + z * rb->map_desc.DepthPitch + y * rb->map_desc.RowPitch + x * byte_width;
+}
+
+static DWORD get_d3d11_readback_u32(struct d3d11_resource_readback *rb, unsigned int x, unsigned int y, unsigned int z)
+{
+    return *(DWORD *)get_d3d11_readback_data(rb, x, y, z, sizeof(DWORD));
+}
+
+static DWORD get_d3d11_readback_color(struct d3d11_resource_readback *rb, unsigned int x, unsigned int y, unsigned int z)
+{
+    return get_d3d11_readback_u32(rb, x, y, z);
+}
+
+static DWORD get_d3d11_texture_color(ID3D11Texture2D *texture, unsigned int x, unsigned int y)
+{
+    struct d3d11_resource_readback rb;
+    DWORD color;
+
+    get_d3d11_texture2d_readback(texture, 0, &rb);
+    color = get_d3d11_readback_color(&rb, x, y, 0);
+    release_d3d11_resource_readback(&rb);
+
+    return color;
 }
 
 static HRESULT (WINAPI *pD3D11CreateDevice)(IDXGIAdapter *adapter, D3D_DRIVER_TYPE driver_type, HMODULE swrast, UINT flags,
@@ -124,6 +255,12 @@ static HRESULT (WINAPI *pMFCreateMediaBufferFromMediaType)(IMFMediaType *media_t
 static HRESULT (WINAPI *pMFCreateDXSurfaceBuffer)(REFIID riid, IUnknown *surface, BOOL bottom_up, IMFMediaBuffer **buffer);
 static HRESULT (WINAPI *pMFCreateTrackedSample)(IMFTrackedSample **sample);
 static DWORD (WINAPI *pMFMapDXGIFormatToDX9Format)(DXGI_FORMAT dxgi_format);
+static DXGI_FORMAT (WINAPI *pMFMapDX9FormatToDXGIFormat)(DWORD format);
+static HRESULT (WINAPI *pMFCreateVideoSampleAllocatorEx)(REFIID riid, void **allocator);
+static HRESULT (WINAPI *pMFCreateDXGISurfaceBuffer)(REFIID riid, IUnknown *surface, UINT subresource, BOOL bottomup,
+        IMFMediaBuffer **buffer);
+static HRESULT (WINAPI *pMFCreateVideoMediaTypeFromSubtype)(const GUID *subtype, IMFVideoMediaType **media_type);
+static HRESULT (WINAPI *pMFLockSharedWorkQueue)(const WCHAR *name, LONG base_priority, DWORD *taskid, DWORD *queue);
 
 static HWND create_window(void)
 {
@@ -450,7 +587,7 @@ static const IMFAsyncCallbackVtbl events_callback_vtbl =
 
 static BOOL get_event(IMFMediaEventGenerator *generator, MediaEventType expected_event_type, PROPVARIANT *value)
 {
-    struct test_callback callback = { 0 };
+    struct test_callback callback = {{ 0 }};
     MediaEventType event_type;
     BOOL ret = FALSE;
     HRESULT hr;
@@ -620,6 +757,9 @@ static void test_source_resolver(void)
     ok(mediasource != NULL, "got %p\n", mediasource);
     ok(obj_type == MF_OBJECT_MEDIASOURCE, "got %d\n", obj_type);
 
+    check_interface(mediasource, &IID_IMFGetService, TRUE);
+    check_service_interface(mediasource, &MF_RATE_CONTROL_SERVICE, &IID_IMFRateSupport, TRUE);
+    check_service_interface(mediasource, &MF_RATE_CONTROL_SERVICE, &IID_IMFRateControl, TRUE);
     hr = IMFMediaSource_CreatePresentationDescriptor(mediasource, &descriptor);
     ok(hr == S_OK, "Failed to get presentation descriptor, hr %#x.\n", hr);
     ok(descriptor != NULL, "got %p\n", descriptor);
@@ -780,14 +920,19 @@ static void init_functions(void)
     X(MFCopyImage);
     X(MFCreate2DMediaBuffer);
     X(MFCreateDXGIDeviceManager);
+    X(MFCreateDXGISurfaceBuffer);
     X(MFCreateDXSurfaceBuffer);
     X(MFCreateSourceResolver);
     X(MFCreateMediaBufferFromMediaType);
     X(MFCreateMFByteStreamOnStream);
     X(MFCreateTrackedSample);
     X(MFCreateTransformActivate);
+    X(MFCreateVideoMediaTypeFromSubtype);
+    X(MFCreateVideoSampleAllocatorEx);
     X(MFGetPlaneSize);
     X(MFGetStrideForBitmapInfoHeader);
+    X(MFLockSharedWorkQueue);
+    X(MFMapDX9FormatToDXGIFormat);
     X(MFMapDXGIFormatToDX9Format);
     X(MFPutWaitingWorkItem);
     X(MFRegisterLocalByteStreamHandler);
@@ -950,28 +1095,32 @@ if(0)
     IUnknown_Release(unk2);
 
     IUnknown_Release(unk);
-
-    hr = MFCreateVideoMediaTypeFromSubtype(&MFVideoFormat_RGB555, &video_type);
-    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
-
-    check_interface(video_type, &IID_IMFMediaType, TRUE);
-    check_interface(video_type, &IID_IMFVideoMediaType, TRUE);
-
-    /* Major and subtype are set on creation. */
-    hr = IMFVideoMediaType_GetCount(video_type, &count);
-    ok(count == 2, "Unexpected attribute count %#x.\n", hr);
-
-    hr = IMFVideoMediaType_DeleteAllItems(video_type);
-    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
-
-    hr = IMFVideoMediaType_GetCount(video_type, &count);
-    ok(!count, "Unexpected attribute count %#x.\n", hr);
-
-    check_interface(video_type, &IID_IMFVideoMediaType, FALSE);
-
-    IMFVideoMediaType_Release(video_type);
-
     IMFMediaType_Release(mediatype);
+
+    if (pMFCreateVideoMediaTypeFromSubtype)
+    {
+        hr = pMFCreateVideoMediaTypeFromSubtype(&MFVideoFormat_RGB555, &video_type);
+        ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+        check_interface(video_type, &IID_IMFMediaType, TRUE);
+        check_interface(video_type, &IID_IMFVideoMediaType, TRUE);
+
+        /* Major and subtype are set on creation. */
+        hr = IMFVideoMediaType_GetCount(video_type, &count);
+        ok(count == 2, "Unexpected attribute count %#x.\n", hr);
+
+        hr = IMFVideoMediaType_DeleteAllItems(video_type);
+        ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+        hr = IMFVideoMediaType_GetCount(video_type, &count);
+        ok(!count, "Unexpected attribute count %#x.\n", hr);
+
+        check_interface(video_type, &IID_IMFVideoMediaType, FALSE);
+
+        IMFVideoMediaType_Release(video_type);
+    }
+    else
+        win_skip("MFCreateVideoMediaTypeFromSubtype() is not available.\n");
 
     /* IMFAudioMediaType */
     hr = MFCreateMediaType(&mediatype);
@@ -5069,15 +5218,19 @@ static void test_queue_com_state(const char *name)
         queue_type = name[1] - '0';
 
         hr = pMFAllocateWorkQueueEx(queue_type, &queue);
-        ok(hr == S_OK, "Failed to allocate a queue, hr %#x.\n", hr);
+        ok(hr == S_OK || broken(queue_type == MF_MULTITHREADED_WORKQUEUE && hr == E_INVALIDARG) /* Win7 */,
+                "Failed to allocate a queue of type %u, hr %#x.\n", queue_type, hr);
 
-        callback.param = queue;
-        hr = MFPutWorkItem(queue, &callback.IMFAsyncCallback_iface, NULL);
-        ok(SUCCEEDED(hr), "Failed to queue work item, hr %#x.\n", hr);
-        WaitForSingleObject(callback.event, INFINITE);
+        if (SUCCEEDED(hr))
+        {
+            callback.param = queue;
+            hr = MFPutWorkItem(queue, &callback.IMFAsyncCallback_iface, NULL);
+            ok(SUCCEEDED(hr), "Failed to queue work item, hr %#x.\n", hr);
+            WaitForSingleObject(callback.event, INFINITE);
 
-        hr = MFUnlockWorkQueue(queue);
-        ok(hr == S_OK, "Failed to unlock the queue, hr %#x.\n", hr);
+            hr = MFUnlockWorkQueue(queue);
+            ok(hr == S_OK, "Failed to unlock the queue, hr %#x.\n", hr);
+        }
     }
 
     CloseHandle(callback.event);
@@ -5246,6 +5399,7 @@ static void test_MFCreate2DMediaBuffer(void)
     ok(hr == S_OK, "Failed to create a buffer, hr %#x.\n", hr);
 
     check_interface(buffer, &IID_IMFGetService, TRUE);
+    check_interface(buffer, &IID_IMF2DBuffer, TRUE);
 
     /* Full backing buffer size, with 64 bytes per row alignment.  */
     hr = IMFMediaBuffer_GetMaxLength(buffer, &max_length);
@@ -5723,6 +5877,7 @@ static void test_MFCreateDXSurfaceBuffer(void)
 {
     IDirect3DSurface9 *backbuffer = NULL, *surface;
     IDirect3DSwapChain9 *swapchain;
+    DWORD length, max_length;
     IDirect3DDevice9 *device;
     IMF2DBuffer2 *_2dbuffer2;
     IMFMediaBuffer *buffer;
@@ -5730,7 +5885,6 @@ static void test_MFCreateDXSurfaceBuffer(void)
     BYTE *data, *data2;
     IMFGetService *gs;
     IDirect3D9 *d3d;
-    DWORD length;
     HWND window;
     HRESULT hr;
     LONG pitch;
@@ -5766,6 +5920,10 @@ static void test_MFCreateDXSurfaceBuffer(void)
     hr = pMFCreateDXSurfaceBuffer(&IID_IDirect3DSurface9, (IUnknown *)backbuffer, FALSE, &buffer);
     ok(hr == S_OK, "Failed to create a buffer, hr %#x.\n", hr);
 
+    check_interface(buffer, &IID_IMF2DBuffer, TRUE);
+    check_interface(buffer, &IID_IMF2DBuffer2, TRUE);
+    check_interface(buffer, &IID_IMFGetService, TRUE);
+
     /* Surface is accessible. */
     hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMFGetService, (void **)&gs);
     ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
@@ -5775,17 +5933,25 @@ static void test_MFCreateDXSurfaceBuffer(void)
     IDirect3DSurface9_Release(surface);
     IMFGetService_Release(gs);
 
-    length = 0;
-    hr = IMFMediaBuffer_GetMaxLength(buffer, &length);
+    max_length = 0;
+    hr = IMFMediaBuffer_GetMaxLength(buffer, &max_length);
     ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
-    ok(!!length, "Unexpected length %u.\n", length);
+    ok(!!max_length, "Unexpected length %u.\n", max_length);
 
     hr = IMFMediaBuffer_GetCurrentLength(buffer, &length);
     ok(hr == S_OK, "Failed to get length, hr %#x.\n", hr);
     ok(!length, "Unexpected length %u.\n", length);
 
-    hr = IMFMediaBuffer_Lock(buffer, &data, NULL, NULL);
+    hr = IMFMediaBuffer_SetCurrentLength(buffer, 2 * max_length);
+    ok(hr == S_OK, "Failed to get length, hr %#x.\n", hr);
+
+    hr = IMFMediaBuffer_GetCurrentLength(buffer, &length);
+    ok(hr == S_OK, "Failed to get length, hr %#x.\n", hr);
+    ok(length == 2 * max_length, "Unexpected length %u.\n", length);
+
+    hr = IMFMediaBuffer_Lock(buffer, &data, NULL, &length);
     ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(length == max_length, "Unexpected length.\n");
 
     /* Unlock twice. */
     hr = IMFMediaBuffer_Unlock(buffer);
@@ -5839,6 +6005,12 @@ static void test_MFCreateDXSurfaceBuffer(void)
     hr = IMF2DBuffer_IsContiguousFormat(_2dbuffer, &value);
     ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
     ok(!value, "Unexpected return value %d.\n", value);
+
+    hr = IMF2DBuffer_GetContiguousLength(_2dbuffer, NULL);
+    ok(hr == E_POINTER, "Unexpected hr %#x.\n", hr);
+    hr = IMF2DBuffer_GetContiguousLength(_2dbuffer, &length);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(length == max_length, "Unexpected length %u.\n", length);
 
     IMF2DBuffer_Release(_2dbuffer);
 
@@ -6025,6 +6197,893 @@ static void test_MFMapDXGIFormatToDX9Format(void)
     }
 }
 
+static void test_MFMapDX9FormatToDXGIFormat(void)
+{
+    static const struct format_pair
+    {
+        DXGI_FORMAT dxgi_format;
+        DWORD d3d9_format;
+    }
+    formats_map[] =
+    {
+        { DXGI_FORMAT_R32G32B32A32_FLOAT, D3DFMT_A32B32G32R32F },
+        { DXGI_FORMAT_R16G16B16A16_FLOAT, D3DFMT_A16B16G16R16F },
+        { DXGI_FORMAT_R16G16B16A16_UNORM, D3DFMT_A16B16G16R16 },
+        { DXGI_FORMAT_R16G16B16A16_SNORM, D3DFMT_Q16W16V16U16 },
+        { DXGI_FORMAT_R32G32_FLOAT, D3DFMT_G32R32F },
+        { DXGI_FORMAT_R10G10B10A2_UNORM, D3DFMT_A2B10G10R10 },
+        { DXGI_FORMAT_R8G8B8A8_SNORM, D3DFMT_Q8W8V8U8 },
+        { DXGI_FORMAT_R16G16_FLOAT, D3DFMT_G16R16F },
+        { DXGI_FORMAT_R16G16_UNORM, D3DFMT_G16R16 },
+        { DXGI_FORMAT_R16G16_SNORM, D3DFMT_V16U16 },
+        { DXGI_FORMAT_D32_FLOAT, D3DFMT_D32F_LOCKABLE },
+        { DXGI_FORMAT_R32_FLOAT, D3DFMT_R32F },
+        { DXGI_FORMAT_D24_UNORM_S8_UINT, D3DFMT_D24S8 },
+        { DXGI_FORMAT_R8G8_SNORM, D3DFMT_V8U8 },
+        { DXGI_FORMAT_R16_FLOAT, D3DFMT_R16F },
+        { DXGI_FORMAT_R16_UNORM, D3DFMT_L16 },
+        { DXGI_FORMAT_R8_UNORM, D3DFMT_L8 },
+        { DXGI_FORMAT_A8_UNORM, D3DFMT_A8 },
+        { DXGI_FORMAT_BC1_UNORM, D3DFMT_DXT1 },
+        { DXGI_FORMAT_BC2_UNORM, D3DFMT_DXT2 },
+        { DXGI_FORMAT_BC3_UNORM, D3DFMT_DXT4 },
+        { DXGI_FORMAT_B8G8R8A8_UNORM, D3DFMT_A8R8G8B8 },
+        { DXGI_FORMAT_B8G8R8X8_UNORM, D3DFMT_X8R8G8B8 },
+        { DXGI_FORMAT_AYUV, MAKEFOURCC('A','Y','U','V') },
+        { DXGI_FORMAT_Y410, MAKEFOURCC('Y','4','1','0') },
+        { DXGI_FORMAT_Y416, MAKEFOURCC('Y','4','1','6') },
+        { DXGI_FORMAT_NV12, MAKEFOURCC('N','V','1','2') },
+        { DXGI_FORMAT_P010, MAKEFOURCC('P','0','1','0') },
+        { DXGI_FORMAT_P016, MAKEFOURCC('P','0','1','6') },
+        { DXGI_FORMAT_420_OPAQUE, MAKEFOURCC('4','2','0','O') },
+        { DXGI_FORMAT_YUY2, D3DFMT_YUY2 },
+        { DXGI_FORMAT_Y210, MAKEFOURCC('Y','2','1','0') },
+        { DXGI_FORMAT_Y216, MAKEFOURCC('Y','2','1','6') },
+        { DXGI_FORMAT_NV11, MAKEFOURCC('N','V','1','1') },
+        { DXGI_FORMAT_AI44, MAKEFOURCC('A','I','4','4') },
+        { DXGI_FORMAT_IA44, MAKEFOURCC('I','A','4','4') },
+        { DXGI_FORMAT_P8, D3DFMT_P8 },
+        { DXGI_FORMAT_A8P8, D3DFMT_A8P8 },
+    };
+    DXGI_FORMAT format;
+    unsigned int i;
+
+    if (!pMFMapDX9FormatToDXGIFormat)
+    {
+        win_skip("MFMapDX9FormatToDXGIFormat() is not available.\n");
+        return;
+    }
+
+    for (i = 0; i < ARRAY_SIZE(formats_map); ++i)
+    {
+        format = pMFMapDX9FormatToDXGIFormat(formats_map[i].d3d9_format);
+        ok(format == formats_map[i].dxgi_format, "Unexpected DXGI format %#x, d3d9 format %#x.\n",
+                format, formats_map[i].d3d9_format);
+    }
+}
+
+static HRESULT WINAPI test_notify_callback_QueryInterface(IMFVideoSampleAllocatorNotify *iface,
+        REFIID riid, void **obj)
+{
+    if (IsEqualIID(riid, &IID_IMFVideoSampleAllocatorNotify) ||
+            IsEqualIID(riid, &IID_IUnknown))
+    {
+        *obj = iface;
+        IMFVideoSampleAllocatorNotify_AddRef(iface);
+        return S_OK;
+    }
+
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI test_notify_callback_AddRef(IMFVideoSampleAllocatorNotify *iface)
+{
+    return 2;
+}
+
+static ULONG WINAPI test_notify_callback_Release(IMFVideoSampleAllocatorNotify *iface)
+{
+    return 1;
+}
+
+static HRESULT WINAPI test_notify_callback_NotifyRelease(IMFVideoSampleAllocatorNotify *iface)
+{
+    return E_NOTIMPL;
+}
+
+static const IMFVideoSampleAllocatorNotifyVtbl test_notify_callback_vtbl =
+{
+    test_notify_callback_QueryInterface,
+    test_notify_callback_AddRef,
+    test_notify_callback_Release,
+    test_notify_callback_NotifyRelease,
+};
+
+static IMFMediaType * create_video_type(const GUID *subtype)
+{
+    IMFMediaType *video_type;
+    HRESULT hr;
+
+    hr = MFCreateMediaType(&video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFMediaType_SetGUID(video_type, &MF_MT_MAJOR_TYPE, &MFMediaType_Video);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFMediaType_SetGUID(video_type, &MF_MT_SUBTYPE, subtype);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    return video_type;
+}
+
+static ID3D11Device *create_d3d11_device(void)
+{
+    static const D3D_FEATURE_LEVEL default_feature_level[] =
+    {
+        D3D_FEATURE_LEVEL_11_0,
+        D3D_FEATURE_LEVEL_10_1,
+        D3D_FEATURE_LEVEL_10_0,
+    };
+    const D3D_FEATURE_LEVEL *feature_level;
+    unsigned int feature_level_count;
+    ID3D11Device *device;
+
+    feature_level = default_feature_level;
+    feature_level_count = ARRAY_SIZE(default_feature_level);
+
+    if (SUCCEEDED(pD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+            feature_level, feature_level_count, D3D11_SDK_VERSION, &device, NULL, NULL)))
+        return device;
+    if (SUCCEEDED(pD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0,
+            feature_level, feature_level_count, D3D11_SDK_VERSION, &device, NULL, NULL)))
+        return device;
+    if (SUCCEEDED(pD3D11CreateDevice(NULL, D3D_DRIVER_TYPE_REFERENCE, NULL, 0,
+            feature_level, feature_level_count, D3D11_SDK_VERSION, &device, NULL, NULL)))
+        return device;
+
+    return NULL;
+}
+
+static void update_d3d11_texture(ID3D11Texture2D *texture, unsigned int sub_resource_idx,
+        const BYTE *data, unsigned int src_pitch)
+{
+    ID3D11DeviceContext *immediate_context;
+    ID3D11Device *device;
+
+    ID3D11Texture2D_GetDevice(texture, &device);
+    ID3D11Device_GetImmediateContext(device, &immediate_context);
+
+    ID3D11DeviceContext_UpdateSubresource(immediate_context, (ID3D11Resource *)texture,
+            sub_resource_idx, NULL, data, src_pitch, 0);
+
+    ID3D11DeviceContext_Release(immediate_context);
+    ID3D11Device_Release(device);
+}
+
+static void test_dxgi_surface_buffer(void)
+{
+    DWORD max_length, cur_length, length, color;
+    IMFDXGIBuffer *dxgi_buffer;
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D *texture;
+    IMF2DBuffer *_2d_buffer;
+    IMFMediaBuffer *buffer;
+    ID3D11Device *device;
+    BYTE buff[64 * 64 * 4];
+    BYTE *data, *data2;
+    LONG pitch, pitch2;
+    UINT index, size;
+    IUnknown *obj;
+    HRESULT hr;
+
+    if (!pMFCreateDXGISurfaceBuffer)
+    {
+        win_skip("MFCreateDXGISurfaceBuffer() is not available.\n");
+        return;
+    }
+
+    device = create_d3d11_device();
+
+    memset(&desc, 0, sizeof(desc));
+    desc.Width = 64;
+    desc.Height = 64;
+    desc.ArraySize = 1;
+    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    desc.SampleDesc.Count = 1;
+    desc.SampleDesc.Quality = 0;
+
+    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
+    ok(hr == S_OK, "Failed to create a texture, hr %#x.\n", hr);
+
+    hr = pMFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, FALSE, &buffer);
+    ok(hr == S_OK, "Failed to create a buffer, hr %#x.\n", hr);
+
+    check_interface(buffer, &IID_IMF2DBuffer, TRUE);
+    check_interface(buffer, &IID_IMF2DBuffer2, TRUE);
+    check_interface(buffer, &IID_IMFDXGIBuffer, TRUE);
+    check_interface(buffer, &IID_IMFGetService, FALSE);
+
+    max_length = 0;
+    hr = IMFMediaBuffer_GetMaxLength(buffer, &max_length);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!!max_length, "Unexpected length %u.\n", max_length);
+
+    hr = IMFMediaBuffer_GetCurrentLength(buffer, &cur_length);
+    ok(hr == S_OK, "Failed to get length, hr %#x.\n", hr);
+    ok(!cur_length, "Unexpected length %u.\n", cur_length);
+
+    hr = IMFMediaBuffer_SetCurrentLength(buffer, 2 * max_length);
+    ok(hr == S_OK, "Failed to get length, hr %#x.\n", hr);
+
+    hr = IMFMediaBuffer_GetCurrentLength(buffer, &cur_length);
+    ok(hr == S_OK, "Failed to get length, hr %#x.\n", hr);
+    ok(cur_length == 2 * max_length, "Unexpected length %u.\n", cur_length);
+
+    hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_GetContiguousLength(_2d_buffer, NULL);
+    ok(hr == E_POINTER, "Unexpected hr %#x.\n", hr);
+    hr = IMF2DBuffer_GetContiguousLength(_2d_buffer, &length);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(length == max_length, "Unexpected length %u.\n", length);
+    IMF2DBuffer_Release(_2d_buffer);
+
+    hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMFDXGIBuffer, (void **)&dxgi_buffer);
+    ok(hr == S_OK, "Failed to get interface, hr %#x.\n", hr);
+
+    EXPECT_REF(texture, 2);
+    hr = IMFDXGIBuffer_GetResource(dxgi_buffer, &IID_ID3D11Texture2D, (void **)&obj);
+    ok(hr == S_OK, "Failed to get resource, hr %#x.\n", hr);
+    EXPECT_REF(texture, 3);
+    ok(obj == (IUnknown *)texture, "Unexpected resource pointer.\n");
+    IUnknown_Release(obj);
+
+    hr = IMFDXGIBuffer_GetSubresourceIndex(dxgi_buffer, NULL);
+    ok(hr == E_POINTER, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFDXGIBuffer_GetSubresourceIndex(dxgi_buffer, &index);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(index == 0, "Unexpected subresource index.\n");
+
+    hr = IMFDXGIBuffer_SetUnknown(dxgi_buffer, &IID_IMFDXGIBuffer, NULL);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFDXGIBuffer_SetUnknown(dxgi_buffer, &IID_IMFDXGIBuffer, (void *)device);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFDXGIBuffer_SetUnknown(dxgi_buffer, &IID_IMFDXGIBuffer, (void *)device);
+    ok(hr == HRESULT_FROM_WIN32(ERROR_OBJECT_ALREADY_EXISTS), "Unexpected hr %#x.\n", hr);
+
+    hr = ID3D11Texture2D_GetPrivateData(texture, &IID_IMFDXGIBuffer, &size, &data);
+    ok(hr == DXGI_ERROR_NOT_FOUND, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFDXGIBuffer_GetUnknown(dxgi_buffer, &IID_IMFDXGIBuffer, &IID_ID3D11Device, (void **)&obj);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(obj == (IUnknown *)device, "Unexpected pointer.\n");
+    IUnknown_Release(obj);
+
+    hr = IMFDXGIBuffer_SetUnknown(dxgi_buffer, &IID_IMFDXGIBuffer, NULL);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFDXGIBuffer_GetUnknown(dxgi_buffer, &IID_IMFDXGIBuffer, &IID_IUnknown, (void **)&obj);
+    ok(hr == MF_E_NOT_FOUND, "Unexpected hr %#x.\n", hr);
+
+    IMFDXGIBuffer_Release(dxgi_buffer);
+
+    /* Texture updates. */
+    color = get_d3d11_texture_color(texture, 0, 0);
+    ok(!color, "Unexpected texture color %#x.\n", color);
+
+    max_length = cur_length = 0;
+    data = NULL;
+    hr = IMFMediaBuffer_Lock(buffer, &data, &max_length, &cur_length);
+todo_wine {
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(max_length && max_length == cur_length, "Unexpected length %u.\n", max_length);
+}
+    if (data) *(DWORD *)data = ~0u;
+
+    color = get_d3d11_texture_color(texture, 0, 0);
+    ok(!color, "Unexpected texture color %#x.\n", color);
+
+    hr = IMFMediaBuffer_Unlock(buffer);
+todo_wine
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    color = get_d3d11_texture_color(texture, 0, 0);
+todo_wine
+    ok(color == ~0u, "Unexpected texture color %#x.\n", color);
+
+    hr = IMFMediaBuffer_Lock(buffer, &data, &max_length, &cur_length);
+todo_wine
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    if (SUCCEEDED(hr))
+        ok(*(DWORD *)data == ~0u, "Unexpected buffer %#x.\n", *(DWORD *)data);
+
+    hr = IMFMediaBuffer_Unlock(buffer);
+todo_wine
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    /* Lock2D()/Unlock2D() */
+    hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_GetScanline0AndPitch(_2d_buffer, &data2, &pitch2);
+    ok(hr == HRESULT_FROM_WIN32(ERROR_WAS_UNLOCKED), "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_Lock2D(_2d_buffer, &data, &pitch);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!!data && pitch == desc.Width * 4, "Unexpected pitch %d.\n", pitch);
+
+    hr = IMF2DBuffer_Lock2D(_2d_buffer, &data, &pitch);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!!data && pitch == desc.Width * 4, "Unexpected pitch %d.\n", pitch);
+
+    hr = IMF2DBuffer_GetScanline0AndPitch(_2d_buffer, &data2, &pitch2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(data2 == data && pitch2 == pitch, "Unexpected data/pitch.\n");
+
+    hr = IMFMediaBuffer_Lock(buffer, &data, &max_length, &cur_length);
+todo_wine
+    ok(hr == MF_E_INVALIDREQUEST, "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_Unlock2D(_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_Unlock2D(_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_Unlock2D(_2d_buffer);
+    ok(hr == HRESULT_FROM_WIN32(ERROR_WAS_UNLOCKED), "Unexpected hr %#x.\n", hr);
+
+    IMF2DBuffer_Release(_2d_buffer);
+    IMFMediaBuffer_Release(buffer);
+
+    /* Bottom up. */
+    hr = pMFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 0, TRUE, &buffer);
+    ok(hr == S_OK, "Failed to create a buffer, hr %#x.\n", hr);
+
+    hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMF2DBuffer_Lock2D(_2d_buffer, &data, &pitch);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!!data && pitch == desc.Width * 4, "Unexpected pitch %d.\n", pitch);
+
+    hr = IMF2DBuffer_GetScanline0AndPitch(_2d_buffer, &data2, &pitch2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(data2 == data && pitch2 == pitch, "Unexpected data/pitch.\n");
+
+    hr = IMF2DBuffer_Unlock2D(_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    IMF2DBuffer_Release(_2d_buffer);
+    IMFMediaBuffer_Release(buffer);
+
+    ID3D11Texture2D_Release(texture);
+
+    /* Subresource index 1. */
+    hr = ID3D11Device_CreateTexture2D(device, &desc, NULL, &texture);
+    ok(hr == S_OK, "Failed to create a texture, hr %#x.\n", hr);
+
+    hr = pMFCreateDXGISurfaceBuffer(&IID_ID3D11Texture2D, (IUnknown *)texture, 1, FALSE, &buffer);
+    ok(hr == S_OK, "Failed to create a buffer, hr %#x.\n", hr);
+
+    hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMF2DBuffer, (void **)&_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    /* Pitch reflects top level. */
+    memset(buff, 0, sizeof(buff));
+    *(DWORD *)buff = 0xff00ff00;
+    update_d3d11_texture(texture, 1, buff, 64 * 4);
+
+    hr = IMF2DBuffer_Lock2D(_2d_buffer, &data, &pitch);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(pitch == desc.Width * 4, "Unexpected pitch %d.\n", pitch);
+    ok(*(DWORD *)data == 0xff00ff00, "Unexpected color %#x.\n", *(DWORD *)data);
+
+    hr = IMF2DBuffer_Unlock2D(_2d_buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    IMF2DBuffer_Release(_2d_buffer);
+    IMFMediaBuffer_Release(buffer);
+
+    ID3D11Texture2D_Release(texture);
+
+    ID3D11Device_Release(device);
+}
+
+static void test_sample_allocator(void)
+{
+    IMFVideoSampleAllocatorNotify test_notify = { &test_notify_callback_vtbl };
+    IMFMediaType *media_type, *video_type, *video_type2;
+    IMFVideoSampleAllocatorCallback *allocator_cb;
+    IMFVideoSampleAllocatorEx *allocatorex;
+    IDirect3DDeviceManager9 *d3d9_manager;
+    IMFVideoSampleAllocator *allocator;
+    unsigned int i, buffer_count, token;
+    IDirect3DDevice9 *d3d9_device;
+    IMFDXGIDeviceManager *manager;
+    IMFSample *sample, *sample2;
+    IMFDXGIBuffer *dxgi_buffer;
+    IMFAttributes *attributes;
+    D3D11_TEXTURE2D_DESC desc;
+    ID3D11Texture2D *texture;
+    IMFMediaBuffer *buffer;
+    ID3D11Device *device;
+    LONG refcount, count;
+    IDirect3D9 *d3d9;
+    IUnknown *unk;
+    HRESULT hr;
+    BYTE *data;
+    HWND window;
+    static const unsigned int usage[] =
+    {
+        D3D11_USAGE_DEFAULT,
+        D3D11_USAGE_IMMUTABLE,
+        D3D11_USAGE_DYNAMIC,
+        D3D11_USAGE_STAGING,
+        D3D11_USAGE_STAGING + 1,
+    };
+
+    if (!pMFCreateVideoSampleAllocatorEx)
+    {
+        win_skip("MFCreateVideoSampleAllocatorEx() is not available.\n");
+        return;
+    }
+
+    hr = pMFCreateVideoSampleAllocatorEx(&IID_IUnknown, (void **)&unk);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    check_interface(unk, &IID_IMFVideoSampleAllocator, TRUE);
+    check_interface(unk, &IID_IMFVideoSampleAllocatorEx, TRUE);
+    check_interface(unk, &IID_IMFVideoSampleAllocatorCallback, TRUE);
+
+    IUnknown_Release(unk);
+
+    hr = pMFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocator, (void **)&allocator);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_QueryInterface(allocator, &IID_IMFVideoSampleAllocatorCallback, (void **)&allocator_cb);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorCallback_SetCallback(allocator_cb, NULL);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorCallback_SetCallback(allocator_cb, &test_notify);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorCallback_SetCallback(allocator_cb, NULL);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, NULL);
+    ok(hr == E_POINTER, "Unexpected hr %#x.\n", hr);
+
+    count = 10;
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, &count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!count, "Unexpected count %d.\n", count);
+
+    hr = IMFVideoSampleAllocator_UninitializeSampleAllocator(allocator);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_AllocateSample(allocator, &sample);
+    ok(hr == MF_E_NOT_INITIALIZED, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_SetDirectXManager(allocator, NULL);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = MFCreateMediaType(&media_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 2, media_type);
+    ok(hr == MF_E_ATTRIBUTENOTFOUND, "Unexpected hr %#x.\n", hr);
+
+    video_type = create_video_type(&MFVideoFormat_RGB32);
+    video_type2 = create_video_type(&MFVideoFormat_RGB32);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 2, video_type);
+    ok(hr == MF_E_ATTRIBUTENOTFOUND, "Unexpected hr %#x.\n", hr);
+
+    /* Frame size is required. */
+    hr = IMFMediaType_SetUINT64(video_type, &MF_MT_FRAME_SIZE, (UINT64) 320 << 32 | 240);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFMediaType_SetUINT64(video_type2, &MF_MT_FRAME_SIZE, (UINT64) 320 << 32 | 240);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 0, video_type);
+    ok(hr == E_INVALIDARG, "Unexpected hr %#x.\n", hr);
+
+    EXPECT_REF(video_type, 1);
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(video_type, 2);
+
+    hr = IMFMediaType_SetUINT64(video_type2, &IID_IUnknown, (UINT64) 320 << 32 | 240);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    /* Setting identical type does not replace it. */
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(video_type, 2);
+    EXPECT_REF(video_type2, 1);
+
+    hr = IMFMediaType_SetUINT64(video_type2, &MF_MT_FRAME_SIZE, (UINT64) 64 << 32 | 64);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(video_type2, 2);
+    EXPECT_REF(video_type, 1);
+
+    /* Modify referenced type. */
+    hr = IMFMediaType_SetUINT64(video_type2, &MF_MT_FRAME_SIZE, (UINT64) 320 << 32 | 64);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(video_type, 2);
+    EXPECT_REF(video_type2, 1);
+
+    count = 0;
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, &count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(count == 1, "Unexpected count %d.\n", count);
+
+    sample = NULL;
+    hr = IMFVideoSampleAllocator_AllocateSample(allocator, &sample);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    refcount = get_refcount(sample);
+
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, &count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!count, "Unexpected count %d.\n", count);
+
+    hr = IMFVideoSampleAllocator_AllocateSample(allocator, &sample2);
+    ok(hr == MF_E_SAMPLEALLOCATOR_EMPTY, "Unexpected hr %#x.\n", hr);
+
+    /* Reinitialize with active sample. */
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 2, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(refcount == get_refcount(sample), "Unexpected refcount %u.\n", get_refcount(sample));
+    EXPECT_REF(video_type, 2);
+
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, &count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+todo_wine
+    ok(!count, "Unexpected count %d.\n", count);
+
+    check_interface(sample, &IID_IMFTrackedSample, TRUE);
+    check_interface(sample, &IID_IMFDesiredSample, FALSE);
+
+    hr = IMFSample_GetBufferByIndex(sample, 0, &buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    check_interface(buffer, &IID_IMF2DBuffer, TRUE);
+    check_interface(buffer, &IID_IMF2DBuffer2, TRUE);
+    check_interface(buffer, &IID_IMFGetService, TRUE);
+    check_interface(buffer, &IID_IMFDXGIBuffer, FALSE);
+
+    IMFMediaBuffer_Release(buffer);
+
+    hr = IMFSample_GetBufferCount(sample, &buffer_count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(buffer_count == 1, "Unexpected buffer count %u.\n", buffer_count);
+
+    IMFSample_Release(sample);
+
+    hr = IMFVideoSampleAllocator_UninitializeSampleAllocator(allocator);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+todo_wine
+    EXPECT_REF(video_type, 2);
+
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, &count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(!count, "Unexpected count %d.\n", count);
+
+    hr = IMFVideoSampleAllocator_AllocateSample(allocator, &sample);
+    ok(hr == MF_E_NOT_INITIALIZED, "Unexpected hr %#x.\n", hr);
+
+    IMFVideoSampleAllocatorCallback_Release(allocator_cb);
+    IMFVideoSampleAllocator_Release(allocator);
+
+    /* IMFVideoSampleAllocatorEx */
+    hr = MFCreateAttributes(&attributes, 0);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = pMFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocatorEx, (void **)&allocatorex);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorEx_QueryInterface(allocatorex, &IID_IMFVideoSampleAllocatorCallback, (void **)&allocator_cb);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocatorex, 1, 0, NULL, video_type);
+    ok(hr == E_INVALIDARG, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFAttributes_SetUINT32(attributes, &MF_SA_BUFFERS_PER_SAMPLE, 2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocatorEx_AllocateSample(allocatorex, &sample);
+    ok(hr == MF_E_NOT_INITIALIZED, "Unexpected hr %#x.\n", hr);
+
+    EXPECT_REF(attributes, 1);
+    hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocatorex, 0, 0, attributes, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(attributes, 2);
+
+    count = 0;
+    hr = IMFVideoSampleAllocatorCallback_GetFreeSampleCount(allocator_cb, &count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(count == 1, "Unexpected count %d.\n", count);
+
+    hr = IMFVideoSampleAllocatorEx_AllocateSample(allocatorex, &sample);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFSample_GetBufferCount(sample, &buffer_count);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(buffer_count == 2, "Unexpected buffer count %u.\n", buffer_count);
+
+    hr = IMFVideoSampleAllocatorEx_AllocateSample(allocatorex, &sample2);
+    ok(hr == MF_E_SAMPLEALLOCATOR_EMPTY, "Unexpected hr %#x.\n", hr);
+
+    /* Reinitialize with already allocated samples. */
+    hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocatorex, 0, 0, NULL, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(attributes, 1);
+
+    hr = IMFVideoSampleAllocatorEx_AllocateSample(allocatorex, &sample2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    IMFSample_Release(sample2);
+
+    IMFSample_Release(sample);
+
+    IMFVideoSampleAllocatorCallback_Release(allocator_cb);
+    IMFVideoSampleAllocatorEx_Release(allocatorex);
+    IMFAttributes_Release(attributes);
+
+    /* Using device manager */
+    if (!(device = create_d3d11_device()))
+    {
+        skip("Failed to create a D3D11 device, skipping tests.\n");
+        return;
+    }
+
+    hr = pMFCreateDXGIDeviceManager(&token, &manager);
+    ok(hr == S_OK, "Failed to create device manager, hr %#x.\n", hr);
+
+    hr = IMFDXGIDeviceManager_ResetDevice(manager, (IUnknown *)device, token);
+    ok(hr == S_OK, "Failed to set a device, hr %#x.\n", hr);
+
+    hr = pMFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocator, (void **)&allocator);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    EXPECT_REF(manager, 1);
+    hr = IMFVideoSampleAllocator_SetDirectXManager(allocator, (IUnknown *)manager);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    EXPECT_REF(manager, 2);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 0, video_type);
+    ok(hr == E_INVALIDARG, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_AllocateSample(allocator, &sample);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFSample_GetBufferByIndex(sample, 0, &buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    check_interface(buffer, &IID_IMF2DBuffer, TRUE);
+    check_interface(buffer, &IID_IMF2DBuffer2, TRUE);
+    check_interface(buffer, &IID_IMFDXGIBuffer, TRUE);
+    check_interface(buffer, &IID_IMFGetService, FALSE);
+
+    hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMFDXGIBuffer, (void **)&dxgi_buffer);
+    ok(hr == S_OK, "Failed to get interface, hr %#x.\n", hr);
+
+    hr = IMFDXGIBuffer_GetResource(dxgi_buffer, &IID_ID3D11Texture2D, (void **)&texture);
+    ok(hr == S_OK, "Failed to get resource, hr %#x.\n", hr);
+
+    ID3D11Texture2D_GetDesc(texture, &desc);
+    ok(desc.Width == 320, "Unexpected width %u.\n", desc.Width);
+    ok(desc.Height == 240, "Unexpected height %u.\n", desc.Height);
+    ok(desc.MipLevels == 1, "Unexpected miplevels %u.\n", desc.MipLevels);
+    ok(desc.ArraySize == 1, "Unexpected array size %u.\n", desc.ArraySize);
+    ok(desc.Format == DXGI_FORMAT_B8G8R8X8_UNORM, "Unexpected format %u.\n", desc.Format);
+    ok(desc.SampleDesc.Count == 1, "Unexpected sample count %u.\n", desc.SampleDesc.Count);
+    ok(desc.SampleDesc.Quality == 0, "Unexpected sample quality %u.\n", desc.SampleDesc.Quality);
+    ok(desc.Usage == D3D11_USAGE_DEFAULT, "Unexpected usage %u.\n", desc.Usage);
+    ok(desc.BindFlags == (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET), "Unexpected bind flags %#x.\n",
+            desc.BindFlags);
+    ok(desc.CPUAccessFlags == 0, "Unexpected CPU access flags %#x.\n", desc.CPUAccessFlags);
+    ok(desc.MiscFlags == 0, "Unexpected misc flags %#x.\n", desc.MiscFlags);
+
+    ID3D11Texture2D_Release(texture);
+    IMFDXGIBuffer_Release(dxgi_buffer);
+
+    hr = IMFMediaBuffer_Lock(buffer, &data, NULL, NULL);
+todo_wine
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFMediaBuffer_Unlock(buffer);
+todo_wine
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    IMFSample_Release(sample);
+
+    IMFVideoSampleAllocator_Release(allocator);
+
+    /* MF_SA_D3D11_USAGE */
+    hr = MFCreateAttributes(&attributes, 1);
+    ok(hr == S_OK, "Failed to create attributes, hr %#x.\n", hr);
+
+    for (i = 0; i < ARRAY_SIZE(usage); ++i)
+    {
+        hr = pMFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocatorEx, (void **)&allocatorex);
+        ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+        hr = IMFVideoSampleAllocatorEx_SetDirectXManager(allocatorex, (IUnknown *)manager);
+        ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+        hr = IMFAttributes_SetUINT32(attributes, &MF_SA_D3D11_USAGE, usage[i]);
+        ok(hr == S_OK, "Failed to set attribute, hr %#x.\n", hr);
+
+        hr = IMFVideoSampleAllocatorEx_InitializeSampleAllocatorEx(allocatorex, 0, 0, attributes, video_type);
+        if (usage[i] == D3D11_USAGE_IMMUTABLE || usage[i] > D3D11_USAGE_STAGING)
+        {
+            ok(hr == E_INVALIDARG, "Unexpected hr %#x.\n", hr);
+            IMFVideoSampleAllocatorEx_Release(allocatorex);
+            continue;
+        }
+        ok(hr == S_OK, "%u: Unexpected hr %#x.\n", usage[i], hr);
+
+        hr = IMFAttributes_SetUINT32(attributes, &MF_SA_D3D11_USAGE, D3D11_USAGE_DEFAULT);
+        ok(hr == S_OK, "Failed to set attribute, hr %#x.\n", hr);
+
+        hr = IMFVideoSampleAllocatorEx_AllocateSample(allocatorex, &sample);
+        ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+        hr = IMFSample_GetBufferByIndex(sample, 0, &buffer);
+        ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+        hr = IMFMediaBuffer_QueryInterface(buffer, &IID_IMFDXGIBuffer, (void **)&dxgi_buffer);
+        ok(hr == S_OK, "Failed to get interface, hr %#x.\n", hr);
+
+        hr = IMFDXGIBuffer_GetResource(dxgi_buffer, &IID_ID3D11Texture2D, (void **)&texture);
+        ok(hr == S_OK, "Failed to get resource, hr %#x.\n", hr);
+
+        ID3D11Texture2D_GetDesc(texture, &desc);
+        ok(desc.Usage == usage[i], "Unexpected usage %u.\n", desc.Usage);
+        if (usage[i] == D3D11_USAGE_DEFAULT)
+        {
+            ok(desc.BindFlags == (D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET), "Unexpected bind flags %#x.\n",
+                desc.BindFlags);
+            ok(desc.CPUAccessFlags == 0, "Unexpected CPU access flags %#x.\n", desc.CPUAccessFlags);
+        }
+        else if (usage[i] == D3D11_USAGE_DYNAMIC)
+        {
+            ok(desc.BindFlags == D3D11_BIND_SHADER_RESOURCE, "Unexpected bind flags %#x.\n", desc.BindFlags);
+            ok(desc.CPUAccessFlags == D3D11_CPU_ACCESS_WRITE, "Unexpected CPU access flags %#x.\n", desc.CPUAccessFlags);
+        }
+        else if (usage[i] == D3D11_USAGE_STAGING)
+        {
+            ok(desc.BindFlags == 0, "Unexpected bind flags %#x.\n", desc.BindFlags);
+            ok(desc.CPUAccessFlags == (D3D11_CPU_ACCESS_WRITE | D3D11_CPU_ACCESS_READ), "Unexpected CPU access flags %#x.\n",
+                    desc.CPUAccessFlags);
+        }
+        ok(desc.MiscFlags == 0, "Unexpected misc flags %#x.\n", desc.MiscFlags);
+
+        ID3D11Texture2D_Release(texture);
+        IMFDXGIBuffer_Release(dxgi_buffer);
+        IMFMediaBuffer_Release(buffer);
+
+        IMFSample_Release(sample);
+
+        IMFVideoSampleAllocatorEx_Release(allocatorex);
+    }
+
+    IMFAttributes_Release(attributes);
+
+    IMFDXGIDeviceManager_Release(manager);
+    ID3D11Device_Release(device);
+
+    /* Use D3D9 device manager. */
+    window = create_window();
+    d3d9 = Direct3DCreate9(D3D_SDK_VERSION);
+    ok(!!d3d9, "Failed to create a D3D9 object.\n");
+    if (!(d3d9_device = create_device(d3d9, window)))
+    {
+        skip("Failed to create a D3D9 device, skipping tests.\n");
+        goto done;
+    }
+
+    hr = DXVA2CreateDirect3DDeviceManager9(&token, &d3d9_manager);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IDirect3DDeviceManager9_ResetDevice(d3d9_manager, d3d9_device, token);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = pMFCreateVideoSampleAllocatorEx(&IID_IMFVideoSampleAllocator, (void **)&allocator);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_SetDirectXManager(allocator, (IUnknown *)d3d9_manager);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_InitializeSampleAllocator(allocator, 1, video_type);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = IMFVideoSampleAllocator_AllocateSample(allocator, &sample);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    check_interface(sample, &IID_IMFTrackedSample, TRUE);
+    check_interface(sample, &IID_IMFDesiredSample, FALSE);
+
+    hr = IMFSample_GetBufferByIndex(sample, 0, &buffer);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    check_interface(buffer, &IID_IMF2DBuffer, TRUE);
+    check_interface(buffer, &IID_IMF2DBuffer2, TRUE);
+    check_interface(buffer, &IID_IMFGetService, TRUE);
+    check_interface(buffer, &IID_IMFDXGIBuffer, FALSE);
+
+    IMFSample_Release(sample);
+    IMFMediaBuffer_Release(buffer);
+
+    IMFVideoSampleAllocator_Release(allocator);
+    IMFMediaType_Release(media_type);
+
+done:
+    IDirect3D9_Release(d3d9);
+    DestroyWindow(window);
+}
+
+static void test_MFLockSharedWorkQueue(void)
+{
+    DWORD taskid, queue, queue2;
+    HRESULT hr;
+
+    if (!pMFLockSharedWorkQueue)
+    {
+        win_skip("MFLockSharedWorkQueue() is not available.\n");
+        return;
+    }
+
+    hr = MFStartup(MF_VERSION, MFSTARTUP_FULL);
+    ok(hr == S_OK, "Failed to start up, hr %#x.\n", hr);
+
+    hr = pMFLockSharedWorkQueue(NULL, 0, &taskid, &queue);
+    ok(hr == E_POINTER, "Unexpected hr %#x.\n", hr);
+
+    hr = pMFLockSharedWorkQueue(NULL, 0, NULL, &queue);
+    ok(hr == E_POINTER, "Unexpected hr %#x.\n", hr);
+
+    taskid = 0;
+    hr = pMFLockSharedWorkQueue(L"", 0, &taskid, &queue);
+    ok(hr == E_INVALIDARG, "Unexpected hr %#x.\n", hr);
+
+    queue = 0;
+    hr = pMFLockSharedWorkQueue(L"", 0, NULL, &queue);
+    ok(queue & MFASYNC_CALLBACK_QUEUE_PRIVATE_MASK, "Unexpected queue id.\n");
+
+    queue2 = 0;
+    hr = pMFLockSharedWorkQueue(L"", 0, NULL, &queue2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+    ok(queue == queue2, "Unexpected queue %#x.\n", queue2);
+
+    hr = MFUnlockWorkQueue(queue2);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = MFUnlockWorkQueue(queue);
+    ok(hr == S_OK, "Unexpected hr %#x.\n", hr);
+
+    hr = MFShutdown();
+    ok(hr == S_OK, "Failed to shut down, hr %#x.\n", hr);
+}
+
 START_TEST(mfplat)
 {
     char **argv;
@@ -6053,6 +7112,7 @@ START_TEST(mfplat)
     test_source_resolver();
     test_MFCreateAsyncResult();
     test_allocate_queue();
+    test_MFLockSharedWorkQueue();
     test_MFCopyImage();
     test_MFCreateCollection();
     test_MFHeapAlloc();
@@ -6085,6 +7145,9 @@ START_TEST(mfplat)
     test_MFCreateTrackedSample();
     test_MFFrameRateToAverageTimePerFrame();
     test_MFMapDXGIFormatToDX9Format();
+    test_dxgi_surface_buffer();
+    test_sample_allocator();
+    test_MFMapDX9FormatToDXGIFormat();
 
     CoUninitialize();
 }

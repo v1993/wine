@@ -32,7 +32,7 @@
 #include "rtworkq.h"
 #include "ole2.h"
 #include "propsys.h"
-#include "dxgi.h"
+#include "d3d11.h"
 #include "uuids.h"
 
 #include "wine/debug.h"
@@ -700,20 +700,6 @@ static BOOL GUIDFromString(LPCWSTR s, GUID *id)
 
     if (!s[36]) return TRUE;
     return FALSE;
-}
-
-BOOL WINAPI DllMain(HINSTANCE instance, DWORD reason, LPVOID reserved)
-{
-    switch (reason)
-    {
-        case DLL_WINE_PREATTACH:
-            return FALSE;    /* prefer native version */
-        case DLL_PROCESS_ATTACH:
-            DisableThreadLibraryCalls(instance);
-            break;
-    }
-
-    return TRUE;
 }
 
 static HRESULT register_transform(const CLSID *clsid, const WCHAR *name, UINT32 flags,
@@ -1525,6 +1511,7 @@ const char *debugstr_attr(const GUID *guid)
     static const struct guid_def guid_defs[] =
     {
 #define X(g) { &(g), #g }
+#define MF_READER_WRITER_D3D_MANAGER MF_SOURCE_READER_D3D_MANAGER
         X(MF_READWRITE_MMCSS_CLASS),
         X(MF_TOPONODE_MARKIN_HERE),
         X(MF_MT_H264_SUPPORTED_SYNC_FRAME_TYPES),
@@ -1615,6 +1602,7 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_MT_PALETTE),
         X(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_PROVIDER_DEVICE_ID),
         X(MF_TOPOLOGY_STATIC_PLAYBACK_OPTIMIZATIONS),
+        X(MF_SA_D3D11_USAGE),
         X(MF_MEDIA_ENGINE_NEEDKEY_CALLBACK),
         X(MF_MT_GEOMETRIC_APERTURE),
         X(MF_MT_ORIGINAL_WAVE_FORMAT_TAG),
@@ -1630,6 +1618,7 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_MT_SPATIAL_AUDIO_MAX_DYNAMIC_OBJECTS),
         X(MF_MT_DECODER_MAX_DPB_COUNT),
         X(MFSampleExtension_ForwardedDecodeUnits),
+        X(MF_SA_D3D11_SHARED_WITHOUT_MUTEX),
         X(MF_MT_DV_AAUX_CTRL_PACK_0),
         X(MF_MT_YUV_MATRIX),
         X(MF_EVENT_SOURCE_TOPOLOGY_CANCELED),
@@ -1664,6 +1653,7 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_MEDIA_ENGINE_PLAYBACK_VISUAL),
         X(MF_MT_VIDEO_CHROMA_SITING),
         X(MF_AUDIO_RENDERER_ATTRIBUTE_STREAM_CATEGORY),
+        X(MF_SA_BUFFERS_PER_SAMPLE),
         X(MFSampleExtension_3DVideo_SampleFormat),
         X(MF_MT_H264_RESOLUTION_SCALING),
         X(MF_MT_VIDEO_LEVEL),
@@ -1736,10 +1726,10 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_TOPONODE_RATELESS),
         X(MF_EVENT_STREAM_METADATA_CONTENT_KEYIDS),
         X(MF_TOPONODE_DISABLE_PREROLL),
+        X(MF_SA_D3D11_ALLOW_DYNAMIC_YUV_TEXTURE),
         X(MF_MT_VIDEO_3D_FORMAT),
         X(MF_EVENT_STREAM_METADATA_KEYDATA),
-        X(MF_SINK_WRITER_D3D_MANAGER),
-        X(MF_SOURCE_READER_D3D_MANAGER),
+        X(MF_READER_WRITER_D3D_MANAGER),
         X(MFSampleExtension_3DVideo),
         X(MF_MT_H264_USAGE),
         X(MF_MEDIA_ENGINE_EME_CALLBACK),
@@ -1751,6 +1741,7 @@ const char *debugstr_attr(const GUID *guid)
         X(MFT_ENUM_HARDWARE_URL_Attribute),
         X(MF_SOURCE_READER_ASYNC_CALLBACK),
         X(MF_MT_OUTPUT_BUFFER_NUM),
+        X(MF_SA_D3D11_BINDFLAGS),
         X(MFT_ENCODER_SUPPORTS_CONFIG_EVENT),
         X(MF_MT_AUDIO_FLAC_MAX_BLOCK_SIZE),
         X(MFT_FRIENDLY_NAME_Attribute),
@@ -1772,10 +1763,12 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_MT_SPATIAL_AUDIO_OBJECT_METADATA_LENGTH),
         X(MF_MT_SPATIAL_AUDIO_OBJECT_METADATA_FORMAT_ID),
         X(MF_SAMPLEGRABBERSINK_IGNORE_CLOCK),
+        X(MF_SA_D3D11_SHARED),
         X(MF_MT_PAN_SCAN_ENABLED),
         X(MF_AUDIO_RENDERER_ATTRIBUTE_ENDPOINT_ID),
         X(MF_MT_DV_VAUX_CTRL_PACK),
         X(MFSampleExtension_ForwardedDecodeUnitType),
+        X(MF_SA_D3D11_AWARE),
         X(MF_MT_AUDIO_AVG_BYTES_PER_SECOND),
         X(MF_SOURCE_READER_MEDIASOURCE_CHARACTERISTICS),
         X(MF_MT_SPATIAL_AUDIO_MIN_METADATA_ITEM_OFFSET_SPACING),
@@ -1802,6 +1795,7 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_MT_H264_RATE_CONTROL_MODES),
         X(MF_DEVSOURCE_ATTRIBUTE_SOURCE_TYPE_VIDCAP_SYMBOLIC_LINK),
         X(MF_READWRITE_D3D_OPTIONAL),
+        X(MF_SA_D3D11_HW_PROTECTED),
         X(MF_MEDIA_ENGINE_DXGI_MANAGER),
         X(MF_READWRITE_MMCSS_CLASS_AUDIO),
         X(MF_MEDIA_ENGINE_COREWINDOW),
@@ -1869,6 +1863,7 @@ const char *debugstr_attr(const GUID *guid)
         X(MF_AUDIO_RENDERER_ATTRIBUTE_ENDPOINT_ROLE),
         X(MF_MT_VIDEO_3D_LEFT_IS_BASE),
         X(MF_TOPONODE_WORKQUEUE_MMCSS_TASKID),
+#undef MF_READER_WRITER_D3D_MANAGER
 #undef X
     };
     struct guid_def *ret = NULL;
@@ -2222,7 +2217,7 @@ static HRESULT attributes_get_item(struct attributes *attributes, const GUID *ke
     attribute = attributes_find_item(attributes, key, NULL);
     if (attribute)
     {
-        if (attribute->value.vt == value->vt && !(value->vt == VT_UNKNOWN && !attribute->value.u.punkVal))
+        if (attribute->value.vt == value->vt && !(value->vt == VT_UNKNOWN && !attribute->value.punkVal))
             hr = PropVariantCopy(value, &attribute->value);
         else
             hr = MF_E_INVALIDTYPE;
@@ -2378,7 +2373,7 @@ HRESULT attributes_GetUINT32(struct attributes *attributes, REFGUID key, UINT32 
     attrval.vt = VT_UI4;
     hr = attributes_get_item(attributes, key, &attrval);
     if (SUCCEEDED(hr))
-        *value = attrval.u.ulVal;
+        *value = attrval.ulVal;
 
     return hr;
 }
@@ -2392,7 +2387,7 @@ HRESULT attributes_GetUINT64(struct attributes *attributes, REFGUID key, UINT64 
     attrval.vt = VT_UI8;
     hr = attributes_get_item(attributes, key, &attrval);
     if (SUCCEEDED(hr))
-        *value = attrval.u.uhVal.QuadPart;
+        *value = attrval.uhVal.QuadPart;
 
     return hr;
 }
@@ -2406,7 +2401,7 @@ HRESULT attributes_GetDouble(struct attributes *attributes, REFGUID key, double 
     attrval.vt = VT_R8;
     hr = attributes_get_item(attributes, key, &attrval);
     if (SUCCEEDED(hr))
-        *value = attrval.u.dblVal;
+        *value = attrval.dblVal;
 
     return hr;
 }
@@ -2422,7 +2417,7 @@ HRESULT attributes_GetGUID(struct attributes *attributes, REFGUID key, GUID *val
     if (attribute)
     {
         if (attribute->value.vt == MF_ATTRIBUTE_GUID)
-            *value = *attribute->value.u.puuid;
+            *value = *attribute->value.puuid;
         else
             hr = MF_E_INVALIDTYPE;
     }
@@ -2445,7 +2440,7 @@ HRESULT attributes_GetStringLength(struct attributes *attributes, REFGUID key, U
     if (attribute)
     {
         if (attribute->value.vt == MF_ATTRIBUTE_STRING)
-            *length = lstrlenW(attribute->value.u.pwszVal);
+            *length = lstrlenW(attribute->value.pwszVal);
         else
             hr = MF_E_INVALIDTYPE;
     }
@@ -2470,7 +2465,7 @@ HRESULT attributes_GetString(struct attributes *attributes, REFGUID key, WCHAR *
     {
         if (attribute->value.vt == MF_ATTRIBUTE_STRING)
         {
-            int len = lstrlenW(attribute->value.u.pwszVal);
+            int len = lstrlenW(attribute->value.pwszVal);
 
             if (length)
                 *length = len;
@@ -2478,7 +2473,7 @@ HRESULT attributes_GetString(struct attributes *attributes, REFGUID key, WCHAR *
             if (size <= len)
                 hr = STRSAFE_E_INSUFFICIENT_BUFFER;
             else
-                memcpy(value, attribute->value.u.pwszVal, (len + 1) * sizeof(WCHAR));
+                memcpy(value, attribute->value.pwszVal, (len + 1) * sizeof(WCHAR));
         }
         else
             hr = MF_E_INVALIDTYPE;
@@ -2501,7 +2496,7 @@ HRESULT attributes_GetAllocatedString(struct attributes *attributes, REFGUID key
     hr = attributes_get_item(attributes, key, &attrval);
     if (SUCCEEDED(hr))
     {
-        *value = attrval.u.pwszVal;
+        *value = attrval.pwszVal;
         *length = lstrlenW(*value);
     }
 
@@ -2519,7 +2514,7 @@ HRESULT attributes_GetBlobSize(struct attributes *attributes, REFGUID key, UINT3
     if (attribute)
     {
         if (attribute->value.vt == MF_ATTRIBUTE_BLOB)
-            *size = attribute->value.u.caub.cElems;
+            *size = attribute->value.caub.cElems;
         else
             hr = MF_E_INVALIDTYPE;
     }
@@ -2543,7 +2538,7 @@ HRESULT attributes_GetBlob(struct attributes *attributes, REFGUID key, UINT8 *bu
     {
         if (attribute->value.vt == MF_ATTRIBUTE_BLOB)
         {
-            UINT32 size = attribute->value.u.caub.cElems;
+            UINT32 size = attribute->value.caub.cElems;
 
             if (bufsize >= size)
                 hr = PropVariantToBuffer(&attribute->value, buf, size);
@@ -2573,8 +2568,8 @@ HRESULT attributes_GetAllocatedBlob(struct attributes *attributes, REFGUID key, 
     hr = attributes_get_item(attributes, key, &attrval);
     if (SUCCEEDED(hr))
     {
-        *buf = attrval.u.caub.pElems;
-        *size = attrval.u.caub.cElems;
+        *buf = attrval.caub.pElems;
+        *size = attrval.caub.cElems;
     }
 
     return hr;
@@ -2589,7 +2584,7 @@ HRESULT attributes_GetUnknown(struct attributes *attributes, REFGUID key, REFIID
     attrval.vt = VT_UNKNOWN;
     hr = attributes_get_item(attributes, key, &attrval);
     if (SUCCEEDED(hr))
-        hr = IUnknown_QueryInterface(attrval.u.punkVal, riid, out);
+        hr = IUnknown_QueryInterface(attrval.punkVal, riid, out);
     PropVariantClear(&attrval);
     return hr;
 }
@@ -2689,7 +2684,7 @@ HRESULT attributes_SetUINT32(struct attributes *attributes, REFGUID key, UINT32 
     PROPVARIANT attrval;
 
     attrval.vt = VT_UI4;
-    attrval.u.ulVal = value;
+    attrval.ulVal = value;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -2698,7 +2693,7 @@ HRESULT attributes_SetUINT64(struct attributes *attributes, REFGUID key, UINT64 
     PROPVARIANT attrval;
 
     attrval.vt = VT_UI8;
-    attrval.u.uhVal.QuadPart = value;
+    attrval.uhVal.QuadPart = value;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -2707,7 +2702,7 @@ HRESULT attributes_SetDouble(struct attributes *attributes, REFGUID key, double 
     PROPVARIANT attrval;
 
     attrval.vt = VT_R8;
-    attrval.u.dblVal = value;
+    attrval.dblVal = value;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -2716,7 +2711,7 @@ HRESULT attributes_SetGUID(struct attributes *attributes, REFGUID key, REFGUID v
     PROPVARIANT attrval;
 
     attrval.vt = VT_CLSID;
-    attrval.u.puuid = (CLSID *)value;
+    attrval.puuid = (CLSID *)value;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -2725,7 +2720,7 @@ HRESULT attributes_SetString(struct attributes *attributes, REFGUID key, const W
     PROPVARIANT attrval;
 
     attrval.vt = VT_LPWSTR;
-    attrval.u.pwszVal = (WCHAR *)value;
+    attrval.pwszVal = (WCHAR *)value;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -2734,8 +2729,8 @@ HRESULT attributes_SetBlob(struct attributes *attributes, REFGUID key, const UIN
     PROPVARIANT attrval;
 
     attrval.vt = VT_VECTOR | VT_UI1;
-    attrval.u.caub.cElems = size;
-    attrval.u.caub.pElems = (UINT8 *)buf;
+    attrval.caub.cElems = size;
+    attrval.caub.pElems = (UINT8 *)buf;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -2744,7 +2739,7 @@ HRESULT attributes_SetUnknown(struct attributes *attributes, REFGUID key, IUnkno
     PROPVARIANT attrval;
 
     attrval.vt = VT_UNKNOWN;
-    attrval.u.punkVal = unknown;
+    attrval.punkVal = unknown;
     return attributes_set_item(attributes, key, &attrval);
 }
 
@@ -3346,22 +3341,22 @@ HRESULT WINAPI MFGetAttributesAsBlob(IMFAttributes *attributes, UINT8 *buffer, U
         {
             case MF_ATTRIBUTE_UINT32:
             case MF_ATTRIBUTE_UINT64:
-                item.u.i64 = value.u.uhVal.QuadPart;
+                item.u.i64 = value.uhVal.QuadPart;
                 break;
             case MF_ATTRIBUTE_DOUBLE:
-                item.u.f = value.u.dblVal;
+                item.u.f = value.dblVal;
                 break;
             case MF_ATTRIBUTE_GUID:
-                item.u.subheader.size = sizeof(*value.u.puuid);
-                data = value.u.puuid;
+                item.u.subheader.size = sizeof(*value.puuid);
+                data = value.puuid;
                 break;
             case MF_ATTRIBUTE_STRING:
-                item.u.subheader.size = (lstrlenW(value.u.pwszVal) + 1) * sizeof(WCHAR);
-                data = value.u.pwszVal;
+                item.u.subheader.size = (lstrlenW(value.pwszVal) + 1) * sizeof(WCHAR);
+                data = value.pwszVal;
                 break;
             case MF_ATTRIBUTE_BLOB:
-                item.u.subheader.size = value.u.caub.cElems;
-                data = value.u.caub.pElems;
+                item.u.subheader.size = value.caub.cElems;
+                data = value.caub.pElems;
                 break;
             case MF_ATTRIBUTE_IUNKNOWN:
                 break;
@@ -7242,7 +7237,7 @@ static HRESULT WINAPI eventqueue_QueueEventParamUnk(IMFMediaEventQueue *iface, M
     TRACE("%p, %s, %s, %#x, %p.\n", iface, debugstr_eventid(event_type), debugstr_guid(extended_type), status, unk);
 
     value.vt = VT_UNKNOWN;
-    value.u.punkVal = unk;
+    value.punkVal = unk;
 
     if (FAILED(hr = MFCreateMediaEvent(event_type, extended_type, status, &value, &event)))
         return hr;
@@ -8591,7 +8586,7 @@ static HRESULT dxgi_device_manager_get_handle_index(struct dxgi_device_manager *
 
 static HRESULT WINAPI dxgi_device_manager_QueryInterface(IMFDXGIDeviceManager *iface, REFIID riid, void **obj)
 {
-    TRACE("(%p, %s, %p).\n", iface, debugstr_guid(riid), obj);
+    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), obj);
 
     if (IsEqualIID(riid, &IID_IMFDXGIDeviceManager) ||
         IsEqualGUID(riid, &IID_IUnknown))
@@ -8611,7 +8606,7 @@ static ULONG WINAPI dxgi_device_manager_AddRef(IMFDXGIDeviceManager *iface)
     struct dxgi_device_manager *manager = impl_from_IMFDXGIDeviceManager(iface);
     ULONG refcount = InterlockedIncrement(&manager->refcount);
 
-    TRACE("(%p) ref=%u.\n", iface, refcount);
+    TRACE("%p, refcount %u.\n", iface, refcount);
 
     return refcount;
 }
@@ -8621,7 +8616,7 @@ static ULONG WINAPI dxgi_device_manager_Release(IMFDXGIDeviceManager *iface)
     struct dxgi_device_manager *manager = impl_from_IMFDXGIDeviceManager(iface);
     ULONG refcount = InterlockedDecrement(&manager->refcount);
 
-    TRACE("(%p) ref=%u.\n", iface, refcount);
+    TRACE("%p, refcount %u.\n", iface, refcount);
 
     if (!refcount)
     {

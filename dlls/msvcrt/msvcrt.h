@@ -32,6 +32,8 @@
 #include "winbase.h"
 #undef strncpy
 
+extern BOOL sse2_supported DECLSPEC_HIDDEN;
+
 #define DBL80_MAX_10_EXP 4932
 #define DBL80_MIN_10_EXP -4951
 
@@ -64,6 +66,7 @@ typedef struct __lc_time_data {
 #endif
     int unk;
     int refcount;
+#if _MSVCR_VER == 0 || _MSVCR_VER >= 100
     union {
         const wchar_t *wstr[43];
         struct {
@@ -78,6 +81,7 @@ typedef struct __lc_time_data {
             const wchar_t *time;
         } names;
     } wstr;
+#endif
 #if _MSVCR_VER >= 110
     const wchar_t *locname;
 #endif
@@ -228,7 +232,6 @@ extern BOOL msvcrt_init_locale(void) DECLSPEC_HIDDEN;
 extern void msvcrt_init_math(void*) DECLSPEC_HIDDEN;
 extern void msvcrt_init_io(void) DECLSPEC_HIDDEN;
 extern void msvcrt_free_io(void) DECLSPEC_HIDDEN;
-extern void msvcrt_init_console(void) DECLSPEC_HIDDEN;
 extern void msvcrt_free_console(void) DECLSPEC_HIDDEN;
 extern void msvcrt_init_args(void) DECLSPEC_HIDDEN;
 extern void msvcrt_free_args(void) DECLSPEC_HIDDEN;

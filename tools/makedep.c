@@ -1570,6 +1570,7 @@ static struct file *open_include_file( const struct makefile *make, struct incl_
     if (pFile->type == INCL_SYSTEM && pFile->use_msvcrt)
     {
         if (!strcmp( pFile->name, "stdarg.h" )) return NULL;
+        if (!strcmp( pFile->name, "x86intrin.h" )) return NULL;
         fprintf( stderr, "%s:%d: error: system header %s cannot be used with msvcrt\n",
                  pFile->included_by->file->name, pFile->included_line, pFile->name );
         exit(1);
@@ -3083,7 +3084,10 @@ static void output_source_spec( struct makefile *make, struct incl_file *source,
 
     strarray_add( &make->clean_files, dll_name );
     strarray_add( &make->res_files, strmake( "%s.res", obj ));
-    output( "%s.res: %s\n", obj_dir_path( make, obj ), obj_dir_path( make, dll_name ));
+    output( "%s.res:", obj_dir_path( make, obj ));
+    output_filename( obj_dir_path( make, dll_name ));
+    output_filename( tools_path( make, "wrc" ));
+    output( "\n" );
     output( "\t%secho \"%s.dll TESTDLL \\\"%s\\\"\" | %s -u -o $@\n", cmd_prefix( "WRC" ), obj, output_file,
             tools_path( make, "wrc" ));
 

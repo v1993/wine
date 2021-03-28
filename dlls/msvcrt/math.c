@@ -64,14 +64,19 @@ typedef int (CDECL *MSVCRT_matherr_func)(struct _exception *);
 
 static MSVCRT_matherr_func MSVCRT_default_matherr_func = NULL;
 
-static BOOL sse2_supported;
+BOOL sse2_supported;
 static BOOL sse2_enabled;
 
 static const struct unix_funcs *unix_funcs;
 
 void msvcrt_init_math( void *module )
 {
-    sse2_supported = sse2_enabled = IsProcessorFeaturePresent( PF_XMMI64_INSTRUCTIONS_AVAILABLE );
+    sse2_supported = IsProcessorFeaturePresent( PF_XMMI64_INSTRUCTIONS_AVAILABLE );
+#if _MSVCR_VER <=71
+    sse2_enabled = FALSE;
+#else
+    sse2_enabled = sse2_supported;
+#endif
     __wine_init_unix_lib( module, DLL_PROCESS_ATTACH, NULL, &unix_funcs );
 }
 
@@ -81,6 +86,38 @@ static inline float fp_barrierf(float x)
     volatile float y = x;
     return y;
 }
+
+static inline double CDECL ret_nan( BOOL update_sw )
+{
+    double x = 1.0;
+    if (!update_sw) return -NAN;
+    return (x - x) / (x - x);
+}
+
+#define SET_X87_CW(MASK) \
+    "subl $4, %esp\n\t" \
+    __ASM_CFI(".cfi_adjust_cfa_offset 4\n\t") \
+    "fnstcw (%esp)\n\t" \
+    "movw (%esp), %ax\n\t" \
+    "movw %ax, 2(%esp)\n\t" \
+    "testw $" #MASK ", %ax\n\t" \
+    "jz 1f\n\t" \
+    "andw $~" #MASK ", %ax\n\t" \
+    "movw %ax, 2(%esp)\n\t" \
+    "fldcw 2(%esp)\n\t" \
+    "1:\n\t"
+
+#define RESET_X87_CW \
+    "movw (%esp), %ax\n\t" \
+    "cmpw %ax, 2(%esp)\n\t" \
+    "je 1f\n\t" \
+    "fstpl 8(%esp)\n\t" \
+    "fldcw (%esp)\n\t" \
+    "fldl 8(%esp)\n\t" \
+    "fwait\n\t" \
+    "1:\n\t" \
+    "addl $4, %esp\n\t" \
+    __ASM_CFI(".cfi_adjust_cfa_offset -4\n\t")
 
 /*********************************************************************
  *      _matherr (CRTDLL.@)
@@ -250,28 +287,29 @@ int CDECL _isnanf( float num )
     return (u.i & 0x7fffffff) > 0x7f800000;
 }
 
+static float asinf_R(float z)
+{
+    /* coefficients for R(x^2) */
+    static const float p1 = 1.66666672e-01,
+                 p2 = -5.11644611e-02,
+                 p3 = -1.21124933e-02,
+                 p4 = -3.58742251e-03,
+                 q1 = -7.56982703e-01;
+
+    float p, q;
+    p = z * (p1 + z * (p2 + z * (p3 + z * p4)));
+    q = 1.0f + z * q1;
+    return p / q;
+}
+
 /*********************************************************************
  *      acosf (MSVCRT.@)
  *
  * Copied from musl: src/math/acosf.c
  */
-static float acosf_R(float z)
-{
-    static const float pS0 = 1.6666586697e-01,
-                 pS1 = -4.2743422091e-02,
-                 pS2 = -8.6563630030e-03,
-                 qS1 = -7.0662963390e-01;
-
-    float p, q;
-    p = z * (pS0 + z * (pS1 + z * pS2));
-    q = 1.0f + z * qS1;
-    return p / q;
-}
-
 float CDECL acosf( float x )
 {
-    static const float pio2_hi = 1.5707962513e+00,
-                 pio2_lo = 7.5497894159e-08;
+    static const double pio2_lo = 6.12323399573676603587e-17;
 
     float z, w, s, c, df;
     unsigned int hx, ix;
@@ -282,7 +320,7 @@ float CDECL acosf( float x )
     if (ix >= 0x3f800000) {
         if (ix == 0x3f800000) {
             if (hx >> 31)
-                return 2 * pio2_lo + 2 * pio2_hi + 7.5231638453e-37;
+                return M_PI;
             return 0;
         }
         if (isnan(x)) return x;
@@ -291,23 +329,22 @@ float CDECL acosf( float x )
     /* |x| < 0.5 */
     if (ix < 0x3f000000) {
         if (ix <= 0x32800000) /* |x| < 2**-26 */
-            return pio2_lo + pio2_hi + 7.5231638453e-37;
-        return pio2_hi - (x - (pio2_lo - x * acosf_R(x * x)));
+            return M_PI_2;
+        return M_PI_2 - (x - (pio2_lo - x * asinf_R(x * x)));
     }
     /* x < -0.5 */
     if (hx >> 31) {
         z = (1 + x) * 0.5f;
         s = sqrtf(z);
-        w = acosf_R(z) * s - pio2_lo;
-        return 2 * (pio2_hi - (s + w));
+        return M_PI - 2 * (s + ((double)s * asinf_R(z)));
     }
     /* x > 0.5 */
     z = (1 - x) * 0.5f;
     s = sqrtf(z);
-    hx = *(unsigned int*)&s & 0xfffff000;
+    hx = *(unsigned int*)&s & 0xffff0000;
     df = *(float*)&hx;
     c = (z - df * df) / (s + df);
-    w = acosf_R(z) * s + c;
+    w = asinf_R(z) * s + c;
     return 2 * (df + w);
 }
 
@@ -316,26 +353,13 @@ float CDECL acosf( float x )
  *
  * Copied from musl: src/math/asinf.c
  */
-static float asinf_R(float z)
-{
-    /* coefficients for R(x^2) */
-    static const float pS0 =  1.6666586697e-01,
-                 pS1 = -4.2743422091e-02,
-                 pS2 = -8.6563630030e-03,
-                 qS1 = -7.0662963390e-01;
-
-    float p, q;
-    p = z * (pS0 + z * (pS1 + z * pS2));
-    q = 1.0f + z * qS1;
-    return p / q;
-}
-
 float CDECL asinf( float x )
 {
     static const double pio2 = 1.570796326794896558e+00;
+    static const float pio4_hi = 0.785398125648;
+    static const float pio2_lo = 7.54978941586e-08;
 
-    double s;
-    float z;
+    float s, z, f, c;
     unsigned int hx, ix;
 
     hx = *(unsigned int*)&x;
@@ -354,8 +378,11 @@ float CDECL asinf( float x )
     }
     /* 1 > |x| >= 0.5 */
     z = (1 - fabsf(x)) * 0.5f;
-    s = sqrt(z);
-    x = pio2 - 2 * (s + s * asinf_R(z));
+    s = sqrtf(z);
+    /* f+c = sqrt(z) */
+    *(unsigned int*)&f = *(unsigned int*)&s & 0xffff0000;
+    c = (z - f * f) / (s + f);
+    x = pio4_hi - (2 * s * asinf_R(z) - (pio2_lo - 2 * c) - (pio4_hi - 2 * f));
     if (hx >> 31)
         return -x;
     return x;
@@ -613,6 +640,28 @@ float CDECL sinhf( float x )
   return ret;
 }
 
+static BOOL sqrtf_validate( float *x )
+{
+    short c = _fdclass(*x);
+
+    if (c == FP_ZERO) return FALSE;
+    if (c == FP_NAN) return FALSE;
+    if (signbit(*x))
+    {
+        *x = math_error(_DOMAIN, "sqrtf", *x, 0, ret_nan(TRUE));
+        return FALSE;
+    }
+    if (c == FP_INFINITE) return FALSE;
+    return TRUE;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+float CDECL sse2_sqrtf(float);
+__ASM_GLOBAL_FUNC( sse2_sqrtf,
+        "sqrtss %xmm0, %xmm0\n\t"
+        "ret" )
+#endif
+
 /*********************************************************************
  *      sqrtf (MSVCRT.@)
  *
@@ -620,25 +669,23 @@ float CDECL sinhf( float x )
  */
 float CDECL sqrtf( float x )
 {
+#ifdef __x86_64__
+    if (!sqrtf_validate(&x))
+        return x;
+
+    return sse2_sqrtf(x);
+#else
     static const float tiny = 1.0e-30;
 
     float z;
-    int sign = 0x80000000;
     int ix,s,q,m,t,i;
     unsigned int r;
 
     ix = *(int*)&x;
 
-    /* take care of Inf and NaN */
-    if ((ix & 0x7f800000) == 0x7f800000 && (ix == 0x7f800000 || ix & 0x7fffff))
+    if (!sqrtf_validate(&x))
         return x;
 
-    /* take care of zero */
-    if (ix <= 0) {
-        if ((ix & ~sign) == 0)
-            return x;  /* sqrt(+-0) = +-0 */
-        return math_error(_DOMAIN, "sqrtf", x, 0, (x - x) / (x - x)); /* sqrt(-ve) = sNaN */
-    }
     /* normalize x */
     m = ix >> 23;
     if (m == 0) {  /* subnormal x */
@@ -683,6 +730,7 @@ float CDECL sqrtf( float x )
     r = ix + ((unsigned int)m << 23);
     z = *(float*)&r;
     return z;
+#endif
 }
 
 /*********************************************************************
@@ -853,6 +901,23 @@ static double asin_R(double z)
     return p / q;
 }
 
+#ifdef __i386__
+double CDECL x87_asin(double);
+__ASM_GLOBAL_FUNC( x87_asin,
+        "fldl 4(%esp)\n\t"
+        SET_X87_CW(~0x37f)
+        "fld %st\n\t"
+        "fld1\n\t"
+        "fsubp\n\t"
+        "fld1\n\t"
+        "fadd %st(2)\n\t"
+        "fmulp\n\t"
+        "fsqrt\n\t"
+        "fpatan\n\t"
+        RESET_X87_CW
+        "ret" )
+#endif
+
 double CDECL asin( double x )
 {
     static const double pio2_hi = 1.57079632679489655800e+00,
@@ -861,6 +926,9 @@ double CDECL asin( double x )
     double z, r, s;
     unsigned int hx, ix;
     ULONGLONG llx;
+#ifdef __i386__
+    unsigned int x87_cw, sse2_cw;
+#endif
 
     hx = *(ULONGLONG*)&x >> 32;
     ix = hx & 0x7fffffff;
@@ -871,9 +939,24 @@ double CDECL asin( double x )
         if (((ix - 0x3ff00000) | lx) == 0)
             /* asin(1) = +-pi/2 with inexact */
             return x * pio2_hi + 7.5231638452626401e-37;
-        if (isnan(x)) return x;
+        if (isnan(x))
+        {
+#ifdef __i386__
+            return math_error(_DOMAIN, "sqrt", x, 0, x);
+#else
+            return x;
+#endif
+        }
         return math_error(_DOMAIN, "asin", x, 0, 0 / (x - x));
     }
+
+#ifdef __i386__
+    __control87_2(0, 0, &x87_cw, &sse2_cw);
+    if (!sse2_enabled || (x87_cw & _MCW_EM) != _MCW_EM
+            || (sse2_cw & (_MCW_EM | _MCW_RC)) != _MCW_EM)
+        return x87_asin(x);
+#endif
+
     /* |x| < 0.5 */
     if (ix < 0x3fe00000) {
         /* if 0x1p-1022 <= |x| < 0x1p-26, avoid raising underflow */
@@ -1165,6 +1248,48 @@ double CDECL sinh( double x )
   return ret;
 }
 
+static BOOL sqrt_validate( double *x, BOOL update_sw )
+{
+    short c = _dclass(*x);
+
+    if (c == FP_ZERO) return FALSE;
+    if (c == FP_NAN)
+    {
+#ifdef __i386__
+        if (update_sw)
+            *x = math_error(_DOMAIN, "sqrt", *x, 0, *x);
+#else
+        /* set signaling bit */
+        *(ULONGLONG*)x |= 0x8000000000000ULL;
+#endif
+        return FALSE;
+    }
+    if (signbit(*x))
+    {
+        *x = math_error(_DOMAIN, "sqrt", *x, 0, ret_nan(update_sw));
+        return FALSE;
+    }
+    if (c == FP_INFINITE) return FALSE;
+    return TRUE;
+}
+
+#if defined(__x86_64__) || defined(__i386__)
+double CDECL sse2_sqrt(double);
+__ASM_GLOBAL_FUNC( sse2_sqrt,
+        "sqrtsd %xmm0, %xmm0\n\t"
+        "ret" )
+#endif
+
+#ifdef __i386__
+double CDECL x87_sqrt(double);
+__ASM_GLOBAL_FUNC( x87_sqrt,
+        "fldl 4(%esp)\n\t"
+        SET_X87_CW(0xc00)
+        "fsqrt\n\t"
+        RESET_X87_CW
+        "ret" )
+#endif
+
 /*********************************************************************
  *		sqrt (MSVCRT.@)
  *
@@ -1172,6 +1297,17 @@ double CDECL sinh( double x )
  */
 double CDECL sqrt( double x )
 {
+#ifdef __x86_64__
+    if (!sqrt_validate(&x, TRUE))
+        return x;
+
+    return sse2_sqrt(x);
+#elif defined( __i386__ )
+    if (!sqrt_validate(&x, TRUE))
+        return x;
+
+    return x87_sqrt(x);
+#else
     static const double tiny = 1.0e-300;
 
     double z;
@@ -1180,21 +1316,13 @@ double CDECL sqrt( double x )
     unsigned int r,t1,s1,ix1,q1;
     ULONGLONG ix;
 
+    if (!sqrt_validate(&x, TRUE))
+        return x;
+
     ix = *(ULONGLONG*)&x;
     ix0 = ix >> 32;
     ix1 = ix;
 
-    /* take care of Inf and NaN */
-    if (isnan(x) || (isinf(x) && x > 0))
-        return x;
-
-    /* take care of zero */
-    if (ix0 <= 0) {
-        if (((ix0 & ~sign) | ix1) == 0)
-            return x;  /* sqrt(+-0) = +-0 */
-        if (ix0 < 0)
-            return math_error(_DOMAIN, "sqrt", x, 0, (x - x) / (x - x));
-    }
     /* normalize x */
     m = ix0 >> 20;
     if (m == 0) {  /* subnormal x */
@@ -1278,6 +1406,7 @@ double CDECL sqrt( double x )
     ix <<= 32;
     ix |= ix1;
     return *(double*)&ix;
+#endif
 }
 
 /*********************************************************************
@@ -2083,6 +2212,52 @@ int CDECL fegetenv(fenv_t *env)
     env->_Fe_ctl = _controlfp(0, 0) & (_EM_INEXACT | _EM_UNDERFLOW |
             _EM_OVERFLOW | _EM_ZERODIVIDE | _EM_INVALID | _RC_CHOP);
     env->_Fe_stat = _statusfp();
+    return 0;
+}
+
+/*********************************************************************
+ *      fetestexcept (MSVCR120.@)
+ */
+int CDECL fetestexcept(int flags)
+{
+    return _statusfp() & flags;
+}
+
+/*********************************************************************
+ *      fesetexceptflag (MSVCR120.@)
+ */
+int CDECL fesetexceptflag(const fexcept_t *status, int excepts)
+{
+    fenv_t env;
+
+    if(!excepts)
+        return 0;
+
+    fegetenv(&env);
+    excepts &= FE_ALL_EXCEPT;
+    env._Fe_stat &= ~excepts;
+    env._Fe_stat |= (*status & excepts);
+    return fesetenv(&env);
+}
+
+/*********************************************************************
+ *      feclearexcept (MSVCR120.@)
+ */
+int CDECL feclearexcept(int flags)
+{
+    fenv_t env;
+
+    fegetenv(&env);
+    env._Fe_stat &= ~(flags & FE_ALL_EXCEPT);
+    return fesetenv(&env);
+}
+
+/*********************************************************************
+ *      fegetexceptflag (MSVCR120.@)
+ */
+int CDECL fegetexceptflag(fexcept_t *status, int excepts)
+{
+    *status = _statusfp() & excepts;
     return 0;
 }
 #endif
@@ -3272,12 +3447,25 @@ void __cdecl __libm_sse2_tanf(void)
  */
 void __cdecl __libm_sse2_sqrt_precise(void)
 {
+    unsigned int cw;
     double d;
-    __asm__ __volatile__( "movq %%xmm0,%0" : "=m" (d) );
-    d = sqrt( d );
-    __asm__ __volatile__( "movq %0,%%xmm0" : : "m" (d) );
-}
 
+    __asm__ __volatile__( "movq %%xmm0,%0" : "=m" (d) );
+    __control87_2(0, 0, NULL, &cw);
+    if (cw & _MCW_RC)
+    {
+        d = sqrt(d);
+        __asm__ __volatile__( "movq %0,%%xmm0" : : "m" (d) );
+        return;
+    }
+
+    if (!sqrt_validate(&d, FALSE))
+    {
+        __asm__ __volatile__( "movq %0,%%xmm0" : : "m" (d) );
+        return;
+    }
+    __asm__ __volatile__( "call " __ASM_NAME( "sse2_sqrt" ) );
+}
 #endif  /* __i386__ */
 
 /*********************************************************************
@@ -3424,6 +3612,36 @@ __int64 CDECL llrintf(float x)
     return unix_funcs->llrintf( x );
 }
 
+/*********************************************************************
+ *      _fdclass (MSVCR120.@)
+ *
+ * Copied from musl: src/math/__fpclassifyf.c
+ */
+short CDECL _fdclass(float x)
+{
+    union { float f; UINT32 i; } u = { x };
+    int e = u.i >> 23 & 0xff;
+
+    if (!e) return u.i << 1 ? FP_SUBNORMAL : FP_ZERO;
+    if (e == 0xff) return u.i << 9 ? FP_NAN : FP_INFINITE;
+    return FP_NORMAL;
+}
+
+/*********************************************************************
+ *      _dclass (MSVCR120.@)
+ *
+ * Copied from musl: src/math/__fpclassify.c
+ */
+short CDECL _dclass(double x)
+{
+    union { double f; UINT64 i; } u = { x };
+    int e = u.i >> 52 & 0x7ff;
+
+    if (!e) return u.i << 1 ? FP_SUBNORMAL : FP_ZERO;
+    if (e == 0x7ff) return (u.i << 12) ? FP_NAN : FP_INFINITE;
+    return FP_NORMAL;
+}
+
 #if _MSVCR_VER>=120
 
 /*********************************************************************
@@ -3488,36 +3706,6 @@ double CDECL trunc(double x)
 float CDECL truncf(float x)
 {
     return unix_funcs->truncf(x);
-}
-
-/*********************************************************************
- *      _dclass (MSVCR120.@)
- *
- * Copied from musl: src/math/__fpclassify.c
- */
-short CDECL _dclass(double x)
-{
-    union { double f; UINT64 i; } u = { x };
-    int e = u.i >> 52 & 0x7ff;
-
-    if (!e) return u.i << 1 ? FP_SUBNORMAL : FP_ZERO;
-    if (e == 0x7ff) return (u.i << 12) ? FP_NAN : FP_INFINITE;
-    return FP_NORMAL;
-}
-
-/*********************************************************************
- *      _fdclass (MSVCR120.@)
- *
- * Copied from musl: src/math/__fpclassifyf.c
- */
-short CDECL _fdclass(float x)
-{
-    union { float f; UINT32 i; } u = { x };
-    int e = u.i >> 23 & 0xff;
-
-    if (!e) return u.i << 1 ? FP_SUBNORMAL : FP_ZERO;
-    if (e == 0xff) return u.i << 9 ? FP_NAN : FP_INFINITE;
-    return FP_NORMAL;
 }
 
 /*********************************************************************

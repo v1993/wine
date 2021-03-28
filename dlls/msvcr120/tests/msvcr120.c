@@ -171,6 +171,7 @@ static int (__cdecl *p__dpcomp)(double x, double y);
 static wchar_t** (CDECL *p____lc_locale_name_func)(void);
 static unsigned int (CDECL *p__GetConcurrency)(void);
 static void* (CDECL *p__W_Gettnames)(void);
+static void* (CDECL *p__Gettnames)(void);
 static void (CDECL *p_free)(void*);
 static float (CDECL *p_strtof)(const char *, char **);
 static int (CDECL *p__finite)(double);
@@ -181,6 +182,10 @@ static int (CDECL *p_fegetenv)(fenv_t*);
 static int (CDECL *p_fesetenv)(const fenv_t*);
 static int (CDECL *p_fegetround)(void);
 static int (CDECL *p_fesetround)(int);
+static int (CDECL *p_fegetexceptflag)(fexcept_t*,int);
+static int (CDECL *p_fesetexceptflag)(const fexcept_t*,int);
+static int (CDECL *p_fetestexcept)(int);
+static int (CDECL *p_feclearexcept)(int);
 static int (CDECL *p__clearfp)(void);
 static _locale_t (__cdecl *p_wcreate_locale)(int, const wchar_t *);
 static void (__cdecl *p_free_locale)(_locale_t);
@@ -242,6 +247,7 @@ static BOOL init(void)
     p____lc_locale_name_func = (void*)GetProcAddress(module, "___lc_locale_name_func");
     p__GetConcurrency = (void*)GetProcAddress(module,"?_GetConcurrency@details@Concurrency@@YAIXZ");
     p__W_Gettnames = (void*)GetProcAddress(module, "_W_Gettnames");
+    p__Gettnames = (void*)GetProcAddress(module, "_Gettnames");
     p_free = (void*)GetProcAddress(module, "free");
     p_strtof = (void*)GetProcAddress(module, "strtof");
     p__finite = (void*)GetProcAddress(module, "_finite");
@@ -255,6 +261,10 @@ static BOOL init(void)
     SET(p_fesetenv, "fesetenv");
     SET(p_fegetround, "fegetround");
     SET(p_fesetround, "fesetround");
+    SET(p_fegetexceptflag, "fegetexceptflag");
+    SET(p_fesetexceptflag, "fesetexceptflag");
+    SET(p_fetestexcept, "fetestexcept");
+    SET(p_feclearexcept, "feclearexcept");
 
     SET(p__clearfp, "_clearfp");
     SET(p_vsscanf, "vsscanf");
@@ -531,7 +541,7 @@ static void test__GetConcurrency(void)
     ok(c == si.dwNumberOfProcessors, "expected %u, got %u\n", si.dwNumberOfProcessors, c);
 }
 
-static void test__W_Gettnames(void)
+static void test_gettnames(void* (CDECL *p_gettnames)(void))
 {
     static const char *str[] = {
         "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
@@ -557,7 +567,7 @@ static void test__W_Gettnames(void)
     if(!p_setlocale(LC_ALL, "english"))
         return;
 
-    ret = p__W_Gettnames();
+    ret = p_gettnames();
     size = ret->str[0]-(char*)ret;
     if(sizeof(void*) == 8)
         ok(size==0x2c0, "structure size: %x\n", size);
@@ -572,6 +582,11 @@ static void test__W_Gettnames(void)
         ok(!lstrcmpW(ret->wstr[i], buf), "ret->wstr[%d] = %s, expected %s\n",
                 i, wine_dbgstr_w(ret->wstr[i]), wine_dbgstr_w(buf));
     }
+
+    ok(ret->str[42] + strlen(ret->str[42]) + 1 == (char*)ret->wstr[0] ||
+            ret->str[42] + strlen(ret->str[42]) + 2 == (char*)ret->wstr[0],
+            "ret->str[42] = %p len = %d, ret->wstr[0] = %p\n",
+            ret->str[42], strlen(ret->str[42]), ret->wstr[0]);
     p_free(ret);
 
     p_setlocale(LC_ALL, "C");
@@ -781,8 +796,41 @@ static void test_critical_section(void)
 
 static void test_feenv(void)
 {
+    static const int tests[] = {
+        0,
+        FE_INEXACT,
+        FE_UNDERFLOW,
+        FE_OVERFLOW,
+        FE_DIVBYZERO,
+        FE_INVALID,
+        FE_ALL_EXCEPT,
+    };
+    static const struct {
+        fexcept_t except;
+        unsigned int flag;
+        unsigned int get;
+        fexcept_t expect;
+    } tests2[] = {
+        /* except                   flag                     get             expect */
+        { 0,                        0,                       0,              0 },
+        { FE_ALL_EXCEPT,            FE_INEXACT,              0,              0 },
+        { FE_ALL_EXCEPT,            FE_INEXACT,              FE_ALL_EXCEPT,  FE_INEXACT },
+        { FE_ALL_EXCEPT,            FE_INEXACT,              FE_INEXACT,     FE_INEXACT },
+        { FE_ALL_EXCEPT,            FE_INEXACT,              FE_OVERFLOW,    0 },
+        { FE_ALL_EXCEPT,            FE_ALL_EXCEPT,           FE_ALL_EXCEPT,  FE_ALL_EXCEPT },
+        { FE_ALL_EXCEPT,            FE_ALL_EXCEPT,           FE_INEXACT,     FE_INEXACT },
+        { FE_ALL_EXCEPT,            FE_ALL_EXCEPT,           0,              0 },
+        { FE_ALL_EXCEPT,            FE_ALL_EXCEPT,           ~0,             FE_ALL_EXCEPT },
+        { FE_ALL_EXCEPT,            FE_ALL_EXCEPT,           ~FE_ALL_EXCEPT, 0 },
+        { FE_INEXACT,               FE_ALL_EXCEPT,           FE_ALL_EXCEPT,  FE_INEXACT },
+        { FE_INEXACT,               FE_UNDERFLOW,            FE_ALL_EXCEPT,  0 },
+        { FE_UNDERFLOW,             FE_INEXACT,              FE_ALL_EXCEPT,  0 },
+        { FE_INEXACT|FE_UNDERFLOW,  FE_UNDERFLOW,            FE_ALL_EXCEPT,  FE_UNDERFLOW },
+        { FE_UNDERFLOW,             FE_INEXACT|FE_UNDERFLOW, FE_ALL_EXCEPT,  FE_UNDERFLOW },
+    };
     fenv_t env, env2;
-    int ret;
+    fexcept_t except;
+    int i, ret, flags;
 
     p__clearfp();
 
@@ -800,6 +848,103 @@ static void test_feenv(void)
     ok(!ret, "fesetenv returned %x\n", ret);
     ret = p_fegetround();
     ok(ret == FE_TONEAREST, "Got unexpected round mode %#x.\n", ret);
+
+    if(0) { /* crash on windows */
+        p_fesetexceptflag(NULL, FE_ALL_EXCEPT);
+        p_fegetexceptflag(NULL, 0);
+    }
+    except = FE_ALL_EXCEPT;
+    ret = p_fesetexceptflag(&except, FE_INEXACT|FE_UNDERFLOW);
+    ok(!ret, "fesetexceptflag returned %x\n", ret);
+    except = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(except == (FE_INEXACT|FE_UNDERFLOW), "expected %x, got %lx\n", FE_INEXACT|FE_UNDERFLOW, except);
+
+    ret = p_feclearexcept(~FE_ALL_EXCEPT);
+    ok(!ret, "feclearexceptflag returned %x\n", ret);
+    except = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(except == (FE_INEXACT|FE_UNDERFLOW), "expected %x, got %lx\n", FE_INEXACT|FE_UNDERFLOW, except);
+
+    /* no crash, but no-op */
+    ret = p_fesetexceptflag(NULL, 0);
+    ok(!ret, "fesetexceptflag returned %x\n", ret);
+    except = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(except == (FE_INEXACT|FE_UNDERFLOW), "expected %x, got %lx\n", FE_INEXACT|FE_UNDERFLOW, except);
+
+    /* zero clears all */
+    except = 0;
+    ret = p_fesetexceptflag(&except, FE_ALL_EXCEPT);
+    ok(!ret, "fesetexceptflag returned %x\n", ret);
+    except = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(!except, "expected 0, got %lx\n", except);
+
+    ret = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(!ret, "fetestexcept returned %x\n", ret);
+
+    flags = 0;
+    /* adding bits with flags */
+    for(i=0; i<ARRAY_SIZE(tests); i++) {
+        except = FE_ALL_EXCEPT;
+        ret = p_fesetexceptflag(&except, tests[i]);
+        ok(!ret, "Test %d: fesetexceptflag returned %x\n", i, ret);
+
+        ret = p_fetestexcept(tests[i]);
+        ok(ret == tests[i], "Test %d: expected %x, got %x\n", i, tests[i], ret);
+
+        flags |= tests[i];
+        ret = p_fetestexcept(FE_ALL_EXCEPT);
+        ok(ret == flags, "Test %d: expected %x, got %x\n", i, flags, ret);
+
+        except = ~0;
+        ret = p_fegetexceptflag(&except, ~0);
+        ok(!ret, "Test %d: fegetexceptflag returned %x.\n", i, ret);
+        ok(except == flags, "Test %d: expected %x, got %lx\n", i, flags, except);
+
+        except = ~0;
+        ret = p_fegetexceptflag(&except, tests[i]);
+        ok(!ret, "Test %d: fegetexceptflag returned %x.\n", i, ret);
+        ok(except == tests[i], "Test %d: expected %x, got %lx\n", i, tests[i], except);
+    }
+
+    for(i=0; i<ARRAY_SIZE(tests); i++) {
+        ret = p_feclearexcept(tests[i]);
+        ok(!ret, "Test %d: feclearexceptflag returned %x\n", i, ret);
+
+        flags &= ~tests[i];
+        except = p_fetestexcept(tests[i]);
+        ok(!except, "Test %d: expected %x, got %lx\n", i, flags, except);
+    }
+
+    except = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(!except, "expected 0, got %lx\n", except);
+
+    /* setting bits with except */
+    for(i=0; i<ARRAY_SIZE(tests); i++) {
+        except = tests[i];
+        ret = p_fesetexceptflag(&except, FE_ALL_EXCEPT);
+        ok(!ret, "Test %d: fesetexceptflag returned %x\n", i, ret);
+
+        ret = p_fetestexcept(tests[i]);
+        ok(ret == tests[i], "Test %d: expected %x, got %x\n", i, tests[i], ret);
+
+        ret = p_fetestexcept(FE_ALL_EXCEPT);
+        ok(ret == tests[i], "Test %d: expected %x, got %x\n", i, tests[i], ret);
+    }
+
+    for(i=0; i<ARRAY_SIZE(tests2); i++) {
+        p__clearfp();
+
+        except = tests2[i].except;
+        ret = p_fesetexceptflag(&except, tests2[i].flag);
+        ok(!ret, "Test %d: fesetexceptflag returned %x\n", i, ret);
+
+        ret = p_fetestexcept(tests2[i].get);
+        ok(ret == tests2[i].expect, "Test %d: expected %lx, got %x\n", i, tests2[i].expect, ret);
+    }
+
+    ret = p_feclearexcept(FE_ALL_EXCEPT);
+    ok(!ret, "feclearexceptflag returned %x\n", ret);
+    except = p_fetestexcept(FE_ALL_EXCEPT);
+    ok(!except, "expected 0, got %lx\n", except);
 }
 
 static void test__wcreate_locale(void)
@@ -1105,13 +1250,13 @@ static void test_CurrentContext(void)
 START_TEST(msvcr120)
 {
     if (!init()) return;
-    test__strtof();
     test_lconv();
     test__dsign();
     test__dpcomp();
     test____lc_locale_name_func();
     test__GetConcurrency();
-    test__W_Gettnames();
+    test_gettnames(p__W_Gettnames);
+    test_gettnames(p__Gettnames);
     test__strtof();
     test_remainder();
     test_critical_section();

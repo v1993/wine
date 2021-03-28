@@ -103,22 +103,21 @@ static struct security_descriptor *dir_get_sd( struct object *obj );
 static int dir_set_sd( struct object *obj, const struct security_descriptor *sd,
                        unsigned int set_info );
 static void dir_dump( struct object *obj, int verbose );
-static struct object_type *dir_get_type( struct object *obj );
 static int dir_close_handle( struct object *obj, struct process *process, obj_handle_t handle );
 static void dir_destroy( struct object *obj );
 
 static const struct object_ops dir_ops =
 {
     sizeof(struct dir),       /* size */
+    &file_type,               /* type */
     dir_dump,                 /* dump */
-    dir_get_type,             /* get_type */
     add_queue,                /* add_queue */
     remove_queue,             /* remove_queue */
     default_fd_signaled,      /* signaled */
     no_satisfied,             /* satisfied */
     no_signal,                /* signal */
     dir_get_fd,               /* get_fd */
-    default_fd_map_access,    /* map_access */
+    default_map_access,       /* map_access */
     dir_get_sd,               /* get_sd */
     dir_set_sd,               /* set_sd */
     no_get_full_name,         /* get_full_name */
@@ -292,13 +291,6 @@ static void dir_dump( struct object *obj, int verbose )
     fprintf( stderr, "Dirfile fd=%p filter=%08x\n", dir->fd, dir->filter );
 }
 
-static struct object_type *dir_get_type( struct object *obj )
-{
-    static const WCHAR name[] = {'F','i','l','e'};
-    static const struct unicode_str str = { name, sizeof(name) };
-    return get_object_type( &str );
-}
-
 /* enter here directly from SIGIO signal handler */
 void do_change_notify( int unix_fd )
 {
@@ -429,7 +421,6 @@ static int dir_close_handle( struct object *obj, struct process *process, obj_ha
 {
     struct dir *dir = (struct dir *)obj;
 
-    if (!fd_close_handle( obj, process, handle )) return 0;
     if (obj->handle_count == 1) release_dir_cache_entry( dir ); /* closing last handle, release cache */
     return 1;  /* ok to close */
 }

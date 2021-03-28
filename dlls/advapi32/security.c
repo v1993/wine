@@ -1467,6 +1467,9 @@ BOOL WINAPI PrivilegedServiceAuditAlarmA( LPCSTR SubsystemName, LPCSTR ServiceNa
     return TRUE;
 }
 
+#define HKEY_SPECIAL_ROOT_FIRST   HKEY_CLASSES_ROOT
+#define HKEY_SPECIAL_ROOT_LAST    HKEY_DYN_DATA
+
 /******************************************************************************
  * GetSecurityInfo [ADVAPI32.@]
  *
@@ -1522,17 +1525,43 @@ DWORD WINAPI GetSecurityInfo( HANDLE handle, SE_OBJECT_TYPE type, SECURITY_INFOR
     }
     else
     {
+        HKEY key = NULL;
+
+        if (type == SE_REGISTRY_KEY && (HandleToUlong(handle) >= HandleToUlong(HKEY_SPECIAL_ROOT_FIRST))
+                && (HandleToUlong(handle) <= HandleToUlong(HKEY_SPECIAL_ROOT_LAST)))
+        {
+            REGSAM access = READ_CONTROL;
+            DWORD ret;
+
+            if (SecurityInfo & SACL_SECURITY_INFORMATION)
+                access |= ACCESS_SYSTEM_SECURITY;
+
+            if ((ret = RegCreateKeyExW( handle, NULL, 0, NULL, 0, access, NULL, &key, NULL )))
+                return ret;
+
+            handle = key;
+        }
+
         status = NtQuerySecurityObject( handle, SecurityInfo, NULL, 0, &size );
         if (status != STATUS_SUCCESS && status != STATUS_BUFFER_TOO_SMALL)
+        {
+            RegCloseKey( key );
             return RtlNtStatusToDosError( status );
+        }
 
-        if (!(sd = LocalAlloc( 0, size ))) return ERROR_NOT_ENOUGH_MEMORY;
+        if (!(sd = LocalAlloc( 0, size )))
+        {
+            RegCloseKey( key );
+            return ERROR_NOT_ENOUGH_MEMORY;
+        }
 
         if ((status = NtQuerySecurityObject( handle, SecurityInfo, sd, size, &size )))
         {
+            RegCloseKey( key );
             LocalFree(sd);
             return RtlNtStatusToDosError( status );
         }
+        RegCloseKey( key );
     }
 
     if (ppsidOwner)
@@ -2285,8 +2314,7 @@ DWORD WINAPI SetEntriesInAclW( ULONG count, PEXPLICIT_ACCESSW pEntries,
                             add = FALSE;
                         break;
                     case ACCESS_DENIED_ACE_TYPE:
-                        if (EqualSid(ppsid[j], &((ACCESS_DENIED_ACE *)old_ace_header)->SidStart))
-                            add = FALSE;
+                        /* REVOKE_ACCESS does not affect ACCESS_DENIED_ACE. */
                         break;
                     case SYSTEM_AUDIT_ACE_TYPE:
                         if (EqualSid(ppsid[j], &((SYSTEM_AUDIT_ACE *)old_ace_header)->SidStart))

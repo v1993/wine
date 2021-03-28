@@ -30,6 +30,7 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "windef.h"
+#include "winternl.h"
 #include "unix_private.h"
 #include "wine/debug.h"
 
@@ -166,7 +167,7 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
         0,    /* TokenAuditPolicy */
         0,    /* TokenOrigin */
         sizeof(TOKEN_ELEVATION_TYPE), /* TokenElevationType */
-        0,    /* TokenLinkedToken */
+        sizeof(TOKEN_LINKED_TOKEN), /* TokenLinkedToken */
         sizeof(TOKEN_ELEVATION), /* TokenElevation */
         0,    /* TokenHasRestrictions */
         0,    /* TokenAccessInformation */
@@ -316,18 +317,21 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
         break;
 
     case TokenImpersonationLevel:
-        SERVER_START_REQ( get_token_impersonation_level )
+        SERVER_START_REQ( get_token_info )
         {
             SECURITY_IMPERSONATION_LEVEL *level = info;
             req->handle = wine_server_obj_handle( token );
-            status = wine_server_call( req );
-            if (status == STATUS_SUCCESS) *level = reply->impersonation_level;
+            if (!(status = wine_server_call( req )))
+            {
+                if (!reply->primary) *level = reply->impersonation_level;
+                else status = STATUS_INVALID_PARAMETER;
+            }
         }
         SERVER_END_REQ;
         break;
 
     case TokenStatistics:
-        SERVER_START_REQ( get_token_statistics )
+        SERVER_START_REQ( get_token_info )
         {
             TOKEN_STATISTICS *statistics = info;
             req->handle = wine_server_obj_handle( token );
@@ -357,7 +361,7 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
         break;
 
     case TokenType:
-        SERVER_START_REQ( get_token_statistics )
+        SERVER_START_REQ( get_token_info )
         {
             TOKEN_TYPE *type = info;
             req->handle = wine_server_obj_handle( token );
@@ -390,19 +394,27 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
         break;
 
     case TokenElevationType:
+        SERVER_START_REQ( get_token_info )
         {
             TOKEN_ELEVATION_TYPE *type = info;
-            FIXME("QueryInformationToken( ..., TokenElevationType, ...) semi-stub\n");
-            *type = TokenElevationTypeFull;
+
+            req->handle = wine_server_obj_handle( token );
+            status = wine_server_call( req );
+            if (!status) *type = reply->elevation;
         }
+        SERVER_END_REQ;
         break;
 
     case TokenElevation:
+        SERVER_START_REQ( get_token_info )
         {
             TOKEN_ELEVATION *elevation = info;
-            FIXME("QueryInformationToken( ..., TokenElevation, ...) semi-stub\n");
-            elevation->TokenIsElevated = TRUE;
+
+            req->handle = wine_server_obj_handle( token );
+            status = wine_server_call( req );
+            if (!status) elevation->TokenIsElevated = (reply->elevation == TokenElevationTypeFull);
         }
+        SERVER_END_REQ;
         break;
 
     case TokenSessionId:
@@ -467,6 +479,18 @@ NTSTATUS WINAPI NtQueryInformationToken( HANDLE token, TOKEN_INFORMATION_CLASS c
                 groups->Groups[0].Sid = sid;
                 groups->Groups[0].Attributes = 0;
             }
+        }
+        SERVER_END_REQ;
+        break;
+
+    case TokenLinkedToken:
+        SERVER_START_REQ( create_linked_token )
+        {
+            TOKEN_LINKED_TOKEN *linked = info;
+
+            req->handle = wine_server_obj_handle( token );
+            status = wine_server_call( req );
+            if (!status) linked->LinkedToken = wine_server_ptr_handle( reply->linked );
         }
         SERVER_END_REQ;
         break;
@@ -709,11 +733,13 @@ NTSTATUS WINAPI NtAccessCheck( PSECURITY_DESCRIPTOR descr, HANDLE token, ACCESS_
     data_size_t len;
     OBJECT_ATTRIBUTES attr;
     NTSTATUS status;
+    ULONG priv_len;
 
     TRACE( "(%p, %p, %08x, %p, %p, %p, %p, %p)\n",
            descr, token, access, mapping, privs, retlen, access_granted, access_status );
 
     if (!privs || !retlen) return STATUS_ACCESS_VIOLATION;
+    priv_len = *retlen;
 
     /* reuse the object attribute SD marshalling */
     InitializeObjectAttributes( &attr, NULL, 0, 0, descr );
@@ -723,21 +749,25 @@ NTSTATUS WINAPI NtAccessCheck( PSECURITY_DESCRIPTOR descr, HANDLE token, ACCESS_
     {
         req->handle = wine_server_obj_handle( token );
         req->desired_access = access;
-        req->mapping_read = mapping->GenericRead;
-        req->mapping_write = mapping->GenericWrite;
-        req->mapping_execute = mapping->GenericExecute;
-        req->mapping_all = mapping->GenericAll;
+        req->mapping.read = mapping->GenericRead;
+        req->mapping.write = mapping->GenericWrite;
+        req->mapping.exec = mapping->GenericExecute;
+        req->mapping.all = mapping->GenericAll;
         wine_server_add_data( req, objattr + 1, objattr->sd_len );
-        wine_server_set_reply( req, privs->Privilege, *retlen - offsetof( PRIVILEGE_SET, Privilege ) );
+        wine_server_set_reply( req, privs->Privilege, priv_len - offsetof( PRIVILEGE_SET, Privilege ) );
 
         status = wine_server_call( req );
 
-        *retlen = offsetof( PRIVILEGE_SET, Privilege ) + reply->privileges_len;
-        privs->PrivilegeCount = reply->privileges_len / sizeof(LUID_AND_ATTRIBUTES);
         if (status == STATUS_SUCCESS)
         {
-            *access_status = reply->access_status;
-            *access_granted = reply->access_granted;
+            *retlen = max( offsetof( PRIVILEGE_SET, Privilege ) + reply->privileges_len, sizeof(PRIVILEGE_SET) );
+            if (priv_len >= *retlen)
+            {
+                privs->PrivilegeCount = reply->privileges_len / sizeof(LUID_AND_ATTRIBUTES);
+                *access_status = reply->access_status;
+                *access_granted = reply->access_granted;
+            }
+            else status = STATUS_BUFFER_TOO_SMALL;
         }
     }
     SERVER_END_REQ;

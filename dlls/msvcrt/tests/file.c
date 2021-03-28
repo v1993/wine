@@ -1039,6 +1039,40 @@ static void test_fgetwc_unicode(void)
     ch = fgetwc(tempfh);
     ok(ch == WEOF, "got %04hx, expected WEOF (unicode)\n", ch);
     fclose(tempfh);
+
+    tempfh = fopen(tempfile, "wb");
+    ok(tempfh != NULL, "can't open tempfile\n");
+    ret = WideCharToMultiByte(CP_UTF8, 0, wchar_text + 1, ARRAY_SIZE(wchar_text) - 1,
+                              utf8_text, sizeof(utf8_text), NULL, NULL);
+    ok(ret > 0, "utf-8 conversion failed\n");
+    utf8_text[ret] = 0;
+    fwrite(utf8_text, sizeof(char), ret, tempfh);
+    fclose(tempfh);
+
+    tempfh = fopen(tempfile, "rt, ccs=UTF-8");
+    ok(tempfh != NULL, "can't open tempfile\n");
+    for (i = 1; i < ARRAY_SIZE(wchar_text); i++)
+    {
+        ch = fgetwc(tempfh);
+        ok(ch == wchar_text[i],
+           "got %04hx, expected %04x (utf8[%d])\n", ch, wchar_text[i], i-1);
+    }
+    ch = fgetwc(tempfh);
+    ok(ch == WEOF, "got %04hx, expected WEOF (utf8)\n", ch);
+    fclose(tempfh);
+
+    tempfh = fopen(tempfile, "rt, ccs=unicode");
+    ok(tempfh != NULL, "can't open tempfile\n");
+    for (i = 0; utf8_text[i]; i++)
+    {
+        ch = fgetwc(tempfh);
+        ok(ch == (unsigned char) utf8_text[i],
+           "got %04hx, expected %04x (unicode[%d])\n", ch, (unsigned char)utf8_text[i], i);
+    }
+    ch = fgetwc(tempfh);
+    ok(ch == WEOF, "got %04hx, expected WEOF (unicode)\n", ch);
+    fclose(tempfh);
+
     unlink(temppath);
 }
 
@@ -1420,13 +1454,27 @@ static void test_file_write_read( void )
   free(tempf);
 }
 
-static void test_file_inherit_child(const char* fd_s)
+static void test_file_inherit_child(const char* fd_s, const char *handle_str)
 {
+    HANDLE handle_value;
     int fd = atoi(fd_s);
+    HANDLE *handle_ptr;
+    unsigned int count;
     char buffer[32];
+    STARTUPINFOA si;
     int ret;
 
-    ret =write(fd, "Success", 8);
+    GetStartupInfoA(&si);
+    count = *(unsigned *)si.lpReserved2;
+    if (handle_str)
+    {
+        ok(count == 3, "Got unexpected count %u.\n", count);
+        sscanf(handle_str, "%p", &handle_value);
+        handle_ptr = (HANDLE *)(si.lpReserved2 + sizeof(unsigned) + count);
+        ok(handle_value == handle_ptr[1], "Got unexpected handle %p.\n", handle_ptr[1]);
+    }
+
+    ret = write(fd, "Success", 8);
     ok( ret == 8, "Couldn't write in child process on %d (%s)\n", fd, strerror(errno));
     lseek(fd, 0, SEEK_SET);
     ok(read(fd, buffer, sizeof (buffer)) == 8, "Couldn't read back the data\n");
@@ -1609,6 +1657,22 @@ static void test_file_inherit( const char* selfname )
     test_stdout_handle( &startup, cmdline, handles[1], TRUE, "large size block" );
     CloseHandle( handles[1] );
     DeleteFileA("fdopen.tst");
+
+    /* test inherit block with invalid handle */
+    handles[1] = INVALID_HANDLE_VALUE;
+    create_io_inherit_block( &startup, 3, handles );
+    sprintf(cmdline, "%s file inherit 1 %p", selfname, handles[1]);
+    test_stdout_handle( &startup, cmdline, NULL, FALSE, "INVALID_HANDLE_VALUE stdout handle" );
+
+    handles[1] = NULL;
+    create_io_inherit_block( &startup, 3, handles );
+    sprintf(cmdline, "%s file inherit 1 %p", selfname, handles[1]);
+    test_stdout_handle( &startup, cmdline, NULL, FALSE, "NULL stdout handle" );
+
+    handles[1] = (void *)0xdeadbeef;
+    create_io_inherit_block( &startup, 3, handles );
+    sprintf(cmdline, "%s file inherit 1 %p", selfname, handles[1]);
+    test_stdout_handle( &startup, cmdline, NULL, FALSE, "invalid stdout handle" );
 }
 
 static void test_invalid_stdin_child( void )
@@ -2680,7 +2744,7 @@ START_TEST(file)
     if (arg_c >= 3)
     {
         if (strcmp(arg_v[2], "inherit") == 0)
-            test_file_inherit_child(arg_v[3]);
+            test_file_inherit_child(arg_v[3], arg_c > 4 ? arg_v[4] : NULL);
         else if (strcmp(arg_v[2], "inherit_no") == 0)
             test_file_inherit_child_no(arg_v[3]);
         else if (strcmp(arg_v[2], "pipes") == 0)

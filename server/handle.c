@@ -101,6 +101,8 @@ static inline obj_handle_t handle_global_to_local( obj_handle_t handle )
 static struct object *grab_object_for_handle( struct object *obj )
 {
     obj->handle_count++;
+    obj->ops->type->handle_count++;
+    obj->ops->type->handle_max = max( obj->ops->type->handle_max, obj->ops->type->handle_count );
     return grab_object( obj );
 }
 
@@ -108,6 +110,7 @@ static struct object *grab_object_for_handle( struct object *obj )
 static void release_object_from_handle( struct object *obj )
 {
     assert( obj->handle_count );
+    obj->ops->type->handle_count--;
     obj->handle_count--;
     release_object( obj );
 }
@@ -118,15 +121,15 @@ static void handle_table_destroy( struct object *obj );
 static const struct object_ops handle_table_ops =
 {
     sizeof(struct handle_table),     /* size */
+    &no_type,                        /* type */
     handle_table_dump,               /* dump */
-    no_get_type,                     /* get_type */
     no_add_queue,                    /* add_queue */
     NULL,                            /* remove_queue */
     NULL,                            /* signaled */
     NULL,                            /* satisfied */
     no_signal,                       /* signal */
     no_get_fd,                       /* get_fd */
-    no_map_access,                   /* map_access */
+    default_map_access,              /* map_access */
     default_get_sd,                  /* get_sd */
     default_set_sd,                  /* set_sd */
     no_get_full_name,                /* get_full_name */
@@ -563,7 +566,7 @@ obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, str
         src_access = obj->ops->map_access( obj, GENERIC_ALL );
     src_access &= ~RESERVED_ALL;
 
-    if (options & DUP_HANDLE_SAME_ACCESS)
+    if (options & DUPLICATE_SAME_ACCESS)
         access = src_access;
     else
         access = obj->ops->map_access( obj, access ) & ~RESERVED_ALL;
@@ -578,16 +581,16 @@ obj_handle_t duplicate_handle( struct process *src, obj_handle_t src_handle, str
             return 0;
         }
 
-        if (options & DUP_HANDLE_MAKE_GLOBAL)
+        if (options & DUPLICATE_MAKE_GLOBAL)
             res = alloc_global_handle( obj, access );
         else
             res = alloc_handle_no_access_check( dst, obj, access, attr );
     }
     else
     {
-        if (options & DUP_HANDLE_MAKE_GLOBAL)
+        if (options & DUPLICATE_MAKE_GLOBAL)
             res = alloc_global_handle_no_access_check( obj, access );
-        else if ((options & DUP_HANDLE_CLOSE_SOURCE) && src == dst &&
+        else if ((options & DUPLICATE_CLOSE_SOURCE) && src == dst &&
                  entry && !(entry->access & RESERVED_CLOSE_PROTECT))
         {
             if (attr & OBJ_INHERIT) access |= RESERVED_INHERIT;
@@ -662,7 +665,7 @@ DECL_HANDLER(dup_handle)
     reply->handle = 0;
     if ((src = get_process_from_handle( req->src_process, PROCESS_DUP_HANDLE )))
     {
-        if (req->options & DUP_HANDLE_MAKE_GLOBAL)
+        if (req->options & DUPLICATE_MAKE_GLOBAL)
         {
             reply->handle = duplicate_handle( src, req->src_handle, NULL,
                                               req->access, req->attributes, req->options );
@@ -674,9 +677,8 @@ DECL_HANDLER(dup_handle)
             release_object( dst );
         }
         /* close the handle no matter what happened */
-        if ((req->options & DUP_HANDLE_CLOSE_SOURCE) && (src != dst || req->src_handle != reply->handle))
-            reply->closed = !close_handle( src, req->src_handle );
-        reply->self = (src == current->process);
+        if ((req->options & DUPLICATE_CLOSE_SOURCE) && (src != dst || req->src_handle != reply->handle))
+            close_handle( src, req->src_handle );
         release_object( src );
     }
 }
@@ -827,9 +829,13 @@ static int enum_handles( struct process *process, void *user )
         }
         assert( info->count );
         handle = info->handle++;
-        handle->owner  = process->id;
-        handle->handle = index_to_handle(i);
-        handle->access = entry->access & ~RESERVED_ALL;
+        handle->owner      = process->id;
+        handle->handle     = index_to_handle(i);
+        handle->access     = entry->access & ~RESERVED_ALL;
+        handle->type       = entry->ptr->ops->type->index;
+        handle->attributes = 0;
+        if (entry->access & RESERVED_INHERIT) handle->attributes |= OBJ_INHERIT;
+        if (entry->access & RESERVED_CLOSE_PROTECT) handle->attributes |= OBJ_PROTECT_CLOSE;
         info->count--;
     }
 

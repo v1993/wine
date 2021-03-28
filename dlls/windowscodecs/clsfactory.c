@@ -58,6 +58,7 @@ static const classinfo wic_classes[] = {
     {&CLSID_WICTiffEncoder, TiffEncoder_CreateInstance},
     {&CLSID_WICIcnsEncoder, IcnsEncoder_CreateInstance},
     {&CLSID_WICDdsDecoder, DdsDecoder_CreateInstance},
+    {&CLSID_WICDdsEncoder, DdsEncoder_CreateInstance},
     {&CLSID_WICDefaultFormatConverter, FormatConverter_CreateInstance},
     {&CLSID_WineTgaDecoder, TgaDecoder_CreateInstance},
     {&CLSID_WICUnknownMetadataReader, UnknownMetadataReader_CreateInstance},
@@ -206,7 +207,7 @@ HRESULT WINAPI DllGetClassObject(REFCLSID rclsid, REFIID iid, LPVOID *ppv)
     return ret;
 }
 
-HRESULT create_instance(CLSID *clsid, const IID *iid, void **ppv)
+HRESULT create_instance(const CLSID *clsid, const IID *iid, void **ppv)
 {
     int i;
 

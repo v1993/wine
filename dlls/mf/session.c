@@ -147,6 +147,7 @@ struct transform_stream
 {
     struct list samples;
     unsigned int requests;
+    unsigned int min_buffer_size;
 };
 
 enum topo_node_flags
@@ -213,6 +214,7 @@ struct media_session
     IMFGetService IMFGetService_iface;
     IMFRateSupport IMFRateSupport_iface;
     IMFRateControl IMFRateControl_iface;
+    IMFTopologyNodeAttributeEditor IMFTopologyNodeAttributeEditor_iface;
     IMFAsyncCallback commands_callback;
     IMFAsyncCallback events_callback;
     IMFAsyncCallback sink_finalizer_callback;
@@ -318,12 +320,21 @@ struct presentation_clock
     BOOL is_shut_down;
 };
 
+enum quality_manager_state
+{
+    QUALITY_MANAGER_READY = 0,
+    QUALITY_MANAGER_SHUT_DOWN,
+};
+
 struct quality_manager
 {
     IMFQualityManager IMFQualityManager_iface;
+    IMFClockStateSink IMFClockStateSink_iface;
     LONG refcount;
 
+    IMFTopology *topology;
     IMFPresentationClock *clock;
+    unsigned int state;
     CRITICAL_SECTION cs;
 };
 
@@ -360,6 +371,11 @@ static struct media_session *impl_session_from_IMFRateSupport(IMFRateSupport *if
 static struct media_session *impl_session_from_IMFRateControl(IMFRateControl *iface)
 {
     return CONTAINING_RECORD(iface, struct media_session, IMFRateControl_iface);
+}
+
+static struct media_session *impl_session_from_IMFTopologyNodeAttributeEditor(IMFTopologyNodeAttributeEditor *iface)
+{
+    return CONTAINING_RECORD(iface, struct media_session, IMFTopologyNodeAttributeEditor_iface);
 }
 
 static struct session_op *impl_op_from_IUnknown(IUnknown *iface)
@@ -410,6 +426,11 @@ static struct sink_notification *impl_sink_notification_from_IUnknown(IUnknown *
 static struct quality_manager *impl_from_IMFQualityManager(IMFQualityManager *iface)
 {
     return CONTAINING_RECORD(iface, struct quality_manager, IMFQualityManager_iface);
+}
+
+static struct quality_manager *impl_from_qm_IMFClockStateSink(IMFClockStateSink *iface)
+{
+    return CONTAINING_RECORD(iface, struct quality_manager, IMFClockStateSink_iface);
 }
 
 static struct topo_node *impl_node_from_IMFVideoSampleAllocatorNotify(IMFVideoSampleAllocatorNotify *iface)
@@ -529,7 +550,7 @@ static ULONG WINAPI session_op_Release(IUnknown *iface)
     return refcount;
 }
 
-static IUnknownVtbl session_op_vtbl =
+static const IUnknownVtbl session_op_vtbl =
 {
     session_op_QueryInterface,
     session_op_AddRef,
@@ -1238,11 +1259,19 @@ static HRESULT session_add_media_sink(struct media_session *session, IMFTopology
     return S_OK;
 }
 
+static unsigned int transform_node_get_stream_id(struct topo_node *node, BOOL output, unsigned int index)
+{
+    unsigned int *map = output ? node->u.transform.output_map : node->u.transform.input_map;
+    return map ? map[index] : index;
+}
+
 static HRESULT session_set_transform_stream_info(struct topo_node *node)
 {
     unsigned int *input_map = NULL, *output_map = NULL;
-    unsigned int i, input_count, output_count;
+    unsigned int i, input_count, output_count, block_alignment;
     struct transform_stream *streams;
+    IMFMediaType *media_type;
+    GUID major = { 0 };
     HRESULT hr;
 
     hr = IMFTransform_GetStreamCount(node->object.transform, &input_count, &output_count);
@@ -1262,20 +1291,33 @@ static HRESULT session_set_transform_stream_info(struct topo_node *node)
 
     if (SUCCEEDED(hr))
     {
+        node->u.transform.input_map = input_map;
+        node->u.transform.output_map = output_map;
+
         streams = heap_calloc(input_count, sizeof(*streams));
         for (i = 0; i < input_count; ++i)
             list_init(&streams[i].samples);
         node->u.transform.inputs = streams;
+        node->u.transform.input_count = input_count;
 
         streams = heap_calloc(output_count, sizeof(*streams));
         for (i = 0; i < output_count; ++i)
+        {
             list_init(&streams[i].samples);
-        node->u.transform.outputs = streams;
 
-        node->u.transform.input_count = input_count;
+            if (SUCCEEDED(IMFTransform_GetOutputCurrentType(node->object.transform,
+                    transform_node_get_stream_id(node, TRUE, i), &media_type)))
+            {
+                if (SUCCEEDED(IMFMediaType_GetMajorType(media_type, &major)) && IsEqualGUID(&major, &MFMediaType_Audio)
+                        && SUCCEEDED(IMFMediaType_GetUINT32(media_type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, &block_alignment)))
+                {
+                    streams[i].min_buffer_size = block_alignment;
+                }
+                IMFMediaType_Release(media_type);
+            }
+        }
+        node->u.transform.outputs = streams;
         node->u.transform.output_count = output_count;
-        node->u.transform.input_map = input_map;
-        node->u.transform.output_map = output_map;
     }
 
     return hr;
@@ -1999,6 +2041,10 @@ static HRESULT WINAPI session_get_service_GetService(IMFGetService *iface, REFGU
     {
         return IMFLocalMFTRegistration_QueryInterface(&local_mft_registration, riid, obj);
     }
+    else if (IsEqualGUID(service, &MF_TOPONODE_ATTRIBUTE_EDITOR_SERVICE))
+    {
+        *obj = &session->IMFTopologyNodeAttributeEditor_iface;
+    }
     else if (IsEqualGUID(service, &MR_VIDEO_RENDER_SERVICE))
     {
         IMFStreamSink *stream_sink;
@@ -2622,12 +2668,6 @@ static void session_set_sink_stream_state(struct media_session *session, IMFStre
     }
 }
 
-static DWORD transform_node_get_stream_id(struct topo_node *node, BOOL output, DWORD index)
-{
-    unsigned int *map = output ? node->u.transform.output_map : node->u.transform.input_map;
-    return map ? map[index] : index;
-}
-
 static struct sample *transform_create_sample(IMFSample *sample)
 {
     struct sample *sample_entry = heap_alloc_zero(sizeof(*sample_entry));
@@ -2645,8 +2685,8 @@ static struct sample *transform_create_sample(IMFSample *sample)
 static HRESULT transform_get_external_output_sample(const struct media_session *session, struct topo_node *transform,
         unsigned int output_index, const MFT_OUTPUT_STREAM_INFO *stream_info, IMFSample **sample)
 {
+    unsigned int buffer_size, downstream_input;
     IMFTopologyNode *downstream_node;
-    unsigned int downstream_input;
     IMFMediaBuffer *buffer = NULL;
     struct topo_node *topo_node;
     TOPOID node_id;
@@ -2669,7 +2709,9 @@ static HRESULT transform_get_external_output_sample(const struct media_session *
     }
     else
     {
-        hr = MFCreateAlignedMemoryBuffer(stream_info->cbSize, stream_info->cbAlignment, &buffer);
+        buffer_size = max(stream_info->cbSize, transform->u.transform.outputs[output_index].min_buffer_size);
+
+        hr = MFCreateAlignedMemoryBuffer(buffer_size, stream_info->cbAlignment, &buffer);
         if (SUCCEEDED(hr))
             hr = MFCreateSample(sample);
 
@@ -3566,6 +3608,52 @@ static const IMFRateControlVtbl session_rate_control_vtbl =
     session_rate_control_GetRate,
 };
 
+static HRESULT WINAPI node_attribute_editor_QueryInterface(IMFTopologyNodeAttributeEditor *iface,
+        REFIID riid, void **obj)
+{
+    TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), obj);
+
+    if (IsEqualIID(riid, &IID_IMFTopologyNodeAttributeEditor) ||
+            IsEqualIID(riid, &IID_IUnknown))
+    {
+        *obj = iface;
+        IMFTopologyNodeAttributeEditor_AddRef(iface);
+        return S_OK;
+    }
+
+    WARN("Unsupported interface %s.\n", debugstr_guid(riid));
+    *obj = NULL;
+    return E_NOINTERFACE;
+}
+
+static ULONG WINAPI node_attribute_editor_AddRef(IMFTopologyNodeAttributeEditor *iface)
+{
+    struct media_session *session = impl_session_from_IMFTopologyNodeAttributeEditor(iface);
+    return IMFMediaSession_AddRef(&session->IMFMediaSession_iface);
+}
+
+static ULONG WINAPI node_attribute_editor_Release(IMFTopologyNodeAttributeEditor *iface)
+{
+    struct media_session *session = impl_session_from_IMFTopologyNodeAttributeEditor(iface);
+    return IMFMediaSession_Release(&session->IMFMediaSession_iface);
+}
+
+static HRESULT WINAPI node_attribute_editor_UpdateNodeAttributes(IMFTopologyNodeAttributeEditor *iface,
+        TOPOID id, DWORD count, MFTOPONODE_ATTRIBUTE_UPDATE *updates)
+{
+    FIXME("%p, %s, %u, %p.\n", iface, wine_dbgstr_longlong(id), count, updates);
+
+    return E_NOTIMPL;
+}
+
+static const IMFTopologyNodeAttributeEditorVtbl node_attribute_editor_vtbl =
+{
+    node_attribute_editor_QueryInterface,
+    node_attribute_editor_AddRef,
+    node_attribute_editor_Release,
+    node_attribute_editor_UpdateNodeAttributes,
+};
+
 /***********************************************************************
  *      MFCreateMediaSession (mf.@)
  */
@@ -3585,6 +3673,7 @@ HRESULT WINAPI MFCreateMediaSession(IMFAttributes *config, IMFMediaSession **ses
     object->IMFGetService_iface.lpVtbl = &session_get_service_vtbl;
     object->IMFRateSupport_iface.lpVtbl = &session_rate_support_vtbl;
     object->IMFRateControl_iface.lpVtbl = &session_rate_control_vtbl;
+    object->IMFTopologyNodeAttributeEditor_iface.lpVtbl = &node_attribute_editor_vtbl;
     object->commands_callback.lpVtbl = &session_commands_callback_vtbl;
     object->events_callback.lpVtbl = &session_events_callback_vtbl;
     object->sink_finalizer_callback.lpVtbl = &session_sink_finalizer_callback_vtbl;
@@ -4687,19 +4776,28 @@ HRESULT WINAPI MFCreatePresentationClock(IMFPresentationClock **clock)
 
 static HRESULT WINAPI standard_quality_manager_QueryInterface(IMFQualityManager *iface, REFIID riid, void **out)
 {
+    struct quality_manager *manager = impl_from_IMFQualityManager(iface);
+
     TRACE("%p, %s, %p.\n", iface, debugstr_guid(riid), out);
 
     if (IsEqualIID(riid, &IID_IMFQualityManager) ||
             IsEqualIID(riid, &IID_IUnknown))
     {
         *out = iface;
-        IMFQualityManager_AddRef(iface);
-        return S_OK;
+    }
+    else if (IsEqualIID(riid, &IID_IMFClockStateSink))
+    {
+        *out = &manager->IMFClockStateSink_iface;
+    }
+    else
+    {
+        WARN("Unsupported %s.\n", debugstr_guid(riid));
+        *out = NULL;
+        return E_NOINTERFACE;
     }
 
-    WARN("Unsupported %s.\n", debugstr_guid(riid));
-    *out = NULL;
-    return E_NOINTERFACE;
+    IUnknown_AddRef((IUnknown *)*out);
+    return S_OK;
 }
 
 static ULONG WINAPI standard_quality_manager_AddRef(IMFQualityManager *iface)
@@ -4723,6 +4821,8 @@ static ULONG WINAPI standard_quality_manager_Release(IMFQualityManager *iface)
     {
         if (manager->clock)
             IMFPresentationClock_Release(manager->clock);
+        if (manager->topology)
+            IMFTopology_Release(manager->topology);
         DeleteCriticalSection(&manager->cs);
         heap_free(manager);
     }
@@ -4730,31 +4830,68 @@ static ULONG WINAPI standard_quality_manager_Release(IMFQualityManager *iface)
     return refcount;
 }
 
+static void standard_quality_manager_set_topology(struct quality_manager *manager, IMFTopology *topology)
+{
+    if (manager->topology)
+        IMFTopology_Release(manager->topology);
+    manager->topology = topology;
+    if (manager->topology)
+        IMFTopology_AddRef(manager->topology);
+}
+
 static HRESULT WINAPI standard_quality_manager_NotifyTopology(IMFQualityManager *iface, IMFTopology *topology)
 {
-    FIXME("%p, %p stub.\n", iface, topology);
+    struct quality_manager *manager = impl_from_IMFQualityManager(iface);
+    HRESULT hr = S_OK;
 
-    return S_OK;
+    TRACE("%p, %p.\n", iface, topology);
+
+    EnterCriticalSection(&manager->cs);
+    if (manager->state == QUALITY_MANAGER_SHUT_DOWN)
+        hr = MF_E_SHUTDOWN;
+    else
+    {
+        standard_quality_manager_set_topology(manager, topology);
+    }
+    LeaveCriticalSection(&manager->cs);
+
+    return hr;
+}
+
+static void standard_quality_manager_release_clock(struct quality_manager *manager)
+{
+    if (manager->clock)
+    {
+        IMFPresentationClock_RemoveClockStateSink(manager->clock, &manager->IMFClockStateSink_iface);
+        IMFPresentationClock_Release(manager->clock);
+    }
+    manager->clock = NULL;
 }
 
 static HRESULT WINAPI standard_quality_manager_NotifyPresentationClock(IMFQualityManager *iface,
         IMFPresentationClock *clock)
 {
     struct quality_manager *manager = impl_from_IMFQualityManager(iface);
+    HRESULT hr = S_OK;
 
     TRACE("%p, %p.\n", iface, clock);
 
-    if (!clock)
-        return E_POINTER;
-
     EnterCriticalSection(&manager->cs);
-    if (manager->clock)
-        IMFPresentationClock_Release(manager->clock);
-    manager->clock = clock;
-    IMFPresentationClock_AddRef(manager->clock);
+    if (manager->state == QUALITY_MANAGER_SHUT_DOWN)
+        hr = MF_E_SHUTDOWN;
+    else if (!clock)
+        hr = E_POINTER;
+    else
+    {
+        standard_quality_manager_release_clock(manager);
+        manager->clock = clock;
+        IMFPresentationClock_AddRef(manager->clock);
+        if (FAILED(IMFPresentationClock_AddClockStateSink(manager->clock, &manager->IMFClockStateSink_iface)))
+            WARN("Failed to set state sink.\n");
+    }
     LeaveCriticalSection(&manager->cs);
 
-    return S_OK;
+    return hr;
 }
 
 static HRESULT WINAPI standard_quality_manager_NotifyProcessInput(IMFQualityManager *iface, IMFTopologyNode *node,
@@ -4783,12 +4920,23 @@ static HRESULT WINAPI standard_quality_manager_NotifyQualityEvent(IMFQualityMana
 
 static HRESULT WINAPI standard_quality_manager_Shutdown(IMFQualityManager *iface)
 {
-    FIXME("%p stub.\n", iface);
+    struct quality_manager *manager = impl_from_IMFQualityManager(iface);
 
-    return E_NOTIMPL;
+    TRACE("%p.\n", iface);
+
+    EnterCriticalSection(&manager->cs);
+    if (manager->state != QUALITY_MANAGER_SHUT_DOWN)
+    {
+        standard_quality_manager_release_clock(manager);
+        standard_quality_manager_set_topology(manager, NULL);
+        manager->state = QUALITY_MANAGER_SHUT_DOWN;
+    }
+    LeaveCriticalSection(&manager->cs);
+
+    return S_OK;
 }
 
-static IMFQualityManagerVtbl standard_quality_manager_vtbl =
+static const IMFQualityManagerVtbl standard_quality_manager_vtbl =
 {
     standard_quality_manager_QueryInterface,
     standard_quality_manager_AddRef,
@@ -4799,6 +4947,67 @@ static IMFQualityManagerVtbl standard_quality_manager_vtbl =
     standard_quality_manager_NotifyProcessOutput,
     standard_quality_manager_NotifyQualityEvent,
     standard_quality_manager_Shutdown,
+};
+
+static HRESULT WINAPI standard_quality_manager_sink_QueryInterface(IMFClockStateSink *iface,
+        REFIID riid, void **obj)
+{
+    struct quality_manager *manager = impl_from_qm_IMFClockStateSink(iface);
+    return IMFQualityManager_QueryInterface(&manager->IMFQualityManager_iface, riid, obj);
+}
+
+static ULONG WINAPI standard_quality_manager_sink_AddRef(IMFClockStateSink *iface)
+{
+    struct quality_manager *manager = impl_from_qm_IMFClockStateSink(iface);
+    return IMFQualityManager_AddRef(&manager->IMFQualityManager_iface);
+}
+
+static ULONG WINAPI standard_quality_manager_sink_Release(IMFClockStateSink *iface)
+{
+    struct quality_manager *manager = impl_from_qm_IMFClockStateSink(iface);
+    return IMFQualityManager_Release(&manager->IMFQualityManager_iface);
+}
+
+static HRESULT WINAPI standard_quality_manager_sink_OnClockStart(IMFClockStateSink *iface,
+        MFTIME systime, LONGLONG offset)
+{
+    return S_OK;
+}
+
+static HRESULT WINAPI standard_quality_manager_sink_OnClockStop(IMFClockStateSink *iface,
+        MFTIME systime)
+{
+    return S_OK;
+}
+
+static HRESULT WINAPI standard_quality_manager_sink_OnClockPause(IMFClockStateSink *iface,
+        MFTIME systime)
+{
+    return S_OK;
+}
+
+static HRESULT WINAPI standard_quality_manager_sink_OnClockRestart(IMFClockStateSink *iface,
+        MFTIME systime)
+{
+    return S_OK;
+}
+
+static HRESULT WINAPI standard_quality_manager_sink_OnClockSetRate(IMFClockStateSink *iface,
+        MFTIME systime, float rate)
+{
+    return S_OK;
+}
+
+static const IMFClockStateSinkVtbl standard_quality_manager_sink_vtbl =
+{
+    standard_quality_manager_sink_QueryInterface,
+    standard_quality_manager_sink_AddRef,
+    standard_quality_manager_sink_Release,
+    standard_quality_manager_sink_OnClockStart,
+    standard_quality_manager_sink_OnClockStop,
+    standard_quality_manager_sink_OnClockPause,
+    standard_quality_manager_sink_OnClockRestart,
+    standard_quality_manager_sink_OnClockSetRate,
 };
 
 HRESULT WINAPI MFCreateStandardQualityManager(IMFQualityManager **manager)
@@ -4812,6 +5021,7 @@ HRESULT WINAPI MFCreateStandardQualityManager(IMFQualityManager **manager)
         return E_OUTOFMEMORY;
 
     object->IMFQualityManager_iface.lpVtbl = &standard_quality_manager_vtbl;
+    object->IMFClockStateSink_iface.lpVtbl = &standard_quality_manager_sink_vtbl;
     object->refcount = 1;
     InitializeCriticalSection(&object->cs);
 

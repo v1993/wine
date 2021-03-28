@@ -26,6 +26,7 @@ my $UNIVERSION = "13.0.0";
 my $UNIDATA  = "https://www.unicode.org/Public/$UNIVERSION/ucd/UCD.zip";
 my $IDNADATA = "https://www.unicode.org/Public/idna/$UNIVERSION";
 my $JISDATA  = "https://www.unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/JIS";
+my $KSCDATA  = "https://www.unicode.org/Public/MAPPINGS/OBSOLETE/EASTASIA/KSC";
 my $REPORTS = "http://www.unicode.org/reports";
 my $MSDATA = "https://download.microsoft.com/download/C/F/7/CF713A5E-9FBC-4FD6-9246-275F65C0E498";
 my $MSCODEPAGES = "$MSDATA/Windows Supported Code Page Data Files.zip";
@@ -417,12 +418,14 @@ my %bidi_types =
 
 my %joining_types =
 (
-   "U" => 0,    # Non_Joining
-   "T" => 1,    # Transparent
-   "R" => 2,    # Right_Joining
-   "L" => 3,    # Left_Joining
-   "D" => 4,    # Dual_Joining
-   "C" => 5,    # Join_Causing
+   "U" => 0,           # Non_Joining
+   "L" => 1,           # Left_Joining
+   "R" => 2,           # Right_Joining
+   "D" => 3,           # Dual_Joining
+   "C" => 3,           # Join_Causing
+   "ALAPH" => 4,       # Syriac ALAPH
+   "DALATH RISH" => 5, # Syriac DALATH RISH group
+   "T" => 6,           # Transparent
 );
 
 my @cp2uni = ();
@@ -433,7 +436,7 @@ my @tolower_table = ();
 my @toupper_table = ();
 my @digitmap_table = ();
 my @category_table = ();
-my @joining_table = ();
+my @initial_joining_table = ();
 my @direction_table = ();
 my @decomp_table = ();
 my @combining_class_table = ();
@@ -641,7 +644,14 @@ sub load_data()
 
         $category_table[$src] = $categories{$cat};
         $direction_table[$src] = $bidi;
-        $joining_table[$src] = $joining_types{"T"} if $cat eq "Mn" || $cat eq "Me" || $cat eq "Cf";
+        if ($cat eq "Mn" || $cat eq "Me" || $cat eq "Cf")
+        {
+            $initial_joining_table[$src] = $joining_types{"T"};
+        }
+        else
+        {
+            $initial_joining_table[$src] = $joining_types{"U"};
+        }
 
         if ($lower ne "")
         {
@@ -933,6 +943,62 @@ sub dump_eucjp_codepage()
     output_codepage_file( 20932 );
 }
 
+################################################################
+# build Korean Wansung table from the KSX1001 file
+sub dump_krwansung_codepage(@)
+{
+    my @cp949 = @_;
+    @cp2uni = ();
+    @glyph2uni = ();
+    @lead_bytes = ();
+    @uni2cp = ();
+    $default_char = 0x3f;
+    $default_wchar = 0x003f;
+
+    # ASCII and undefined chars
+    foreach my $i (0x00 .. 0x9f) { add_mapping( $i, $i ); }
+    add_mapping( 0xa0, 0xf8e6 );
+    add_mapping( 0xad, 0xf8e7 );
+    add_mapping( 0xae, 0xf8e8 );
+    add_mapping( 0xaf, 0xf8e9 );
+    add_mapping( 0xfe, 0xf8ea );
+    add_mapping( 0xff, 0xf8eb );
+
+    my $INPUT = open_data_file( $KSCDATA, "KSX1001.TXT" );
+    while (<$INPUT>)
+    {
+        next if /^\#/;  # skip comments
+        next if /^$/;  # skip empty lines
+        next if /\x1a/;  # skip ^Z
+        if (/^0x([0-9a-fA-F]+)\s+0x([0-9a-fA-F]+)\s+(\#.*)?/)
+        {
+            add_mapping( 0x8080 + hex $1, hex $2 );
+            next;
+        }
+        die "Unrecognized line $_\n";
+    }
+    close $INPUT;
+
+    # get some extra mappings from cp 949
+    my @defined_lb;
+    map { $defined_lb[$_] = 1; } @lead_bytes;
+    foreach my $i (0x0000 .. 0xffff)
+    {
+        next if ($i >= 0x1100 && $i <= 0x11ff);  # range not used in 20949
+        next unless defined $cp949[$i];
+        if ($cp949[$i] >= 0xff)
+        {
+            # only add chars for lead bytes that exist in 20949
+            my $hi = $cp949[$i] >> 8;
+            my $lo = $cp949[$i] & 0xff;
+            next unless $defined_lb[$hi];
+            next unless $lo >= 0xa1 && $lo <= 0xfe;
+        }
+        add_mapping( $cp949[$i], $i );
+    }
+
+    output_codepage_file( 20949 );
+}
 
 ################################################################
 # build the sort keys table
@@ -1226,7 +1292,6 @@ sub dump_linebreak($)
 {
     my $filename = shift;
     my @break_table;
-    my $next_group = 0;
 
     my $INPUT = open_data_file( $UNIDATA, "LineBreak.txt" );
     while (<$INPUT>)
@@ -1601,10 +1666,7 @@ sub dump_bracket($)
 sub dump_shaping($)
 {
     my $filename = shift;
-    my %groups;
-    my $next_group = 0;
-
-    $groups{"No_Joining_Group"} = $next_group++;
+    my @joining_table = @initial_joining_table;
 
     my $INPUT = open_data_file( $UNIDATA, "ArabicShaping.txt" );
     while (<$INPUT>)
@@ -1615,9 +1677,7 @@ sub dump_shaping($)
         if (/^\s*([0-9a-fA-F]+)\s*;.*;\s*([RLDCUT])\s*;\s*(\w+)/)
         {
             my $type = $2;
-            my $group = $3;
-            $groups{$group} = $next_group++ unless defined $groups{$group};
-            $joining_table[hex $1] = $joining_types{$type} | ($groups{$group} << 8);
+            $joining_table[hex $1] = $joining_types{$type};
             next;
         }
         die "malformed line $_";
@@ -1643,6 +1703,52 @@ sub dump_shaping($)
             ${joining_forms{"medial"}}[$i] || $i;
     }
     print OUTPUT "};\n";
+
+    close OUTPUT;
+    save_file($filename);
+}
+
+################################################################
+# dump the Arabic shaping table
+sub dump_arabic_shaping($)
+{
+    my $filename = shift;
+    my @joining_table = @initial_joining_table;
+
+    my $INPUT = open_data_file( $UNIDATA, "ArabicShaping.txt" );
+    while (<$INPUT>)
+    {
+        next if /^\#/;  # skip comments
+        next if /^\s*$/;  # skip empty lines
+        next if /\x1a/;  # skip ^Z
+        if (/^\s*([0-9a-fA-F]+)\s*;.*;\s*([RLDCUT])\s*;\s*(\w+)/)
+        {
+            my $type = $2;
+            my $group = $3;
+
+            if ($group eq "ALAPH" || $group eq "DALATH RISH")
+            {
+                $joining_table[hex $1] = $joining_types{$group};
+            }
+            else
+            {
+                $joining_table[hex $1] = $joining_types{$type};
+            }
+
+            next;
+        }
+        die "malformed line $_";
+    }
+    close $INPUT;
+
+    open OUTPUT,">$filename.new" or die "Cannot create $filename";
+    print "Building $filename\n";
+    print OUTPUT "/* Unicode Arabic shaping */\n";
+    print OUTPUT "/* generated from $UNIDATA:ArabicShaping.txt */\n";
+    print OUTPUT "/* DO NOT EDIT!! */\n\n";
+    print OUTPUT "#include \"windef.h\"\n\n";
+
+    dump_two_level_mapping( "arabic_shaping_table", 0, 16, @joining_table );
 
     close OUTPUT;
     save_file($filename);
@@ -2252,6 +2358,8 @@ sub dump_msdata_codepage($)
     close $INPUT;
 
     output_codepage_file( $codepage );
+
+    if ($codepage == 949) { dump_krwansung_codepage( @uni2cp ); }
 }
 
 ################################################################
@@ -2669,7 +2777,7 @@ sub dump_registry_script($%)
                 $i == $#subkeys && $def ? " = s '$def'" : "", 4 * $indent, "";
             $indent++;
         }
-        foreach my $v (@vals) { printf OUTPUT "%*sval $v\n", 4 * $indent, ""; }
+        foreach my $v (sort @vals) { printf OUTPUT "%*sval $v\n", 4 * $indent, ""; }
         for (my $i = 0; $i < @subkeys; $i++) { printf OUTPUT "%*s}\n", 4 * --$indent, ""; }
     }
     while ($indent) { printf OUTPUT "%*s}\n", 4 * --$indent, ""; }
@@ -2708,6 +2816,7 @@ dump_mirroring( "dlls/dwrite/mirror.c" );
 dump_bracket( "dlls/gdi32/uniscribe/bracket.c" );
 dump_bracket( "dlls/dwrite/bracket.c" );
 dump_shaping( "dlls/gdi32/uniscribe/shaping.c" );
+dump_arabic_shaping( "dlls/dwrite/shapers/arabic_table.c" );
 dump_linebreak( "dlls/gdi32/uniscribe/linebreak.c" );
 dump_linebreak( "dlls/dwrite/linebreak.c" );
 dump_scripts( "dlls/dwrite/scripts" );

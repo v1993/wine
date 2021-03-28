@@ -285,7 +285,7 @@ static void save_registry_key( HKEY key, const struct console_config *config )
     DWORD val, width, height, i;
     WCHAR color_name[13];
 
-    TRACE( "%s", debugstr_config( config ));
+    TRACE( "%s\n", debugstr_config( config ));
 
     for (i = 0; i < ARRAY_SIZE(config->color_map); i++)
     {
@@ -870,7 +870,7 @@ static void update_console_font( struct console *console, const WCHAR *font,
         EnumFontFamiliesW( console->window->mem_dc, NULL, get_first_font_enum, (LPARAM)&fc );
         if (fc.done) return;
     }
-    ERR( "Couldn't find a decent font" );
+    ERR( "Couldn't find a decent font\n" );
 }
 
 /* get a cell from a relative coordinate in window (takes into account the scrolling) */
@@ -1885,7 +1885,7 @@ static void apply_config( struct console *console, const struct console_config *
     console->active->attr = config->attr;
     console->active->popup_attr = config->popup_attr;
     console->active->win.left   = config->win_pos.X;
-    console->active->win.right  = config->win_pos.Y;
+    console->active->win.top    = config->win_pos.Y;
     console->active->win.right  = config->win_pos.X + config->win_width - 1;
     console->active->win.bottom = config->win_pos.Y + config->win_height - 1;
     memcpy( console->active->color_map, config->color_map, sizeof(config->color_map) );
@@ -1901,6 +1901,8 @@ static void apply_config( struct console *console, const struct console_config *
     }
 
     update_window( console );
+
+    notify_screen_buffer_size( console->active );
 }
 
 static void current_config( struct console *console, struct console_config *config )

@@ -52,6 +52,20 @@
 #include "process.h"
 #include "security.h"
 
+static const WCHAR file_name[] = {'F','i','l','e'};
+
+struct type_descr file_type =
+{
+    { file_name, sizeof(file_name) },   /* name */
+    FILE_ALL_ACCESS,                    /* valid_access */
+    {                                   /* mapping */
+        FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE,
+        FILE_GENERIC_EXECUTE,
+        FILE_ALL_ACCESS
+    },
+};
+
 struct file
 {
     struct object       obj;            /* object header */
@@ -61,8 +75,6 @@ struct file
     uid_t               uid;            /* file stat.st_uid */
     struct list         kernel_object;  /* list of kernel object pointers */
 };
-
-static unsigned int generic_file_map_access( unsigned int access );
 
 static void file_dump( struct object *obj, int verbose );
 static struct fd *file_get_fd( struct object *obj );
@@ -75,21 +87,20 @@ static struct object *file_open_file( struct object *obj, unsigned int access,
 static struct list *file_get_kernel_obj_list( struct object *obj );
 static void file_destroy( struct object *obj );
 
-static int file_get_poll_events( struct fd *fd );
 static enum server_fd_type file_get_fd_type( struct fd *fd );
 
 static const struct object_ops file_ops =
 {
     sizeof(struct file),          /* size */
+    &file_type,                   /* type */
     file_dump,                    /* dump */
-    file_get_type,                /* get_type */
     add_queue,                    /* add_queue */
     remove_queue,                 /* remove_queue */
     default_fd_signaled,          /* signaled */
     no_satisfied,                 /* satisfied */
     no_signal,                    /* signal */
     file_get_fd,                  /* get_fd */
-    default_fd_map_access,        /* map_access */
+    default_map_access,           /* map_access */
     file_get_sd,                  /* get_sd */
     file_set_sd,                  /* set_sd */
     no_get_full_name,             /* get_full_name */
@@ -98,13 +109,13 @@ static const struct object_ops file_ops =
     NULL,                         /* unlink_name */
     file_open_file,               /* open_file */
     file_get_kernel_obj_list,     /* get_kernel_obj_list */
-    fd_close_handle,              /* close_handle */
+    no_close_handle,              /* close_handle */
     file_destroy                  /* destroy */
 };
 
 static const struct fd_ops file_fd_ops =
 {
-    file_get_poll_events,         /* get_poll_events */
+    default_fd_get_poll_events,   /* get_poll_events */
     default_poll_event,           /* poll_event */
     file_get_fd_type,             /* get_fd_type */
     no_fd_read,                   /* read */
@@ -138,7 +149,7 @@ struct file *create_file_for_fd( int fd, unsigned int access, unsigned int shari
     }
 
     file->mode = st.st_mode;
-    file->access = default_fd_map_access( &file->obj, access );
+    file->access = default_map_access( &file->obj, access );
     list_init( &file->kernel_object );
     if (!(file->fd = create_anonymous_fd( &file_fd_ops, fd, &file->obj,
                                           FILE_SYNCHRONOUS_IO_NONALERT )))
@@ -165,7 +176,7 @@ struct file *create_file_for_fd_obj( struct fd *fd, unsigned int access, unsigne
     if ((file = alloc_object( &file_ops )))
     {
         file->mode = st.st_mode;
-        file->access = default_fd_map_access( &file->obj, access );
+        file->access = default_map_access( &file->obj, access );
         list_init( &file->kernel_object );
         if (!(file->fd = dup_fd_object( fd, access, sharing, FILE_SYNCHRONOUS_IO_NONALERT )))
         {
@@ -199,6 +210,7 @@ int is_file_executable( const char *name )
 }
 
 static struct object *create_file( struct fd *root, const char *nameptr, data_size_t len,
+                                   struct unicode_str nt_name,
                                    unsigned int access, unsigned int sharing, int create,
                                    unsigned int options, unsigned int attrs,
                                    const struct security_descriptor *sd )
@@ -209,7 +221,7 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
     char *name;
     mode_t mode;
 
-    if (!len || ((nameptr[0] == '/') ^ !root))
+    if (!len || ((nameptr[0] == '/') ^ !root) || (nt_name.len && ((nt_name.str[0] == '\\') ^ !root)))
     {
         set_error( STATUS_OBJECT_PATH_SYNTAX_BAD );
         return NULL;
@@ -253,10 +265,10 @@ static struct object *create_file( struct fd *root, const char *nameptr, data_si
             mode |= S_IXOTH;
     }
 
-    access = generic_file_map_access( access );
+    access = map_access( access, &file_type.mapping );
 
     /* FIXME: should set error to STATUS_OBJECT_NAME_COLLISION if file existed before */
-    fd = open_fd( root, name, flags | O_NONBLOCK | O_LARGEFILE, &mode, access, sharing, options );
+    fd = open_fd( root, name, nt_name, flags | O_NONBLOCK | O_LARGEFILE, &mode, access, sharing, options );
     if (!fd) goto done;
 
     if (S_ISDIR(mode))
@@ -280,23 +292,6 @@ static void file_dump( struct object *obj, int verbose )
     fprintf( stderr, "File fd=%p\n", file->fd );
 }
 
-struct object_type *file_get_type( struct object *obj )
-{
-    static const WCHAR name[] = {'F','i','l','e'};
-    static const struct unicode_str str = { name, sizeof(name) };
-    return get_object_type( &str );
-}
-
-static int file_get_poll_events( struct fd *fd )
-{
-    struct file *file = get_fd_user( fd );
-    int events = 0;
-    assert( file->obj.ops == &file_ops );
-    if (file->access & FILE_UNIX_READ_ACCESS) events |= POLLIN;
-    if (file->access & FILE_UNIX_WRITE_ACCESS) events |= POLLOUT;
-    return events;
-}
-
 static enum server_fd_type file_get_fd_type( struct fd *fd )
 {
     struct file *file = get_fd_user( fd );
@@ -311,15 +306,6 @@ static struct fd *file_get_fd( struct object *obj )
     struct file *file = (struct file *)obj;
     assert( obj->ops == &file_ops );
     return (struct fd *)grab_object( file->fd );
-}
-
-static unsigned int generic_file_map_access( unsigned int access )
-{
-    if (access & GENERIC_READ)    access |= FILE_GENERIC_READ;
-    if (access & GENERIC_WRITE)   access |= FILE_GENERIC_WRITE;
-    if (access & GENERIC_EXECUTE) access |= FILE_GENERIC_EXECUTE;
-    if (access & GENERIC_ALL)     access |= FILE_ALL_ACCESS;
-    return access & ~(GENERIC_READ | GENERIC_WRITE | GENERIC_EXECUTE | GENERIC_ALL);
 }
 
 struct security_descriptor *mode_to_sd( mode_t mode, const SID *user, const SID *group )
@@ -473,7 +459,7 @@ static mode_t file_access_to_mode( unsigned int access )
 {
     mode_t mode = 0;
 
-    access = generic_file_map_access( access );
+    access = map_access( access, &file_type.mapping );
     if (access & FILE_READ_DATA)  mode |= 4;
     if (access & (FILE_WRITE_DATA|FILE_APPEND_DATA)) mode |= 2;
     if (access & FILE_EXECUTE)    mode |= 1;
@@ -618,13 +604,15 @@ static struct object *file_open_file( struct object *obj, unsigned int access,
 {
     struct file *file = (struct file *)obj;
     struct object *new_file = NULL;
+    struct unicode_str nt_name;
     char *unix_name;
 
     assert( obj->ops == &file_ops );
 
     if ((unix_name = dup_fd_name( file->fd, "" )))
     {
-        new_file = create_file( NULL, unix_name, strlen(unix_name), access,
+        get_nt_name( file->fd, &nt_name );
+        new_file = create_file( NULL, unix_name, strlen(unix_name), nt_name, access,
                                 sharing, FILE_OPEN, options, 0, NULL );
         free( unix_name );
     }
@@ -700,20 +688,13 @@ DECL_HANDLER(create_file)
 {
     struct object *file;
     struct fd *root_fd = NULL;
-    struct unicode_str unicode_name;
+    struct unicode_str nt_name;
     const struct security_descriptor *sd;
-    const struct object_attributes *objattr = get_req_object_attributes( &sd, &unicode_name, NULL );
+    const struct object_attributes *objattr = get_req_object_attributes( &sd, &nt_name, NULL );
     const char *name;
     data_size_t name_len;
 
     if (!objattr) return;
-
-    /* name is transferred in the unix codepage outside of the objattr structure */
-    if (unicode_name.len)
-    {
-        set_error( STATUS_INVALID_PARAMETER );
-        return;
-    }
 
     if (objattr->rootdir)
     {
@@ -728,7 +709,7 @@ DECL_HANDLER(create_file)
     name = get_req_data_after_objattr( objattr, &name_len );
 
     reply->handle = 0;
-    if ((file = create_file( root_fd, name, name_len, req->access, req->sharing,
+    if ((file = create_file( root_fd, name, name_len, nt_name, req->access, req->sharing,
                              req->create, req->options, req->attrs, sd )))
     {
         reply->handle = alloc_handle( current->process, file, req->access, objattr->attributes );

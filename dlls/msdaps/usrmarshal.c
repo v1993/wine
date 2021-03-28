@@ -1583,6 +1583,36 @@ HRESULT CALLBACK IGetDataSource_GetDataSource_Proxy(IGetDataSource* This, REFIID
     return E_NOTIMPL;
 }
 
+HRESULT CALLBACK IColumnsRowset_GetAvailableColumns_Proxy(IColumnsRowset* This, DBORDINAL *count, DBID **columns)
+{
+    FIXME("(%p)->(%p %p): stub\n", This, count, columns);
+    return E_NOTIMPL;
+}
+
+HRESULT __RPC_STUB IColumnsRowset_GetAvailableColumns_Stub(IColumnsRowset* This, DBORDINAL *count, DBID **columns,
+    IErrorInfo **error)
+{
+    FIXME("(%p)->(%p %p %p): stub\n", This, count, columns, error);
+    return E_NOTIMPL;
+}
+
+HRESULT CALLBACK IColumnsRowset_GetColumnsRowset_Proxy(IColumnsRowset* This, IUnknown *outer, DBORDINAL count,
+    const DBID columns[], REFIID riid, ULONG property_cnt, DBPROPSET property_sets[], IUnknown **rowset)
+{
+    FIXME("(%p)->(%p %ld %p %s %d %p %p): stub\n", This, outer, count, columns, debugstr_guid(riid),
+          property_cnt, property_sets, rowset);
+    return E_NOTIMPL;
+}
+
+HRESULT __RPC_STUB IColumnsRowset_GetColumnsRowset_Stub(IColumnsRowset* This, IUnknown *outer,
+    DBORDINAL count, const DBID *columns, REFIID riid, ULONG property_cnt, DBPROPSET *property_sets,
+    IUnknown **rowset, ULONG props_cnt, DBPROPSTATUS *prop_status, IErrorInfo **error)
+{
+    FIXME("(%p)->(%p %ld %p %s %d %p %p %u %p %p): stub\n", This, outer, count, columns, debugstr_guid(riid),
+          property_cnt, property_sets, rowset, props_cnt, prop_status, error);
+    return E_NOTIMPL;
+}
+
 HRESULT __RPC_STUB IGetDataSource_GetDataSource_Stub(IGetDataSource* This, REFIID riid, IUnknown **datasource,
     IErrorInfo **error)
 {
@@ -1627,6 +1657,20 @@ HRESULT __RPC_STUB IConvertType_CanConvert_Stub(IConvertType* This, DBTYPE from,
     DBCONVERTFLAGS flags, IErrorInfo **error)
 {
     FIXME("(%p)->(%d %d 0x%08x %p): stub\n", This, from, to, flags, error);
+    return E_NOTIMPL;
+}
+
+HRESULT __RPC_STUB IMultipleResults_GetResult_Stub(IMultipleResults* This, IUnknown *outer,
+    DBRESULTFLAG result, REFIID riid, DBROWCOUNT *affected, IUnknown **rowset, IErrorInfo **error)
+{
+    FIXME("(%p)->(%p %ld %s %p %p %p): stub\n", This, outer, result, debugstr_guid(riid), affected, rowset, error);
+    return E_NOTIMPL;
+}
+
+HRESULT CALLBACK IMultipleResults_GetResult_Proxy(IMultipleResults* This, IUnknown *outer,
+    DBRESULTFLAG result, REFIID riid, DBROWCOUNT *affected, IUnknown **rowset)
+{
+    FIXME("(%p)->(%p %ld %s %p %p): stub\n", This, outer, result, debugstr_guid(riid), affected, rowset);
     return E_NOTIMPL;
 }
 

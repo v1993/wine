@@ -422,7 +422,7 @@ static HRESULT WINMM_GetFriendlyName(IMMDevice *device, WCHAR *out,
         return hr;
     }
 
-    lstrcpynW(out, var.u.pwszVal, outlen);
+    lstrcpynW(out, var.pwszVal, outlen);
 
     PropVariantClear(&var);
 
@@ -2038,19 +2038,6 @@ static MMRESULT WINMM_FramesToMMTime(MMTIME *time, UINT32 played_frames,
     case TIME_SAMPLES:
         time->u.sample = played_frames;
         return MMSYSERR_NOERROR;
-    case TIME_MS:
-        time->u.ms = (UINT64)played_frames * 1000 / sample_rate;
-        return MMSYSERR_NOERROR;
-    case TIME_SMPTE:
-        time->u.smpte.fps = 30;
-        played_frames += sample_rate / time->u.smpte.fps - 1; /* round up */
-        time->u.smpte.frame = (played_frames % sample_rate) * time->u.smpte.fps / sample_rate;
-        played_frames /= sample_rate; /* yields seconds */
-        time->u.smpte.sec = played_frames % 60;
-        played_frames /= 60;
-        time->u.smpte.min = played_frames % 60;
-        time->u.smpte.hour= played_frames / 60;
-        return MMSYSERR_NOERROR;
     default:
         time->wType = TIME_BYTES;
         /* fall through */
@@ -2381,7 +2368,7 @@ static LRESULT DRV_QueryDeviceInterface(WINMM_QueryInterfaceInfo *info)
         return MMSYSERR_ERROR;
     }
 
-    len_bytes = (lstrlenW(pv.u.pwszVal) + 1) * sizeof(WCHAR);
+    len_bytes = (lstrlenW(pv.pwszVal) + 1) * sizeof(WCHAR);
 
     if(info->str){
         if(len_bytes > *info->len_bytes){
@@ -2391,7 +2378,7 @@ static LRESULT DRV_QueryDeviceInterface(WINMM_QueryInterfaceInfo *info)
             return MMSYSERR_INVALPARAM;
         }
 
-        memcpy(info->str, pv.u.pwszVal, len_bytes);
+        memcpy(info->str, pv.pwszVal, len_bytes);
     }else
         *info->len_bytes = len_bytes;
 

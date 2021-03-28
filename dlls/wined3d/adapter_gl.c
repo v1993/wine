@@ -1646,8 +1646,9 @@ cards_intel[] =
  * drivers: R700, RV790, R680, RV535, RV516, R410, RS485, RV360, RV351. */
 cards_amd_mesa[] =
 {
-    /* Navi 10 */
+    /* Navi 10/14 */
     {"NAVI10",                      CARD_AMD_RADEON_RX_NAVI_10},
+    {"NAVI14",                      CARD_AMD_RADEON_RX_NAVI_14},
     /* Polaris 10/11 */
     {"POLARIS10",                   CARD_AMD_RADEON_RX_480},
     {"POLARIS11",                   CARD_AMD_RADEON_RX_460},
@@ -4767,6 +4768,8 @@ static void wined3d_view_gl_destroy_object(void *object)
     struct wined3d_device *device;
     GLuint counter_id;
 
+    TRACE("ctx %p.\n", ctx);
+
     device = ctx->device;
 
     counter_id = ctx->counter_bo ? ctx->counter_bo->id : 0;
@@ -4804,7 +4807,7 @@ static void wined3d_view_gl_destroy(struct wined3d_device *device,
 
     wined3d_cs_destroy_object(device->cs, wined3d_view_gl_destroy_object, ctx);
     if (ctx == &c)
-        device->cs->ops->finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
+        wined3d_cs_finish(device->cs, WINED3D_CS_QUEUE_DEFAULT);
 }
 
 static void adapter_gl_destroy_rendertarget_view(struct wined3d_rendertarget_view *view)
@@ -4946,6 +4949,8 @@ static void wined3d_sampler_gl_destroy_object(void *object)
     const struct wined3d_gl_info *gl_info;
     struct wined3d_context *context;
 
+    TRACE("sampler_gl %p.\n", sampler_gl);
+
     if (sampler_gl->name)
     {
         context = context_acquire(sampler_gl->s.device, NULL, 0);
@@ -4978,6 +4983,8 @@ static HRESULT adapter_gl_create_query(struct wined3d_device *device, enum wined
 static void wined3d_query_gl_destroy_object(void *object)
 {
     struct wined3d_query *query = object;
+
+    TRACE("query %p.\n", query);
 
     if (query->buffer_object)
     {
@@ -5012,13 +5019,21 @@ static void adapter_gl_flush_context(struct wined3d_context *context)
         context_gl->gl_info->gl_ops.gl.p_glFlush();
 }
 
-void adapter_gl_clear_uav(struct wined3d_context *context,
+static void adapter_gl_clear_uav(struct wined3d_context *context,
         struct wined3d_unordered_access_view *view, const struct wined3d_uvec4 *clear_value)
 {
     TRACE("context %p, view %p, clear_value %s.\n", context, view, debug_uvec4(clear_value));
 
     wined3d_unordered_access_view_gl_clear_uint(wined3d_unordered_access_view_gl(view),
             clear_value, wined3d_context_gl(context));
+}
+
+static void adapter_gl_generate_mipmap(struct wined3d_context *context, struct wined3d_shader_resource_view *view)
+{
+    TRACE("context %p, view %p.\n", context, view);
+
+    wined3d_shader_resource_view_gl_generate_mipmap(wined3d_shader_resource_view_gl(view),
+            wined3d_context_gl(context));
 }
 
 static const struct wined3d_adapter_ops wined3d_adapter_gl_ops =
@@ -5055,6 +5070,7 @@ static const struct wined3d_adapter_ops wined3d_adapter_gl_ops =
     .adapter_draw_primitive = draw_primitive,
     .adapter_dispatch_compute = dispatch_compute,
     .adapter_clear_uav = adapter_gl_clear_uav,
+    .adapter_generate_mipmap = adapter_gl_generate_mipmap,
 };
 
 static void wined3d_adapter_gl_init_d3d_info(struct wined3d_adapter_gl *adapter_gl, uint32_t wined3d_creation_flags)

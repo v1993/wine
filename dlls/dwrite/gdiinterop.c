@@ -369,7 +369,7 @@ static HRESULT WINAPI rendertarget_DrawGlyphRun(IDWriteBitmapRenderTarget1 *ifac
     }
 
     hr = IDWriteFontFace3_GetRecommendedRenderingMode(fontface, run->fontEmSize, target->ppdip * 96.0f,
-            target->ppdip * 96.0f, NULL /* FIXME */, run->isSideways, DWRITE_OUTLINE_THRESHOLD_ALIASED, measuring_mode,
+            target->ppdip * 96.0f, &target->m, run->isSideways, DWRITE_OUTLINE_THRESHOLD_ALIASED, measuring_mode,
             params, &rendermode, &gridfitmode);
     IDWriteFontFace3_Release(fontface);
     if (FAILED(hr))
@@ -911,7 +911,8 @@ static HRESULT WINAPI gdiinterop1_GetMatchingFontsByLOGFONT(IDWriteGdiInterop1 *
     return E_NOTIMPL;
 }
 
-static const struct IDWriteGdiInterop1Vtbl gdiinteropvtbl = {
+static const IDWriteGdiInterop1Vtbl gdiinteropvtbl =
+{
     gdiinterop_QueryInterface,
     gdiinterop_AddRef,
     gdiinterop_Release,
@@ -1022,7 +1023,7 @@ static HRESULT WINAPI memresourcestream_GetLastWriteTime(IDWriteFontFileStream *
     return E_NOTIMPL;
 }
 
-static const struct IDWriteFontFileStreamVtbl memresourcestreamvtbl =
+static const IDWriteFontFileStreamVtbl memresourcestreamvtbl =
 {
     memresourcestream_QueryInterface,
     memresourcestream_AddRef,
@@ -1082,7 +1083,8 @@ static HRESULT WINAPI memresourceloader_CreateStreamFromKey(IDWriteFontFileLoade
     return S_OK;
 }
 
-static const struct IDWriteFontFileLoaderVtbl memresourceloadervtbl = {
+static const IDWriteFontFileLoaderVtbl memresourceloadervtbl =
+{
     memresourceloader_QueryInterface,
     memresourceloader_AddRef,
     memresourceloader_Release,

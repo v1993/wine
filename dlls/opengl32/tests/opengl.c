@@ -330,6 +330,18 @@ static void test_choosepixelformat(void)
     ok( test_pfd(&pfd, NULL), "PFD_STEREO_DONTCARE failed\n" );
     pfd.dwFlags &= ~PFD_STEREO_DONTCARE;
     pfd.cAuxBuffers = 0;
+
+    pfd.dwFlags |= PFD_DEPTH_DONTCARE;
+    pfd.cDepthBits = 24;
+    ok( test_pfd(&pfd, &ret_fmt), "PFD_DEPTH_DONTCARE failed.\n" );
+    ok( !ret_fmt.cDepthBits, "Got unexpected cDepthBits %u.\n", ret_fmt.cDepthBits );
+    pfd.cStencilBits = 8;
+    ok( test_pfd(&pfd, &ret_fmt), "PFD_DEPTH_DONTCARE, depth 24, stencil 8 failed.\n" );
+    ok( !ret_fmt.cDepthBits || ret_fmt.cDepthBits == 24, "Got unexpected cDepthBits %u.\n", ret_fmt.cDepthBits );
+    ok( ret_fmt.cStencilBits == 8, "Got unexpected cStencilBits %u.\n", ret_fmt.cStencilBits );
+    pfd.cDepthBits = 0;
+    pfd.cStencilBits = 0;
+    pfd.dwFlags &= ~PFD_DEPTH_DONTCARE;
 }
 
 static void WINAPI gl_debug_message_callback(GLenum source, GLenum type, GLuint id, GLenum severity,
@@ -1752,6 +1764,62 @@ static void test_swap_control(HDC oldhdc)
     wglMakeCurrent(oldhdc, oldctx);
 }
 
+static void test_wglChoosePixelFormatARB(HDC hdc)
+{
+    static int attrib_list[] =
+    {
+        WGL_DRAW_TO_WINDOW_ARB, 1,
+        WGL_SUPPORT_OPENGL_ARB, 1,
+        0
+    };
+
+    PIXELFORMATDESCRIPTOR fmt, last_fmt;
+    BYTE depth, last_depth;
+    UINT format_count;
+    int formats[1024];
+    unsigned int i;
+    int res;
+
+    if (!pwglChoosePixelFormatARB)
+    {
+        skip("wglChoosePixelFormatARB is not available\n");
+        return;
+    }
+
+    format_count = 0;
+    res = pwglChoosePixelFormatARB(hdc, attrib_list, NULL, ARRAY_SIZE(formats), formats, &format_count);
+    ok(res, "Got unexpected result %d.\n", res);
+
+    memset(&last_fmt, 0, sizeof(last_fmt));
+    last_depth = 0;
+
+    for (i = 0; i < format_count; ++i)
+    {
+        memset(&fmt, 0, sizeof(fmt));
+        if (!DescribePixelFormat(hdc, formats[i], sizeof(fmt), &fmt)
+                || (fmt.dwFlags & PFD_GENERIC_FORMAT))
+        {
+            memset(&fmt, 0, sizeof(fmt));
+            continue;
+        }
+
+        depth = fmt.cDepthBits;
+        fmt.cDepthBits = 0;
+        fmt.cStencilBits = 0;
+
+        if (memcmp(&fmt, &last_fmt, sizeof(fmt)))
+        {
+            last_fmt = fmt;
+            last_depth = depth;
+        }
+        else
+        {
+            ok(last_depth <= depth, "Got unexpected depth %u, last_depth %u, i %u, format %u.\n",
+                    depth, last_depth, i, formats[i]);
+        }
+    }
+}
+
 START_TEST(opengl)
 {
     HWND hwnd;
@@ -1846,6 +1914,7 @@ START_TEST(opengl)
         }
 
         test_choosepixelformat();
+        test_wglChoosePixelFormatARB(hdc);
         test_debug_message_callback();
         test_setpixelformat(hdc);
         test_destroy(hdc);

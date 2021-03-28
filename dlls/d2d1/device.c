@@ -1161,6 +1161,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawText(ID2D1DeviceContext *if
     IDWriteTextLayout *text_layout;
     IDWriteFactory *dwrite_factory;
     D2D1_POINT_2F origin;
+    float width, height;
     HRESULT hr;
 
     TRACE("iface %p, string %s, string_len %u, text_format %p, layout_rect %s, "
@@ -1175,13 +1176,15 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawText(ID2D1DeviceContext *if
         return;
     }
 
+    width = max(0.0f, layout_rect->right - layout_rect->left);
+    height = max(0.0f, layout_rect->bottom - layout_rect->top);
     if (measuring_mode == DWRITE_MEASURING_MODE_NATURAL)
         hr = IDWriteFactory_CreateTextLayout(dwrite_factory, string, string_len, text_format,
-                layout_rect->right - layout_rect->left, layout_rect->bottom - layout_rect->top, &text_layout);
+                width, height, &text_layout);
     else
         hr = IDWriteFactory_CreateGdiCompatibleTextLayout(dwrite_factory, string, string_len, text_format,
-                layout_rect->right - layout_rect->left, layout_rect->bottom - layout_rect->top, render_target->desc.dpiX / 96.0f,
-                (DWRITE_MATRIX*)&render_target->drawing_state.transform, measuring_mode == DWRITE_MEASURING_MODE_GDI_NATURAL, &text_layout);
+                width, height, render_target->desc.dpiX / 96.0f, (DWRITE_MATRIX *)&render_target->drawing_state.transform,
+                measuring_mode == DWRITE_MEASURING_MODE_GDI_NATURAL, &text_layout);
     IDWriteFactory_Release(dwrite_factory);
     if (FAILED(hr))
     {
@@ -1189,7 +1192,7 @@ static void STDMETHODCALLTYPE d2d_device_context_DrawText(ID2D1DeviceContext *if
         return;
     }
 
-    d2d_point_set(&origin, layout_rect->left, layout_rect->top);
+    d2d_point_set(&origin, min(layout_rect->left, layout_rect->right), min(layout_rect->top, layout_rect->bottom));
     ID2D1DeviceContext_DrawTextLayout(iface, origin, text_layout, brush, options);
     IDWriteTextLayout_Release(text_layout);
 }

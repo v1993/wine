@@ -3867,22 +3867,20 @@ static void test_kiuserexceptiondispatcher(void)
         0x48, 0x8d, 0x8c, 0x24, 0xf0, 0x04, 0x00, 0x00,
                                     /* lea 0x4f0(%rsp),%rcx */
         0x4c, 0x89, 0x22,           /* mov %r12,(%rdx) */
-        0xff, 0x14, 0x25,
-        /* offset: 17 bytes */
-        0x00, 0x00, 0x00, 0x00,     /* callq *addr */ /* call hook implementation. */
+        0x48, 0xb8,                 /* movabs hook_KiUserExceptionDispatcher,%rax */
+        0,0,0,0,0,0,0,0,            /* offset 16 */
+        0xff, 0xd0,                 /* callq *rax */
         0x48, 0x31, 0xc9,           /* xor %rcx, %rcx */
         0x48, 0x31, 0xd2,           /* xor %rdx, %rdx */
-
-        0xff, 0x24, 0x25,
-        /* offset: 30 bytes */
-        0x00, 0x00, 0x00, 0x00,     /* jmpq *addr */ /* jump to original function. */
+        0x48, 0xb8,                 /* movabs pKiUserExceptionDispatcher,%rax */
+        0,0,0,0,0,0,0,0,            /* offset 34 */
+        0xff, 0xe0,                 /* jmpq *rax */
     };
 
-    void *phook_KiUserExceptionDispatcher = hook_KiUserExceptionDispatcher;
     BYTE patched_KiUserExceptionDispatcher_bytes[12];
-    DWORD old_protect1, old_protect2;
+    void *bpt_address, *trampoline_ptr;
     EXCEPTION_RECORD record;
-    void *bpt_address;
+    DWORD old_protect;
     CONTEXT ctx;
     LONG pass;
     BYTE *ptr;
@@ -3898,19 +3896,14 @@ static void test_kiuserexceptiondispatcher(void)
     *(ULONG64 *)(except_code + 2) = (ULONG64)&test_kiuserexceptiondispatcher_regs;
     *(ULONG64 *)(except_code + 0x2a) = (ULONG64)&test_kiuserexceptiondispatcher_regs.new_rax;
 
-    ok(((ULONG64)&phook_KiUserExceptionDispatcher & 0xffffffff) == ((ULONG64)&phook_KiUserExceptionDispatcher),
-            "Address is too long.\n");
-    ok(((ULONG64)&pKiUserExceptionDispatcher & 0xffffffff) == ((ULONG64)&pKiUserExceptionDispatcher),
-            "Address is too long.\n");
-
-    *(unsigned int *)(hook_trampoline + 17) = (unsigned int)(ULONG_PTR)&phook_KiUserExceptionDispatcher;
-    *(unsigned int *)(hook_trampoline + 30) = (unsigned int)(ULONG_PTR)&pKiUserExceptionDispatcher;
-
-    ret = VirtualProtect(hook_trampoline, ARRAY_SIZE(hook_trampoline), PAGE_EXECUTE_READWRITE, &old_protect1);
-    ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
+    *(ULONG_PTR *)(hook_trampoline + 16) = (ULONG_PTR)hook_KiUserExceptionDispatcher;
+    *(ULONG_PTR *)(hook_trampoline + 34) = (ULONG_PTR)pKiUserExceptionDispatcher;
+    trampoline_ptr = (char *)code_mem + 1024;
+    memcpy(trampoline_ptr, hook_trampoline, sizeof(hook_trampoline));
+    ok(((ULONG64)trampoline_ptr & 0xffffffff) == (ULONG64)trampoline_ptr, "Address is too long.\n");
 
     ret = VirtualProtect(pKiUserExceptionDispatcher, sizeof(saved_KiUserExceptionDispatcher_bytes),
-            PAGE_EXECUTE_READWRITE, &old_protect2);
+            PAGE_EXECUTE_READWRITE, &old_protect);
     ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
 
     memcpy(saved_KiUserExceptionDispatcher_bytes, pKiUserExceptionDispatcher,
@@ -3919,7 +3912,7 @@ static void test_kiuserexceptiondispatcher(void)
     /* mov hook_trampoline, %rax */
     *ptr++ = 0x48;
     *ptr++ = 0xb8;
-    *(void **)ptr = hook_trampoline;
+    *(void **)ptr = trampoline_ptr;
     ptr += sizeof(ULONG64);
     /* jmp *rax */
     *ptr++ = 0xff;
@@ -4042,9 +4035,7 @@ static void test_kiuserexceptiondispatcher(void)
     RemoveVectoredExceptionHandler(vectored_handler);
 
     ret = VirtualProtect(pKiUserExceptionDispatcher, sizeof(saved_KiUserExceptionDispatcher_bytes),
-            old_protect2, &old_protect2);
-    ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
-    ret = VirtualProtect(hook_trampoline, ARRAY_SIZE(hook_trampoline), old_protect1, &old_protect1);
+            old_protect, &old_protect);
     ok(ret, "Got unexpected ret %#x, GetLastError() %u.\n", ret, GetLastError());
 }
 
@@ -4242,7 +4233,8 @@ static void test_thread_context(void)
     COMPARE( R9 );
     COMPARE( R10 );
     COMPARE( R11 );
-    COMPARE( Cpsr );
+    ok( (context.Cpsr & 0xff0f0000) == (expect.Cpsr & 0xff0f0000),
+        "wrong Cpsr %08x/%08x\n", context.Cpsr, expect.Cpsr );
     ok( context.Sp == expect.Sp - 8,
         "wrong Sp %08x/%08x\n", context.Sp, expect.Sp - 8 );
     /* Pc is somewhere close to the NtGetContextThread implementation */
@@ -5823,6 +5815,111 @@ static void test_debug_registers(void)
     WaitForSingleObject(thread, 10000);
     CloseHandle(thread);
 }
+
+#if defined(__x86_64__)
+
+static void test_debug_registers_wow64(void)
+{
+    char cmdline[] = "C:\\windows\\syswow64\\notepad.exe";
+    PROCESS_INFORMATION pi;
+    STARTUPINFOA si = {0};
+    WOW64_CONTEXT wow64_ctx;
+    CONTEXT ctx;
+    BOOL is_wow64;
+    NTSTATUS ret;
+    BOOL bret;
+
+    si.cb = sizeof(si);
+    bret = CreateProcessA(cmdline, NULL, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi);
+    ok(bret, "CreateProcessA failed\n");
+
+    bret = pIsWow64Process(pi.hProcess, &is_wow64);
+    ok(bret && is_wow64, "expected Wow64 process\n");
+
+    SuspendThread(pi.hThread);
+
+    ZeroMemory(&ctx, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_ALL;
+    bret = GetThreadContext(pi.hThread, &ctx);
+    ok(bret, "GetThreadContext failed\n");
+
+    ctx.Dr0 = 0x12340000;
+    ctx.Dr1 = 0x12340001;
+    ctx.Dr2 = 0x12340002;
+    ctx.Dr3 = 0x12340003;
+    ctx.Dr7 = 0x155; /* enable all breakpoints (local) */
+    bret = SetThreadContext(pi.hThread, &ctx);
+    ok(bret, "SetThreadContext failed\n");
+
+    if (bret) {
+        ZeroMemory(&ctx, sizeof(ctx));
+        ctx.ContextFlags = CONTEXT_ALL;
+        bret = GetThreadContext(pi.hThread, &ctx);
+        ok(bret, "GetThreadContext failed\n");
+        if (bret)
+        {
+            ok(ctx.Dr0 == 0x12340000, "expected 0x12340000, got %lx\n", ctx.Dr0);
+            ok(ctx.Dr1 == 0x12340001, "expected 0x12340001, got %lx\n", ctx.Dr1);
+            ok(ctx.Dr2 == 0x12340002, "expected 0x12340002, got %lx\n", ctx.Dr2);
+            ok(ctx.Dr3 == 0x12340003, "expected 0x12340003, got %lx\n", ctx.Dr3);
+            ok(ctx.Dr7 == 0x155, "expected 0x155, got %lx\n", ctx.Dr7);
+        }
+
+        ZeroMemory(&wow64_ctx, sizeof(wow64_ctx));
+        wow64_ctx.ContextFlags = WOW64_CONTEXT_ALL;
+        ret = pRtlWow64GetThreadContext(pi.hThread, &wow64_ctx);
+        ok(ret == STATUS_SUCCESS, "Wow64GetThreadContext failed with %lx\n", ret);
+        if (ret == STATUS_SUCCESS)
+        {
+            ok(wow64_ctx.Dr0 == 0x12340000, "expected 0x12340000, got %lx\n", wow64_ctx.Dr0);
+            ok(wow64_ctx.Dr1 == 0x12340001, "expected 0x12340001, got %lx\n", wow64_ctx.Dr1);
+            ok(wow64_ctx.Dr2 == 0x12340002, "expected 0x12340002, got %lx\n", wow64_ctx.Dr2);
+            ok(wow64_ctx.Dr3 == 0x12340003, "expected 0x12340003, got %lx\n", wow64_ctx.Dr3);
+            ok(wow64_ctx.Dr7 == 0x155, "expected 0x155, got %lx\n", wow64_ctx.Dr7);
+        }
+    }
+
+    wow64_ctx.Dr0 = 0x56780000;
+    wow64_ctx.Dr1 = 0x56780001;
+    wow64_ctx.Dr2 = 0x56780002;
+    wow64_ctx.Dr3 = 0x56780003;
+    wow64_ctx.Dr7 = 0x101; /* enable only the first breakpoint */
+    ret = pRtlWow64SetThreadContext(pi.hThread, &wow64_ctx);
+    ok(ret == STATUS_SUCCESS, "Wow64SetThreadContext failed with %lx\n", ret);
+
+    ZeroMemory(&wow64_ctx, sizeof(wow64_ctx));
+    wow64_ctx.ContextFlags = WOW64_CONTEXT_ALL;
+    ret = pRtlWow64GetThreadContext(pi.hThread, &wow64_ctx);
+    ok(ret == STATUS_SUCCESS, "Wow64GetThreadContext failed with %lx\n", ret);
+    if (ret == STATUS_SUCCESS)
+    {
+        ok(wow64_ctx.Dr0 == 0x56780000, "expected 0x56780000, got %lx\n", wow64_ctx.Dr0);
+        ok(wow64_ctx.Dr1 == 0x56780001, "expected 0x56780001, got %lx\n", wow64_ctx.Dr1);
+        ok(wow64_ctx.Dr2 == 0x56780002, "expected 0x56780002, got %lx\n", wow64_ctx.Dr2);
+        ok(wow64_ctx.Dr3 == 0x56780003, "expected 0x56780003, got %lx\n", wow64_ctx.Dr3);
+        ok(wow64_ctx.Dr7 == 0x101, "expected 0x101, got %lx\n", wow64_ctx.Dr7);
+    }
+
+    ZeroMemory(&ctx, sizeof(ctx));
+    ctx.ContextFlags = CONTEXT_ALL;
+    bret = GetThreadContext(pi.hThread, &ctx);
+    ok(bret, "GetThreadContext failed\n");
+    if (bret)
+    {
+        ok(ctx.Dr0 == 0x56780000, "expected 0x56780000, got %lx\n", ctx.Dr0);
+        ok(ctx.Dr1 == 0x56780001, "expected 0x56780001, got %lx\n", ctx.Dr1);
+        ok(ctx.Dr2 == 0x56780002, "expected 0x56780002, got %lx\n", ctx.Dr2);
+        ok(ctx.Dr3 == 0x56780003, "expected 0x56780003, got %lx\n", ctx.Dr3);
+        ok(ctx.Dr7 == 0x101, "expected 0x101, got %lx\n", ctx.Dr7);
+    }
+
+    ResumeThread(pi.hThread);
+    TerminateProcess(pi.hProcess, 0);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+}
+
+#endif
 
 static DWORD debug_service_exceptions;
 
@@ -7770,7 +7867,7 @@ static void test_extended_context(void)
     memset(&xs->YmmContext, 0xcc, sizeof(xs->YmmContext));
     bret = GetThreadContext(thread, context);
     ok(bret, "Got unexpected bret %#x, GetLastError() %u.\n", bret, GetLastError());
-    ok(xs->Mask == (sizeof(void *) == 4 ? 4 : 0) || broken(sizeof(void *) == 4 && !xs->Mask) /* Win7u */,
+    ok(!xs->Mask || (sizeof(void *) == 4 && xs->Mask == 4),
             "Got unexpected Mask %s.\n", wine_dbgstr_longlong(xs->Mask));
     for (i = 0; i < 16 * 4; ++i)
         ok(((ULONG *)&xs->YmmContext)[i] == (xs->Mask ? (i < 8 * 4 ? 0 : 0x48484848) : 0xcccccccc),
@@ -8322,6 +8419,7 @@ START_TEST(exception)
 
     test_rtlraiseexception();
     test_debug_registers();
+    test_debug_registers_wow64();
     test_debug_service(1);
     test_virtual_unwind();
     test___C_specific_handler();

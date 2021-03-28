@@ -63,6 +63,7 @@
 #include "windef.h"
 #include "winbase.h"
 #include "tlhelp32.h"
+#include "wine/exception.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(winedbg);
@@ -111,11 +112,11 @@ struct gdb_context
 static void gdbctx_delete_xpoint(struct gdb_context *gdbctx, struct dbg_thread *thread,
                                  dbg_ctx_t *ctx, struct gdb_xpoint *x)
 {
-    struct dbg_process *process = thread->process;
+    struct dbg_process *process = gdbctx->process;
     struct backend_cpu *cpu = process->be_cpu;
 
     if (!cpu->remove_Xpoint(process->handle, process->process_io, ctx, x->type, x->addr, x->value, x->size))
-        ERR("%04x:%04x: Couldn't remove breakpoint at:%p/%x type:%d\n", process->pid, thread->tid, x->addr, x->size, x->type);
+        ERR("%04x:%04x: Couldn't remove breakpoint at:%p/%x type:%d\n", process->pid, thread ? thread->tid : ~0, x->addr, x->size, x->type);
 
     list_remove(&x->entry);
     HeapFree(GetProcessHeap(), 0, x);
@@ -349,7 +350,7 @@ static unsigned char signal_from_debug_event(DEBUG_EVENT* de)
         return SIGALRM;
     /* should not be here */
     case EXCEPTION_INVALID_HANDLE:
-    case EXCEPTION_NAME_THREAD:
+    case EXCEPTION_WINE_NAME_THREAD:
         return SIGTRAP;
     default:
         ERR("Unknown exception code 0x%08x\n", ec);
@@ -363,7 +364,7 @@ static BOOL handle_exception(struct gdb_context* gdbctx, EXCEPTION_DEBUG_INFO* e
 
     switch (rec->ExceptionCode)
     {
-    case EXCEPTION_NAME_THREAD:
+    case EXCEPTION_WINE_NAME_THREAD:
     {
         const THREADNAME_INFO *threadname = (const THREADNAME_INFO *)rec->ExceptionInformation;
         struct dbg_thread *thread;

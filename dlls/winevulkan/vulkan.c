@@ -1061,17 +1061,20 @@ VkResult WINAPI wine_vkEnumerateInstanceExtensionProperties(const char *layer_na
     return *count < num_properties ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+VkResult WINAPI wine_vkEnumerateDeviceLayerProperties(VkPhysicalDevice phys_dev, uint32_t *count, VkLayerProperties *properties)
+{
+    TRACE("%p, %p, %p\n", phys_dev, count, properties);
+
+    *count = 0;
+    return VK_SUCCESS;
+}
+
 VkResult WINAPI wine_vkEnumerateInstanceLayerProperties(uint32_t *count, VkLayerProperties *properties)
 {
     TRACE("%p, %p\n", count, properties);
 
-    if (!properties)
-    {
-        *count = 0;
-        return VK_SUCCESS;
-    }
-
-    return VK_ERROR_LAYER_NOT_PRESENT;
+    *count = 0;
+    return VK_SUCCESS;
 }
 
 VkResult WINAPI wine_vkEnumerateInstanceVersion(uint32_t *version)
@@ -1290,7 +1293,7 @@ VkResult WINAPI wine_vkQueueSubmit(VkQueue queue, uint32_t count,
         memcpy(&submits_host[i], &submits[i], sizeof(*submits_host));
 
         num_command_buffers = submits[i].commandBufferCount;
-        command_buffers = heap_calloc(num_command_buffers, sizeof(*submits_host));
+        command_buffers = heap_calloc(num_command_buffers, sizeof(*command_buffers));
         if (!command_buffers)
         {
             ERR("Unable to allocate memory for command buffers!\n");
@@ -1507,7 +1510,7 @@ static inline VkTimeDomainEXT get_performance_counter_time_domain(void)
     return VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT;
 # endif
 #else
-    FIXME("No mapping for VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT on this platform.");
+    FIXME("No mapping for VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT on this platform.\n");
     return VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
 #endif
 }
@@ -1536,7 +1539,7 @@ static inline uint64_t convert_timestamp(VkTimeDomainEXT host_domain, VkTimeDoma
             && target_domain == VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT)
         return convert_monotonic_timestamp(value);
 
-    FIXME("Couldn't translate between host domain %d and target domain %d", host_domain, target_domain);
+    FIXME("Couldn't translate between host domain %d and target domain %d\n", host_domain, target_domain);
     return value;
 }
 
@@ -1609,7 +1612,7 @@ VkResult WINAPI wine_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(VkPhysicalDe
         else if (host_time_domains[i] == VK_TIME_DOMAIN_CLOCK_MONOTONIC_RAW_EXT)
             supports_monotonic_raw = TRUE;
         else
-            FIXME("Unknown time domain %d", host_time_domains[i]);
+            FIXME("Unknown time domain %d\n", host_time_domains[i]);
     }
 
     heap_free(host_time_domains);
@@ -1622,7 +1625,7 @@ VkResult WINAPI wine_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(VkPhysicalDe
     else if (supports_monotonic && performance_counter_domain == VK_TIME_DOMAIN_CLOCK_MONOTONIC_EXT)
         out_time_domains[out_time_domain_count++] = VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT;
     else
-        FIXME("VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT not supported on this platform.");
+        FIXME("VK_TIME_DOMAIN_QUERY_PERFORMANCE_COUNTER_EXT not supported on this platform.\n");
 
     /* Forward the device domain time */
     if (supports_device)
@@ -1770,6 +1773,80 @@ void WINAPI wine_vkGetPrivateDataEXT(VkDevice device, VkObjectType object_type, 
     device->funcs.p_vkGetPrivateDataEXT(device->device, object_type, object_handle, private_data_slot, data);
 }
 
+VkResult WINAPI wine_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *create_info,
+        const VkAllocationCallbacks *allocator, VkSwapchainKHR *swapchain)
+{
+    VkSwapchainCreateInfoKHR native_info;
+
+    TRACE("%p, %p, %p, %p\n", device, create_info, allocator, swapchain);
+
+    native_info = *create_info;
+    native_info.surface = wine_surface_from_handle(create_info->surface)->driver_surface;
+
+    return thunk_vkCreateSwapchainKHR(device, &native_info, allocator, swapchain);
+}
+
+VkResult WINAPI wine_vkCreateWin32SurfaceKHR(VkInstance instance,
+        const VkWin32SurfaceCreateInfoKHR *createInfo, const VkAllocationCallbacks *allocator, VkSurfaceKHR *surface)
+{
+    struct wine_surface *object;
+    VkResult res;
+
+    TRACE("%p, %p, %p, %p\n", instance, createInfo, allocator, surface);
+
+    if (allocator)
+        FIXME("Support for allocation callbacks not implemented yet\n");
+
+    object = heap_alloc_zero(sizeof(*object));
+
+    if (!object)
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    res = instance->funcs.p_vkCreateWin32SurfaceKHR(instance->instance, createInfo, NULL, &object->driver_surface);
+
+    if (res != VK_SUCCESS)
+    {
+        heap_free(object);
+        return res;
+    }
+
+    object->surface = vk_funcs->p_wine_get_native_surface(object->driver_surface);
+
+    WINE_VK_ADD_NON_DISPATCHABLE_MAPPING(instance, object, object->surface);
+
+    *surface = wine_surface_to_handle(object);
+
+    return VK_SUCCESS;
+}
+
+void WINAPI wine_vkDestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *allocator)
+{
+    struct wine_surface *object = wine_surface_from_handle(surface);
+
+    TRACE("%p, 0x%s, %p\n", instance, wine_dbgstr_longlong(surface), allocator);
+
+    if (!object)
+        return;
+
+    instance->funcs.p_vkDestroySurfaceKHR(instance->instance, object->driver_surface, NULL);
+
+    WINE_VK_REMOVE_HANDLE_MAPPING(instance, object);
+    heap_free(object);
+}
+
+VkResult WINAPI wine_vkGetPhysicalDeviceSurfaceFormats2KHR(VkPhysicalDevice phys_dev,
+        const VkPhysicalDeviceSurfaceInfo2KHR *surface_info, uint32_t *formats_count, VkSurfaceFormat2KHR *formats)
+{
+    VkPhysicalDeviceSurfaceInfo2KHR native_info;
+
+    TRACE("%p, %p, %p, %p\n", phys_dev, surface_info, formats_count, formats);
+
+    native_info = *surface_info;
+    native_info.surface = wine_surface_from_handle(surface_info->surface)->driver_surface;
+
+    return thunk_vkGetPhysicalDeviceSurfaceFormats2KHR(phys_dev, &native_info, formats_count, formats);
+}
+
 static inline void adjust_max_image_count(VkPhysicalDevice phys_dev, VkSurfaceCapabilitiesKHR* capabilities)
 {
     /* Many Windows games, for example Strange Brigade, No Man's Sky, Path of Exile
@@ -1803,11 +1880,15 @@ VkResult WINAPI wine_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(VkPhysicalDevice 
 VkResult WINAPI wine_vkGetPhysicalDeviceSurfaceCapabilities2KHR(VkPhysicalDevice phys_dev,
         const VkPhysicalDeviceSurfaceInfo2KHR *surface_info, VkSurfaceCapabilities2KHR *capabilities)
 {
+    VkPhysicalDeviceSurfaceInfo2KHR native_info;
     VkResult res;
 
     TRACE("%p, %p, %p\n", phys_dev, surface_info, capabilities);
 
-    res = thunk_vkGetPhysicalDeviceSurfaceCapabilities2KHR(phys_dev, surface_info, capabilities);
+    native_info = *surface_info;
+    native_info.surface = wine_surface_from_handle(surface_info->surface)->driver_surface;
+
+    res = thunk_vkGetPhysicalDeviceSurfaceCapabilities2KHR(phys_dev, &native_info, capabilities);
 
     if (res == VK_SUCCESS)
         adjust_max_image_count(phys_dev, &capabilities->surfaceCapabilities);
@@ -1861,6 +1942,9 @@ void WINAPI wine_vkDestroyDebugUtilsMessengerEXT(
     TRACE("%p, 0x%s, %p\n", instance, wine_dbgstr_longlong(messenger), allocator);
 
     object = wine_debug_utils_messenger_from_handle(messenger);
+
+    if (!object)
+        return;
 
     instance->funcs.p_vkDestroyDebugUtilsMessengerEXT(instance->instance, object->debug_messenger, NULL);
     WINE_VK_REMOVE_HANDLE_MAPPING(instance, object);
@@ -1963,6 +2047,9 @@ void WINAPI wine_vkDestroyDebugReportCallbackEXT(
     TRACE("%p, 0x%s, %p\n", instance, wine_dbgstr_longlong(callback), allocator);
 
     object = wine_debug_report_callback_from_handle(callback);
+
+    if (!object)
+        return;
 
     instance->funcs.p_vkDestroyDebugReportCallbackEXT(instance->instance, object->debug_callback, NULL);
 

@@ -2286,17 +2286,17 @@
 @ cdecl fdim(double double)
 @ cdecl fdimf(float float)
 @ cdecl fdiml(double double) fdim
-@ stub feclearexcept
+@ cdecl feclearexcept(long)
 @ cdecl fegetenv(ptr)
-@ stub fegetexceptflag
+@ cdecl fegetexceptflag(ptr long)
 @ cdecl fegetround()
 @ stub feholdexcept
 @ cdecl feof(ptr)
 @ cdecl ferror(ptr)
 @ cdecl fesetenv(ptr)
-@ stub fesetexceptflag
+@ cdecl fesetexceptflag(ptr long)
 @ cdecl fesetround(long)
-@ stub fetestexcept
+@ cdecl fetestexcept(long)
 @ cdecl fflush(ptr)
 @ cdecl fgetc(ptr)
 @ cdecl fgetpos(ptr ptr)
@@ -2381,7 +2381,7 @@
 @ cdecl lgammaf(float)
 @ cdecl lgammal(double) lgamma
 @ cdecl -ret64 llabs(int64)
-@ cdecl lldiv(int64 int64)
+@ cdecl -norelay lldiv(int64 int64)
 @ cdecl -ret64 llrint(double)
 @ cdecl -ret64 llrintf(float)
 @ cdecl -ret64 llrintl(double) llrint

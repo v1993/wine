@@ -37,7 +37,6 @@
 #include "kernelbase.h"
 #include "wine/asm.h"
 #include "wine/exception.h"
-#include "wine/server.h"
 #include "wine/debug.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(sync);
@@ -347,6 +346,35 @@ DWORD WINAPI DECLSPEC_HOTPATCH WaitForMultipleObjectsEx( DWORD count, const HAND
         status = WAIT_FAILED;
     }
     return status;
+}
+
+
+/******************************************************************************
+ *           WaitForDebugEvent   (kernelbase.@)
+ */
+BOOL WINAPI DECLSPEC_HOTPATCH WaitForDebugEvent( DEBUG_EVENT *event, DWORD timeout )
+{
+    NTSTATUS status;
+    LARGE_INTEGER time;
+    DBGUI_WAIT_STATE_CHANGE state;
+
+    for (;;)
+    {
+        status = DbgUiWaitStateChange( &state, get_nt_timeout( &time, timeout ) );
+        switch (status)
+        {
+        case STATUS_SUCCESS:
+            DbgUiConvertStateChangeStructure( &state, event );
+            return TRUE;
+        case STATUS_USER_APC:
+            continue;
+        case STATUS_TIMEOUT:
+            SetLastError( ERROR_SEM_TIMEOUT );
+            return FALSE;
+        default:
+            return set_ntstatus( status );
+        }
+    }
 }
 
 

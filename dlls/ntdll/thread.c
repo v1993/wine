@@ -27,7 +27,6 @@
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
 #include "winternl.h"
-#include "wine/server.h"
 #include "wine/debug.h"
 #include "ntdll_misc.h"
 #include "ddk/wdm.h"
@@ -85,7 +84,6 @@ void WINAPI RtlExitUserThread( ULONG status )
     NtQueryInformationThread( GetCurrentThread(), ThreadAmILastThread, &last, sizeof(last), NULL );
     if (last) RtlExitUserProcess( status );
     LdrShutdownThread();
-    RtlFreeThreadActivationContextStack();
     for (;;) NtTerminateThread( GetCurrentThread(), status );
 }
 

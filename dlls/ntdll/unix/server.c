@@ -99,8 +99,6 @@ WINE_DEFAULT_DEBUG_CHANNEL(server);
 #define SOCKETNAME "socket"        /* name of the socket file */
 #define LOCKNAME   "lock"          /* name of the lock file */
 
-static const BOOL is_win64 = (sizeof(void *) > sizeof(int));
-
 static const char *server_dir;
 
 unsigned int server_cpus = 0;
@@ -580,6 +578,21 @@ static void invoke_system_apc( const apc_call_t *call, apc_result_t *result )
         else result->create_thread.status = STATUS_INVALID_PARAMETER;
         break;
     }
+    case APC_DUP_HANDLE:
+    {
+        HANDLE dst_handle = NULL;
+
+        result->type = call->type;
+
+        result->dup_handle.status = NtDuplicateObject( NtCurrentProcess(),
+                                                       wine_server_ptr_handle(call->dup_handle.src_handle),
+                                                       wine_server_ptr_handle(call->dup_handle.dst_process),
+                                                       &dst_handle, call->dup_handle.access,
+                                                       call->dup_handle.attributes, call->dup_handle.options );
+        result->dup_handle.handle = wine_server_obj_handle( dst_handle );
+        NtClose( wine_server_ptr_handle(call->dup_handle.dst_process) );
+        break;
+    }
     case APC_BREAK_PROCESS:
     {
         HANDLE handle;
@@ -721,9 +734,15 @@ NTSTATUS WINAPI NtContinue( CONTEXT *context, BOOLEAN alertable )
     user_apc_t apc;
     NTSTATUS status;
 
-    status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, NULL, &apc );
-    if (status == STATUS_USER_APC) invoke_apc( context, &apc );
-    return NtSetContextThread( GetCurrentThread(), context );
+    if (alertable)
+    {
+        status = server_select( NULL, 0, SELECT_INTERRUPTIBLE | SELECT_ALERTABLE, 0, NULL, NULL, &apc );
+        if (status == STATUS_USER_APC) invoke_apc( context, &apc );
+    }
+    status = NtSetContextThread( GetCurrentThread(), context );
+    if (!status && (context->ContextFlags & CONTEXT_INTEGER) == CONTEXT_INTEGER)
+        signal_restore_full_cpu_context();
+    return status;
 }
 
 
@@ -1410,14 +1429,61 @@ static int get_unix_tid(void)
 
 
 /***********************************************************************
+ *           init_thread_pipe
+ *
+ * Create the server->client communication pipe.
+ */
+static int init_thread_pipe(void)
+{
+    int reply_pipe[2];
+    stack_t ss;
+
+    ss.ss_sp    = get_signal_stack();
+    ss.ss_size  = signal_stack_size;
+    ss.ss_flags = 0;
+    sigaltstack( &ss, NULL );
+
+    if (server_pipe( reply_pipe ) == -1) server_protocol_perror( "pipe" );
+    if (server_pipe( ntdll_get_thread_data()->wait_fd ) == -1) server_protocol_perror( "pipe" );
+    wine_server_send_fd( reply_pipe[1] );
+    wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
+    ntdll_get_thread_data()->reply_fd = reply_pipe[0];
+    return reply_pipe[1];
+}
+
+
+/***********************************************************************
+ *           init_teb64
+ *
+ * Initialize the 64-bit part of the TEB for WoW64 threads.
+ */
+static void init_teb64( TEB *teb )
+{
+#ifndef _WIN64
+    TEB64 *teb64 = (TEB64 *)((char *)teb - teb_offset);
+
+    if (!is_wow64) return;
+    teb->GdiBatchCount = PtrToUlong( teb64 );
+    teb->WowTebOffset  = -teb_offset;
+    teb64->ClientId.UniqueProcess = PtrToUlong( teb->ClientId.UniqueProcess );
+    teb64->ClientId.UniqueThread  = PtrToUlong( teb->ClientId.UniqueThread );
+#endif
+}
+
+/***********************************************************************
  *           server_init_process
  *
  * Start the server and create the initial socket pair.
  */
-void server_init_process(void)
+size_t server_init_process(void)
 {
-    obj_handle_t version;
+    static const char *cpu_names[] = { "x86", "x86_64", "PowerPC", "ARM", "ARM64" };
+    const char *arch = getenv( "WINEARCH" );
     const char *env_socket = getenv( "WINESERVERSOCKET" );
+    obj_handle_t version;
+    int ret, reply_pipe;
+    struct sigaction sig_act;
+    size_t info_size;
 
     server_pid = -1;
     if (env_socket)
@@ -1470,6 +1536,63 @@ void server_init_process(void)
     /* work around Ubuntu's ptrace breakage */
     if (server_pid != -1) prctl( 0x59616d61 /* PR_SET_PTRACER */, server_pid );
 #endif
+
+    /* ignore SIGPIPE so that we get an EPIPE error instead  */
+    sig_act.sa_handler = SIG_IGN;
+    sig_act.sa_flags   = 0;
+    sigemptyset( &sig_act.sa_mask );
+    sigaction( SIGPIPE, &sig_act, NULL );
+
+    reply_pipe = init_thread_pipe();
+
+    SERVER_START_REQ( init_first_thread )
+    {
+        req->unix_pid    = getpid();
+        req->unix_tid    = get_unix_tid();
+        req->teb         = wine_server_client_ptr( NtCurrentTeb() );
+        req->peb         = wine_server_client_ptr( NtCurrentTeb()->Peb );
+#ifdef __i386__
+        req->ldt_copy    = wine_server_client_ptr( &__wine_ldt_copy );
+#endif
+        req->reply_fd    = reply_pipe;
+        req->wait_fd     = ntdll_get_thread_data()->wait_fd[1];
+        req->debug_level = (TRACE_ON(server) != 0);
+        req->cpu         = client_cpu;
+        ret = wine_server_call( req );
+        NtCurrentTeb()->ClientId.UniqueProcess = ULongToHandle(reply->pid);
+        NtCurrentTeb()->ClientId.UniqueThread  = ULongToHandle(reply->tid);
+        info_size         = reply->info_size;
+        server_start_time = reply->server_start;
+        server_cpus       = reply->all_cpus;
+    }
+    SERVER_END_REQ;
+    close( reply_pipe );
+
+#ifndef _WIN64
+    is_wow64 = (server_cpus & ((1 << CPU_x86_64) | (1 << CPU_ARM64))) != 0;
+    init_teb64( NtCurrentTeb() );
+#endif
+
+    switch (ret)
+    {
+    case STATUS_SUCCESS:
+        if (arch)
+        {
+            if (!strcmp( arch, "win32" ) && (is_win64 || is_wow64))
+                fatal_error( "WINEARCH set to win32 but '%s' is a 64-bit installation.\n", config_dir );
+            if (!strcmp( arch, "win64" ) && !is_win64 && !is_wow64)
+                fatal_error( "WINEARCH set to win64 but '%s' is a 32-bit installation.\n", config_dir );
+        }
+        return info_size;
+    case STATUS_INVALID_IMAGE_WIN_64:
+        fatal_error( "'%s' is a 32-bit installation, it cannot support 64-bit applications.\n", config_dir );
+    case STATUS_NOT_SUPPORTED:
+        fatal_error( "'%s' is a 64-bit installation, it cannot be used with a 32-bit wineserver.\n", config_dir );
+    case STATUS_INVALID_IMAGE_FORMAT:
+        fatal_error( "wineserver doesn't support the %s architecture\n", cpu_names[client_cpu] );
+    default:
+        server_protocol_error( "init_first_thread failed with status %x\n", ret );
+    }
 }
 
 
@@ -1480,7 +1603,7 @@ void server_init_process_done(void)
 {
     PEB *peb = NtCurrentTeb()->Peb;
     IMAGE_NT_HEADERS *nt = get_exe_nt_header();
-    void *entry = (char *)peb->ImageBaseAddress + nt->OptionalHeader.AddressOfEntryPoint;
+    void *entry;
     NTSTATUS status;
     int suspend, needs_close, unixdir;
 
@@ -1506,14 +1629,9 @@ void server_init_process_done(void)
     /* Signal the parent process to continue */
     SERVER_START_REQ( init_process_done )
     {
-        req->module   = wine_server_client_ptr( peb->ImageBaseAddress );
-#ifdef __i386__
-        req->ldt_copy = wine_server_client_ptr( &__wine_ldt_copy );
-#endif
-        req->entry    = wine_server_client_ptr( entry );
-        req->gui      = (nt->OptionalHeader.Subsystem != IMAGE_SUBSYSTEM_WINDOWS_CUI);
         status = wine_server_call( req );
         suspend = reply->suspend;
+        entry = wine_server_get_ptr( reply->entry );
     }
     SERVER_END_REQ;
 
@@ -1527,88 +1645,25 @@ void server_init_process_done(void)
  *
  * Send an init thread request.
  */
-size_t server_init_thread( void *entry_point, BOOL *suspend )
+void server_init_thread( void *entry_point, BOOL *suspend )
 {
-    static const char *cpu_names[] = { "x86", "x86_64", "PowerPC", "ARM", "ARM64" };
-    const char *arch = getenv( "WINEARCH" );
-    int ret;
-    int reply_pipe[2];
-    struct sigaction sig_act;
-    stack_t ss;
-    size_t info_size;
-
-    /* ignore SIGPIPE so that we get an EPIPE error instead  */
-    sig_act.sa_handler = SIG_IGN;
-    sig_act.sa_flags   = 0;
-    sigemptyset( &sig_act.sa_mask );
-    sigaction( SIGPIPE, &sig_act, NULL );
-
-    ss.ss_sp    = get_signal_stack();
-    ss.ss_size  = signal_stack_size;
-    ss.ss_flags = 0;
-    sigaltstack( &ss, NULL );
-
-    /* create the server->client communication pipes */
-    if (server_pipe( reply_pipe ) == -1) server_protocol_perror( "pipe" );
-    if (server_pipe( ntdll_get_thread_data()->wait_fd ) == -1) server_protocol_perror( "pipe" );
-    wine_server_send_fd( reply_pipe[1] );
-    wine_server_send_fd( ntdll_get_thread_data()->wait_fd[1] );
-    ntdll_get_thread_data()->reply_fd = reply_pipe[0];
-    close( reply_pipe[1] );
+    int reply_pipe = init_thread_pipe();
 
     SERVER_START_REQ( init_thread )
     {
-        req->unix_pid    = getpid();
-        req->unix_tid    = get_unix_tid();
-        req->teb         = wine_server_client_ptr( NtCurrentTeb() );
-        req->entry       = wine_server_client_ptr( entry_point );
-        req->reply_fd    = reply_pipe[1];
-        req->wait_fd     = ntdll_get_thread_data()->wait_fd[1];
-        req->debug_level = (TRACE_ON(server) != 0);
-        req->cpu         = client_cpu;
-        ret = wine_server_call( req );
+        req->unix_tid  = get_unix_tid();
+        req->teb       = wine_server_client_ptr( NtCurrentTeb() );
+        req->entry     = wine_server_client_ptr( entry_point );
+        req->reply_fd  = reply_pipe;
+        req->wait_fd   = ntdll_get_thread_data()->wait_fd[1];
+        wine_server_call( req );
+        *suspend = reply->suspend;
         NtCurrentTeb()->ClientId.UniqueProcess = ULongToHandle(reply->pid);
         NtCurrentTeb()->ClientId.UniqueThread  = ULongToHandle(reply->tid);
-        info_size         = reply->info_size;
-        server_start_time = reply->server_start;
-        server_cpus       = reply->all_cpus;
-        *suspend          = reply->suspend;
     }
     SERVER_END_REQ;
-
-#ifndef _WIN64
-    is_wow64 = (server_cpus & ((1 << CPU_x86_64) | (1 << CPU_ARM64))) != 0;
-    if (is_wow64)
-    {
-        TEB64 *teb64 = (TEB64 *)((char *)NtCurrentTeb() - teb_offset);
-
-        NtCurrentTeb()->GdiBatchCount = PtrToUlong( teb64 );
-        NtCurrentTeb()->WowTebOffset  = -teb_offset;
-        teb64->ClientId.UniqueProcess = PtrToUlong( NtCurrentTeb()->ClientId.UniqueProcess );
-        teb64->ClientId.UniqueThread  = PtrToUlong( NtCurrentTeb()->ClientId.UniqueThread );
-    }
-#endif
-
-    switch (ret)
-    {
-    case STATUS_SUCCESS:
-        if (arch)
-        {
-            if (!strcmp( arch, "win32" ) && (is_win64 || is_wow64))
-                fatal_error( "WINEARCH set to win32 but '%s' is a 64-bit installation.\n", config_dir );
-            if (!strcmp( arch, "win64" ) && !is_win64 && !is_wow64)
-                fatal_error( "WINEARCH set to win64 but '%s' is a 32-bit installation.\n", config_dir );
-        }
-        return info_size;
-    case STATUS_INVALID_IMAGE_WIN_64:
-        fatal_error( "'%s' is a 32-bit installation, it cannot support 64-bit applications.\n", config_dir );
-    case STATUS_NOT_SUPPORTED:
-        fatal_error( "'%s' is a 64-bit installation, it cannot be used with a 32-bit wineserver.\n", config_dir );
-    case STATUS_INVALID_IMAGE_FORMAT:
-        fatal_error( "wineserver doesn't support the %s architecture\n", cpu_names[client_cpu] );
-    default:
-        server_protocol_error( "init_thread failed with status %x\n", ret );
-    }
+    close( reply_pipe );
+    init_teb64( NtCurrentTeb() );
 }
 
 
@@ -1635,7 +1690,37 @@ NTSTATUS WINAPI DbgUiIssueRemoteBreakin( HANDLE process )
 NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE dest_process, HANDLE *dest,
                                    ACCESS_MASK access, ULONG attributes, ULONG options )
 {
+    sigset_t sigset;
     NTSTATUS ret;
+    int fd = -1;
+
+    if ((options & DUPLICATE_CLOSE_SOURCE) && source_process != NtCurrentProcess())
+    {
+        apc_call_t call;
+        apc_result_t result;
+
+        memset( &call, 0, sizeof(call) );
+
+        call.dup_handle.type        = APC_DUP_HANDLE;
+        call.dup_handle.src_handle  = wine_server_obj_handle( source );
+        call.dup_handle.dst_process = wine_server_obj_handle( dest_process );
+        call.dup_handle.access      = access;
+        call.dup_handle.attributes  = attributes;
+        call.dup_handle.options     = options;
+        ret = server_queue_process_apc( source_process, &call, &result );
+        if (ret != STATUS_SUCCESS) return ret;
+
+        if (!result.dup_handle.status)
+            *dest = wine_server_ptr_handle( result.dup_handle.handle );
+        return result.dup_handle.status;
+    }
+
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    /* always remove the cached fd; if the server request fails we'll just
+     * retrieve it again */
+    if (options & DUPLICATE_CLOSE_SOURCE)
+        fd = remove_fd_from_cache( source );
 
     SERVER_START_REQ( dup_handle )
     {
@@ -1648,14 +1733,13 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
         if (!(ret = wine_server_call( req )))
         {
             if (dest) *dest = wine_server_ptr_handle( reply->handle );
-            if (reply->closed && reply->self)
-            {
-                int fd = remove_fd_from_cache( source );
-                if (fd != -1) close( fd );
-            }
         }
     }
     SERVER_END_REQ;
+
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    if (fd != -1) close( fd );
     return ret;
 }
 
@@ -1665,9 +1749,16 @@ NTSTATUS WINAPI NtDuplicateObject( HANDLE source_process, HANDLE source, HANDLE 
  */
 NTSTATUS WINAPI NtClose( HANDLE handle )
 {
+    sigset_t sigset;
     HANDLE port;
     NTSTATUS ret;
-    int fd = remove_fd_from_cache( handle );
+    int fd;
+
+    server_enter_uninterrupted_section( &fd_cache_mutex, &sigset );
+
+    /* always remove the cached fd; if the server request fails we'll just
+     * retrieve it again */
+    fd = remove_fd_from_cache( handle );
 
     SERVER_START_REQ( close_handle )
     {
@@ -1675,6 +1766,9 @@ NTSTATUS WINAPI NtClose( HANDLE handle )
         ret = wine_server_call( req );
     }
     SERVER_END_REQ;
+
+    server_leave_uninterrupted_section( &fd_cache_mutex, &sigset );
+
     if (fd != -1) close( fd );
 
     if (ret != STATUS_INVALID_HANDLE || !handle) return ret;
